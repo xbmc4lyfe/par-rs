@@ -63,16 +63,22 @@ pub struct Inventory {
     pub sealed: Vec<([u8; 16], [u8; 16])>,
 }
 
-/// Bytes that delimit a file name inside a subject: whitespace, quotes and brackets.
-#[inline]
-fn name_delimiter(b: u8) -> bool {
-    b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'<' | b'>' | b'[' | b']' | b'(' | b')')
-}
-
 /// A byte that opens a name: whitespace, a quote or an opening bracket. Closing brackets are
 /// not openers, so `Show (2026).par2` has the stem `Show (2026)` rather than nothing.
 fn name_opener(b: u8) -> bool {
     b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'<' | b'[' | b'(')
+}
+
+/// Does a name end at byte `at` of `subject`: the end of the text, whitespace (ASCII or Unicode,
+/// so the no-break space of a header read as Latin-1 counts, as it did for a `\\s` regex), a quote
+/// or a closing bracket? `at` must be a char boundary (it follows the ASCII `.par2`).
+#[inline]
+fn name_ends_at(subject: &str, at: usize) -> bool {
+    match subject.as_bytes().get(at) {
+        None => true,
+        Some(&b) if b.is_ascii() => b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'>' | b']' | b')' | 0x0b),
+        Some(_) => subject.get(at..).and_then(|t| t.chars().next()).is_some_and(char::is_whitespace),
+    }
 }
 
 /// Is `stem` (lower-case insensitive, the name without `.par2`) a `.volNNN+MM` / `.volNNN-MM`
@@ -93,8 +99,8 @@ fn is_volume_stem(stem: &[u8]) -> bool {
 /// Does a Usenet subject refer to the base `.par2` index file (not a `.volNNN+MM.par2`
 /// volume)? Case-insensitive; quoted and unquoted names are recognised.
 ///
-/// A name ends right after `.par2`: the next byte must be the end of the subject, whitespace, a
-/// quote or a closing bracket, so `a.par2.rar` and `a.par2-1` are not par2 files while
+/// A name ends right after `.par2`: the next character must be the end of the subject, whitespace
+/// (ASCII or Unicode), a quote or a closing bracket, so `a.par2.rar` and `a.par2-1` are not par2 files while
 /// `"a.par2"`, `(a.par2)` and `[a.par2]` are. The name starts after the previous whitespace,
 /// quote or opening bracket; a closing bracket is part of it, so `Show (2026).par2` and
 /// `Movie[rartv].par2` are par2 files, and so is the bare `".par2"` of an obfuscated post.
@@ -106,7 +112,7 @@ pub fn is_base_par2(subject: &str) -> bool {
         if !s.get(dot.saturating_add(1)..dot.saturating_add(5)).is_some_and(|t| t.eq_ignore_ascii_case(b"par2")) {
             return false;
         }
-        if s.get(dot.saturating_add(5)).is_some_and(|&b| !name_delimiter(b) || matches!(b, b'<' | b'[' | b'(')) {
+        if !name_ends_at(subject, dot.saturating_add(5)) {
             return false;
         }
         // The name's stem: back to the previous opener (a closing bracket belongs to the name,

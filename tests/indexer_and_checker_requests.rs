@@ -103,6 +103,14 @@ fn base_par2_subject_rule() {
         ("(2026).par2", true),
         ("().par2", true),
         ("a (1).par2 and b.vol0+1.par2", true),
+        // Unicode whitespace ends a name too (a no-break space from a Latin-1 header, U+3000, VT).
+        ("a.par2\u{a0}yEnc", true),
+        ("a.par2\u{3000}yEnc", true),
+        ("a.par2\u{b}yEnc", true),
+        ("a.par2\u{2003}(1/1)", true),
+        ("a.par2é", false),
+        ("a.par2\u{e9}", false),
+        ("a.par2\u{200b}x", false),
     ];
     for (subject, want) in cases {
         assert_eq!(is_base_par2(subject), want, "{subject:?}");
