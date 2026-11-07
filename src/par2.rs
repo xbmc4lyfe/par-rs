@@ -97,7 +97,8 @@ fn is_volume_stem(stem: &[u8]) -> bool {
 /// quote or a closing bracket, so `a.par2.rar` and `a.par2-1` are not par2 files while
 /// `"a.par2"`, `(a.par2)` and `[a.par2]` are. The name starts after the previous whitespace,
 /// quote or opening bracket; a closing bracket is part of it, so `Show (2026).par2` and
-/// `Movie[rartv].par2` are par2 files. No allocation: one pass over the bytes.
+/// `Movie[rartv].par2` are par2 files, and so is the bare `".par2"` of an obfuscated post.
+/// No allocation: one pass over the bytes.
 pub fn is_base_par2(subject: &str) -> bool {
     let s = subject.as_bytes();
     memchr::memchr_iter(b'.', s).any(|dot| {
@@ -109,11 +110,9 @@ pub fn is_base_par2(subject: &str) -> bool {
             return false;
         }
         // The name's stem: back to the previous opener (a closing bracket belongs to the name,
-        // as in `Show (2026).par2` or `Movie[rartv].par2`); it must not be empty.
+        // as in `Show (2026).par2` or `Movie[rartv].par2`). An empty stem is a name too:
+        // obfuscated posts call their index `".par2"`.
         let start = s.get(..dot).map_or(0, |head| head.iter().rposition(|&b| name_opener(b)).map_or(0, |p| p.saturating_add(1)));
-        if start >= dot {
-            return false;
-        }
         !is_volume_stem(s.get(start..dot).unwrap_or(&[]))
     })
 }
