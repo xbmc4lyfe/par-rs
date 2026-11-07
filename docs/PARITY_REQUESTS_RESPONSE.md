@@ -60,7 +60,10 @@ Your table is the test (`base_par2_subject_rule`): a name ends right after `.par
 next byte is the end of the subject, ASCII whitespace, `"`, `'`, or a closing `)` `]` `>`. So
 `a.par2.rar` and `a.par2-1` are false; `"a.par2"`, `(a.par2)`, `[a.par2]`, `<a.par2>` are true;
 `.volNNN+MM.par2` / `.volNNN-MM.par2` stems stay false; a bare `.par2` with an empty stem is
-false. Case-insensitive.
+false. Case-insensitive. The name starts after the previous whitespace, quote or *opening*
+bracket: a closing bracket is part of the name, so `Show (2026).par2`, `Movie[rartv].par2` and
+`[Group] Title - 01 [720p].par2` are true (the first cut of this rule got that wrong; a review of
+your PR against `tests/fixtures/naming_samples.tsv` caught 17 such subjects).
 
 ## 6. Speed
 

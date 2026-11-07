@@ -86,6 +86,22 @@ fn base_par2_subject_rule() {
         ("x.PaR2", true),
         ("x.par2x", false),
         ("", false),
+        // A closing bracket belongs to the name: these are real base par2 subjects.
+        (r#""Show (2026).par2" yEnc (1/1)"#, true),
+        ("Movie.2026.1080p[rartv].par2", true),
+        ("a (1).par2", true),
+        ("[HorribleSubs]_AIURA_-_01_[480p].par2", true),
+        ("[Chyuu] Nanatsu no Taizai - 12 [720p][D1F49539].par2", true),
+        ("Marillion - Live From Cadogan Hall 2011 (DVD 1).par2", true),
+        ("100 Hits - Lady Sings The Blues 2006 (5cd's).par2", true),
+        ("Guido Negraszus - Lounge (2012)(320).par2", true),
+        ("Assassins Creed - Bloodlines [EUR].par2", true),
+        ("Show (2026).vol000+01.par2", false),
+        ("Show (2026).par2.rar", false),
+        ("Show (2026).par2-1", false),
+        ("(2026).par2", true),
+        ("().par2", true),
+        ("a (1).par2 and b.vol0+1.par2", true),
     ];
     for (subject, want) in cases {
         assert_eq!(is_base_par2(subject), want, "{subject:?}");

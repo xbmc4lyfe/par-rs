@@ -69,6 +69,12 @@ fn name_delimiter(b: u8) -> bool {
     b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'<' | b'>' | b'[' | b']' | b'(' | b')')
 }
 
+/// A byte that opens a name: whitespace, a quote or an opening bracket. Closing brackets are
+/// not openers, so `Show (2026).par2` has the stem `Show (2026)` rather than nothing.
+fn name_opener(b: u8) -> bool {
+    b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'<' | b'[' | b'(')
+}
+
 /// Is `stem` (lower-case insensitive, the name without `.par2`) a `.volNNN+MM` / `.volNNN-MM`
 /// recovery volume name?
 fn is_volume_stem(stem: &[u8]) -> bool {
@@ -89,7 +95,9 @@ fn is_volume_stem(stem: &[u8]) -> bool {
 ///
 /// A name ends right after `.par2`: the next byte must be the end of the subject, whitespace, a
 /// quote or a closing bracket, so `a.par2.rar` and `a.par2-1` are not par2 files while
-/// `"a.par2"`, `(a.par2)` and `[a.par2]` are. No allocation: one pass over the bytes.
+/// `"a.par2"`, `(a.par2)` and `[a.par2]` are. The name starts after the previous whitespace,
+/// quote or opening bracket; a closing bracket is part of it, so `Show (2026).par2` and
+/// `Movie[rartv].par2` are par2 files. No allocation: one pass over the bytes.
 pub fn is_base_par2(subject: &str) -> bool {
     let s = subject.as_bytes();
     memchr::memchr_iter(b'.', s).any(|dot| {
@@ -100,8 +108,9 @@ pub fn is_base_par2(subject: &str) -> bool {
         if s.get(dot.saturating_add(5)).is_some_and(|&b| !name_delimiter(b) || matches!(b, b'<' | b'[' | b'(')) {
             return false;
         }
-        // The name's stem: back to the previous delimiter; it must not be empty.
-        let start = s.get(..dot).map_or(0, |head| head.iter().rposition(|&b| name_delimiter(b)).map_or(0, |p| p.saturating_add(1)));
+        // The name's stem: back to the previous opener (a closing bracket belongs to the name,
+        // as in `Show (2026).par2` or `Movie[rartv].par2`); it must not be empty.
+        let start = s.get(..dot).map_or(0, |head| head.iter().rposition(|&b| name_opener(b)).map_or(0, |p| p.saturating_add(1)));
         if start >= dot {
             return false;
         }
