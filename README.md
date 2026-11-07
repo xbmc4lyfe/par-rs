@@ -237,8 +237,8 @@ CLI front end for manual use: `cargo run --release --example nzbpar -- {create|v
 * `is_base_par2` ends a name right after `.par2`: the next byte must be the end of the subject,
   whitespace, a quote or a closing bracket (`a.par2.rar` and `a.par2-1` are not par2 files;
   `"a.par2"`, `(a.par2)`, `[a.par2]` are). No allocation per subject.
-* `RepairOptions::ignore_extensions` entries containing `*` or `?` are wildcard masks on the base
-  name (nzbget `ParIgnoreExt=*`; inside a mask `#` is one digit, as in nzbget's `WildMask`),
+* `RepairOptions::ignore_extensions` entries containing `*` or `?` are wildcard masks over the whole
+  local name (nzbget `ParIgnoreExt=*`; inside a mask `#` is one digit, as in nzbget's `WildMask`),
   matched by `repairer::ignore_name_matches`; every entry is also a case-insensitive suffix, so a
   literal file name works too.
 * `packet::load_par2_collection(main_path, opts)` loads an index and its sibling volumes into a

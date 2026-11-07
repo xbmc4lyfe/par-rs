@@ -67,8 +67,8 @@ pub struct RepairOptions {
     /// are still repaired when a repair runs for other reasons. Each entry is either an
     /// extension (with the dot, e.g. `.sfv`, `.nfo`, `.nzb`: a case-insensitive suffix match on
     /// the local name) or, when it contains `*` or `?`, a wildcard mask matched case-insensitively
-    /// against the file's base name (`*` any run of bytes, `?` one byte), as nzbget's
-    /// `Util::MatchFileExt` does. See [`ignore_name_matches`].
+    /// against the whole local name (`*` any run of bytes, `?` one byte, `#` one digit), as
+    /// nzbget's `Util::MatchFileExt` + `WildMask` do. See [`ignore_name_matches`].
     pub ignore_extensions: Vec<String>,
     /// Also require the whole-file MD5 (and 16k MD5) to match before calling a file complete.
     /// Off by default: a file whose every slice matches its IFSC CRC-32 + MD5 at the expected
@@ -79,11 +79,13 @@ pub struct RepairOptions {
     pub kernel: Kernel,
 }
 
-/// Does one `RepairOptions::ignore_extensions` entry cover `local_name`? Entries with `*` or
-/// `?` are wildcard masks on the base name (`*` any run of bytes, `?` one byte, and inside a
-/// mask `#` one ASCII digit); any entry also matches as a case-insensitive suffix of the whole
-/// local name, so `.nfo`, `nfo`, `*.nfo`, `readme.nfo` and `*` all ignore `release.nfo` or
-/// `readme.nfo`. Mirrors nzbget's `Util::MatchFileExt` + `WildMask`.
+/// Does one `RepairOptions::ignore_extensions` entry cover `local_name` (the file's name
+/// relative to the base directory, `/`-separated)? Entries with `*` or `?` are wildcard masks
+/// over that whole local name (`*` any run of bytes, `?` one byte, and inside a mask `#` one
+/// ASCII digit); any entry also matches as a case-insensitive suffix of it, so `.nfo`, `nfo`,
+/// `*.nfo`, `readme.nfo` and `*` all ignore `release.nfo` or `readme.nfo`, while `clip*` does
+/// not ignore `extras/clip.mkv`. Mirrors nzbget's `Util::MatchFileExt` + `WildMask`, which
+/// see the target file name, directories included.
 pub fn ignore_name_matches(local_name: &str, entry: &str) -> bool {
     let name = local_name.as_bytes();
     let pat = entry.as_bytes();
@@ -94,8 +96,7 @@ pub fn ignore_name_matches(local_name: &str, entry: &str) -> bool {
         return true;
     }
     if pat.iter().any(|&b| b == b'*' || b == b'?') {
-        let base = name.iter().rposition(|&b| b == b'/' || b == b'\\').map_or(name, |p| name.get(p.saturating_add(1)..).unwrap_or(&[]));
-        return wildcard_match(pat, base);
+        return wildcard_match(pat, name);
     }
     false
 }
