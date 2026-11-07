@@ -157,6 +157,106 @@ pub fn crc32_uncombine_prefix(crc_ab: u32, crc_a: u32, len_b: u64) -> u32 {
     crc_ab ^ multmodp(xpow_bytes(len_b), crc_a)
 }
 
+/// The operator "append `len` bytes" (`x^(8·len) mod P`) as four 256-entry tables, so that
+/// combining many checksums of the same length costs four lookups each instead of a 32-step
+/// multiply: `crc · c` is GF(2)-linear in `crc`, so `T_k[b] = (b << 8k) · c` and the product is
+/// the XOR of one lookup per byte of `crc`.
+///
+/// Build it once per slice size (≈2 µs) and reuse it: [`fold_ifsc_crcs_with`] and
+/// [`ifsc_interval_crcs`] do, and the plain folds switch to one automatically past
+/// [`Crc32Shift::MIN_PARTS`] parts.
+#[derive(Clone)]
+pub struct Crc32Shift {
+    tables: Box<[[u32; 256]; 4]>,
+    len: u64,
+}
+
+impl fmt::Debug for Crc32Shift {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Crc32Shift({} bytes)", self.len)
+    }
+}
+
+impl Crc32Shift {
+    /// Part count from which building a table pays for itself in the folds.
+    pub const MIN_PARTS: usize = 48;
+
+    /// Operator for `len` bytes.
+    pub fn new(len: u64) -> Self {
+        Self::from_operator(xpow_bytes(len), len)
+    }
+
+    #[allow(clippy::indexing_slicing)] // every index is a `u8` or `0..4`, always in range
+    fn from_operator(c: u32, len: u64) -> Self {
+        let mut tables = Box::new([[0u32; 256]; 4]);
+        for (k, table) in tables.iter_mut().enumerate() {
+            let mut basis = [0u32; 8];
+            for (bit, b) in basis.iter_mut().enumerate() {
+                *b = multmodp(1u32 << (8 * k + bit), c);
+            }
+            for b in 1usize..256 {
+                table[b] = table[b & (b - 1)] ^ basis[b.trailing_zeros() as usize];
+            }
+        }
+        Self { tables, len }
+    }
+
+    /// The number of bytes this operator appends.
+    pub fn byte_len(&self) -> u64 {
+        self.len
+    }
+
+    /// `crc · x^(8·len)`: the CRC after appending `len` zero bytes to a register holding `crc`
+    /// (raw register semantics; see [`crc32_zeros`] for finalised checksums).
+    #[inline]
+    #[allow(clippy::indexing_slicing)] // indices are bytes of `crc`
+    pub fn apply(&self, crc: u32) -> u32 {
+        let [b0, b1, b2, b3] = crc.to_le_bytes();
+        self.tables[0][b0 as usize] ^ self.tables[1][b1 as usize] ^ self.tables[2][b2 as usize] ^ self.tables[3][b3 as usize]
+    }
+
+    /// [`crc32_combine`] with `len2 == self.len()`: CRC of `crc1`'s data followed by
+    /// `crc2`'s data.
+    #[inline]
+    pub fn combine(&self, crc1: u32, crc2: u32) -> u32 {
+        self.apply(crc1) ^ crc2
+    }
+}
+
+/// Combines consecutive parts, switching to a [`Crc32Shift`] table when enough parts of one
+/// length are expected.
+struct Folder {
+    shift: Option<Crc32Shift>,
+    use_tables: bool,
+    rebuilds: u8,
+}
+
+impl Folder {
+    fn new(expected_parts: usize) -> Self {
+        Self { shift: None, use_tables: expected_parts >= Crc32Shift::MIN_PARTS, rebuilds: 0 }
+    }
+
+    #[inline]
+    fn combine(&mut self, acc: u32, crc: u32, len: u64) -> u32 {
+        if !self.use_tables {
+            return crc32_combine_u64(acc, crc, len);
+        }
+        if self.shift.as_ref().is_none_or(|s| s.byte_len() != len) {
+            // Lengths that keep changing (not the one odd tail part) are not worth tables.
+            if self.rebuilds >= 3 {
+                self.use_tables = false;
+                return crc32_combine_u64(acc, crc, len);
+            }
+            self.rebuilds += 1;
+            self.shift = Some(Crc32Shift::new(len));
+        }
+        match &self.shift {
+            Some(s) => s.combine(acc, crc),
+            None => crc32_combine_u64(acc, crc, len),
+        }
+    }
+}
+
 /// Why a set of part checksums could not be folded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FoldError {
@@ -189,7 +289,8 @@ pub fn fold_yenc_parts(parts: &[(u32, usize)]) -> Result<u32, FoldError> {
     let Some(&(first, _)) = it.next() else {
         return Err(FoldError::Empty);
     };
-    Ok(it.fold(first, |acc, &(crc, len)| crc32_combine(acc, crc, len)))
+    let mut folder = Folder::new(parts.len());
+    Ok(it.fold(first, |acc, &(crc, len)| folder.combine(acc, crc, len as u64)))
 }
 
 /// Fold yEnc parts given as `(part index, crc32, length)` in any order; every index in
@@ -207,6 +308,7 @@ pub fn fold_yenc_indexed_parts(total: usize, parts: &[(usize, u32, usize)]) -> R
     let mut expected = 0usize;
     let mut acc: Option<u32> = None;
     let mut last: Option<(usize, u32, usize)> = None;
+    let mut folder = Folder::new(total);
     for &(i, crc, len) in &sorted {
         if let Some((li, lc, ll)) = last
             && li == i
@@ -221,7 +323,7 @@ pub fn fold_yenc_indexed_parts(total: usize, parts: &[(usize, u32, usize)]) -> R
         }
         acc = Some(match acc {
             None => crc,
-            Some(a) => crc32_combine(a, crc, len),
+            Some(a) => folder.combine(a, crc, len as u64),
         });
         expected = expected.saturating_add(1);
         last = Some((i, crc, len));
@@ -235,6 +337,20 @@ pub fn fold_yenc_indexed_parts(total: usize, parts: &[(usize, u32, usize)]) -> R
 /// Fold PAR2 IFSC slice CRCs (each over a `block_size` slice, the last one zero padded) into
 /// the whole-file CRC-32. `None` when the slice count does not match `file_size / block_size`.
 pub fn fold_ifsc_crcs(slice_crcs: &[u32], block_size: u64, file_size: u64) -> Option<u32> {
+    if slice_crcs.len() >= Crc32Shift::MIN_PARTS {
+        return fold_ifsc_crcs_with(&Crc32Shift::new(block_size), slice_crcs, file_size);
+    }
+    fold_ifsc_impl(slice_crcs, block_size, file_size, |a, c| crc32_combine_u64(a, c, block_size))
+}
+
+/// [`fold_ifsc_crcs`] with a prebuilt operator for the set's block size (`shift.byte_len()`), for
+/// callers folding many files of one set: four lookups per slice instead of a multiply.
+pub fn fold_ifsc_crcs_with(shift: &Crc32Shift, slice_crcs: &[u32], file_size: u64) -> Option<u32> {
+    fold_ifsc_impl(slice_crcs, shift.byte_len(), file_size, |a, c| shift.combine(a, c))
+}
+
+/// Shared body of the IFSC folds; `combine_full(acc, crc)` appends one full `block_size` slice.
+fn fold_ifsc_impl(slice_crcs: &[u32], block_size: u64, file_size: u64, combine_full: impl Fn(u32, u32) -> u32) -> Option<u32> {
     if block_size == 0 {
         return None;
     }
@@ -253,13 +369,63 @@ pub fn fold_ifsc_crcs(slice_crcs: &[u32], block_size: u64, file_size: u64) -> Op
     for &c in full {
         acc = Some(match acc {
             None => c,
-            Some(a) => crc32_combine_u64(a, c, block_size),
+            Some(a) => combine_full(a, c),
         });
     }
     Some(match acc {
         None => last_crc,
         Some(a) => crc32_combine_u64(a, last_crc, last_len),
     })
+}
+
+/// Fold PAR2 IFSC slice CRCs (each over `block_size` bytes, the last one zero padded) onto
+/// `grid_size` intervals of the unpadded file: entry `k` is the CRC-32 of file bytes
+/// `[k · grid_size, (k + 1) · grid_size)`, the last entry covering the tail. Compare it with
+/// [`compute_interval_crcs`] of the file's articles on the same grid (`lcm_grid(&[article_size,
+/// block_size])`) to see *which* stretch of a file disagrees with its PAR2 set.
+///
+/// `None` when `grid_size` is not a positive multiple of `block_size`, `block_size == 0`, or
+/// the slice count does not fit `file_size`. A zero-length file has no intervals.
+pub fn ifsc_interval_crcs(slice_crcs: &[u32], block_size: u64, file_size: u64, grid_size: u64) -> Option<Vec<u32>> {
+    if block_size == 0 || grid_size == 0 || !grid_size.is_multiple_of(block_size) {
+        return None;
+    }
+    let slices = file_size.div_ceil(block_size);
+    if slices != slice_crcs.len() as u64 {
+        return None;
+    }
+    if file_size == 0 {
+        return Some(Vec::new());
+    }
+    let per_interval = usize::try_from(grid_size / block_size).ok()?;
+    let last_len = file_size - (slices - 1) * block_size; // 1..=block_size
+    let pad = block_size - last_len;
+    let shift = (slice_crcs.len() >= Crc32Shift::MIN_PARTS).then(|| Crc32Shift::new(block_size));
+    let combine_full = |a: u32, c: u32| match &shift {
+        Some(s) => s.combine(a, c),
+        None => crc32_combine_u64(a, c, block_size),
+    };
+    let (last, full) = slice_crcs.split_last()?;
+    let last_crc = crc32_unzero_u64(*last, pad);
+    let mut out = Vec::with_capacity(slice_crcs.len().div_ceil(per_interval));
+    let mut acc: Option<u32> = None;
+    let mut filled = 0usize;
+    for &c in full {
+        acc = Some(match acc {
+            None => c,
+            Some(a) => combine_full(a, c),
+        });
+        filled += 1;
+        if filled == per_interval {
+            out.push(acc.take().unwrap_or(0));
+            filled = 0;
+        }
+    }
+    out.push(match acc {
+        None => last_crc,
+        Some(a) => crc32_combine_u64(a, last_crc, last_len),
+    });
+    Some(out)
 }
 
 /// `O(1)`-per-byte sliding-window CRC-32 for a fixed window size.
@@ -351,6 +517,7 @@ pub fn compute_interval_crcs(parts: &[(u32, u64)], grid_size: u64) -> Option<Vec
     let mut out = Vec::new();
     let mut acc: Option<u32> = None;
     let mut filled: u64 = 0;
+    let mut folder = Folder::new(parts.len());
     for &(crc, len) in parts {
         if len == 0 {
             continue;
@@ -361,7 +528,7 @@ pub fn compute_interval_crcs(parts: &[(u32, u64)], grid_size: u64) -> Option<Vec
         }
         acc = Some(match acc {
             None => crc,
-            Some(a) => crc32_combine_u64(a, crc, len),
+            Some(a) => folder.combine(a, crc, len),
         });
         filled += len;
         if filled == grid_size {

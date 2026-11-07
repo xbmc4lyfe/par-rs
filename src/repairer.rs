@@ -63,9 +63,12 @@ pub struct RepairOptions {
     pub rename_misnamed: bool,
     /// Scanner buffer size.
     pub scan_buffer: usize,
-    /// Extensions (with the dot, case-insensitive, e.g. `.sfv`, `.nfo`, `.nzb`) of files whose
-    /// damage or absence must not trigger a repair (nzbget's `ParIgnoreExt`). They are still
-    /// repaired when a repair runs for other reasons.
+    /// Files whose damage or absence must not trigger a repair (nzbget's `ParIgnoreExt`); they
+    /// are still repaired when a repair runs for other reasons. Each entry is either an
+    /// extension (with the dot, e.g. `.sfv`, `.nfo`, `.nzb`: a case-insensitive suffix match on
+    /// the local name) or, when it contains `*` or `?`, a wildcard mask matched case-insensitively
+    /// against the file's base name (`*` any run of bytes, `?` one byte), as nzbget's
+    /// `Util::MatchFileExt` does. See [`ignore_name_matches`].
     pub ignore_extensions: Vec<String>,
     /// Also require the whole-file MD5 (and 16k MD5) to match before calling a file complete.
     /// Off by default: a file whose every slice matches its IFSC CRC-32 + MD5 at the expected
@@ -74,6 +77,53 @@ pub struct RepairOptions {
     pub full_file_md5: bool,
     /// SIMD kernel.
     pub kernel: Kernel,
+}
+
+/// Does one `RepairOptions::ignore_extensions` entry cover `local_name`? Entries with `*` or
+/// `?` are wildcard masks on the base name (`*` any run of bytes, `?` one byte); any entry also
+/// matches as a case-insensitive suffix of the whole local name, so `.nfo`, `nfo`, `*.nfo` and
+/// `*` all ignore `release.nfo`. Mirrors nzbget's `Util::MatchFileExt` + `WildMask`.
+pub fn ignore_name_matches(local_name: &str, entry: &str) -> bool {
+    let name = local_name.as_bytes();
+    let pat = entry.as_bytes();
+    if pat.is_empty() {
+        return false;
+    }
+    if name.len() >= pat.len() && name.get(name.len() - pat.len()..).is_some_and(|tail| tail.eq_ignore_ascii_case(pat)) {
+        return true;
+    }
+    if pat.iter().any(|&b| b == b'*' || b == b'?') {
+        let base = name.iter().rposition(|&b| b == b'/' || b == b'\\').map_or(name, |p| name.get(p.saturating_add(1)..).unwrap_or(&[]));
+        return wildcard_match(pat, base);
+    }
+    false
+}
+
+/// Case-insensitive glob (`*`, `?`) over bytes, iterative (no recursion, linear in the input).
+fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None; // (pattern index after '*', text index it covers)
+    while t < text.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p.saturating_add(1), t));
+                p = p.saturating_add(1);
+            }
+            Some(&pc) if pc == b'?' || text.get(t).is_some_and(|&tc| tc.eq_ignore_ascii_case(&pc)) => {
+                p = p.saturating_add(1);
+                t = t.saturating_add(1);
+            }
+            _ => match star {
+                Some((sp, st)) => {
+                    p = sp;
+                    t = st.saturating_add(1);
+                    star = Some((sp, t));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern.get(p..).is_some_and(|rest| rest.iter().all(|&b| b == b'*'))
 }
 
 impl Default for RepairOptions {
@@ -613,7 +663,7 @@ impl Par2Repairer {
                 None
             };
             self.checksums.push(cs);
-            let ignored = self.options.ignore_extensions.iter().any(|e| local.len() >= e.len() && local.get(local.len() - e.len()..).is_some_and(|t| t.eq_ignore_ascii_case(e)));
+            let ignored = self.options.ignore_extensions.iter().any(|e| ignore_name_matches(&local, e));
             self.files.push(SourceFileState {
                 file_id: *id,
                 target_filename: local,

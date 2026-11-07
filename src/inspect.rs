@@ -233,6 +233,8 @@ impl fmt::Display for CreatorTool {
 /// Decoded `Creator` packet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatorInfo {
+    /// Set id from the packet header; `None` when built by [`CreatorInfo::parse`] alone.
+    pub set_id: Option<[u8; 16]>,
     /// Raw client string (NUL padding removed, lossily decoded).
     pub raw: String,
     /// Classified tool.
@@ -283,7 +285,7 @@ impl CreatorInfo {
             .iter()
             .find(|a| lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|t| t == **a))
             .map(|a| (*a).to_owned());
-        Self { raw, tool, version, arch }
+        Self { set_id: None, raw, tool, version, arch }
     }
 }
 
@@ -358,6 +360,10 @@ pub struct MainInfo {
     pub non_recovery_set: Vec<[u8; 16]>,
     /// The body was shorter than its file count claimed.
     pub truncated: bool,
+    /// `MD5(body) == set_id`: PAR2 derives the set id from the Main packet body, so when this
+    /// holds the file lists above are exactly the ones the set id was made from (nobody added a
+    /// file to the set afterwards).
+    pub body_hashes_to_set_id: bool,
 }
 
 /// Decoded `FileDesc` packet.
@@ -572,7 +578,8 @@ fn parse_main(set_id: [u8; 16], body: &[u8], packed: bool) -> Option<MainInfo> {
             off = off.checked_add(16)?;
         }
     }
-    Some(MainInfo { set_id, slice_size, subslice_size, recovery_set, non_recovery_set, truncated })
+    let body_hashes_to_set_id = <[u8; 16]>::from(Md5::digest(body)) == set_id;
+    Some(MainInfo { set_id, slice_size, subslice_size, recovery_set, non_recovery_set, truncated, body_hashes_to_set_id })
 }
 
 fn parse_file_desc(set_id: [u8; 16], body: &[u8]) -> Option<FileDescInfo> {
@@ -756,7 +763,7 @@ pub fn inspect_par2_with(data: &[u8], verify: VerifyMode) -> Par2Inspection {
                         });
                     }
                 }
-                PacketKind::Creator => r.creators.push(CreatorInfo::parse(body)),
+                PacketKind::Creator => r.creators.push(CreatorInfo { set_id: Some(set_id), ..CreatorInfo::parse(body) }),
                 PacketKind::UniFileN => {
                     if let Some(file_id) = array::<16>(body, 0) {
                         r.unicode_names.push(UnicodeNameInfo { set_id, file_id, name: sanitize_utf16le_name(body.get(16..).unwrap_or(&[])) });
@@ -790,6 +797,89 @@ pub fn inspect_par2_with(data: &[u8], verify: VerifyMode) -> Par2Inspection {
         };
     }
     r
+}
+
+/// The packets an inventory needs, scanned in one optimistic pass: lengths are trusted while
+/// walking, every metadata packet's MD5 is checked afterwards in one 16-lane batch
+/// ([`crate::md5simd::md5_many`]), and recovery data is neither hashed nor decoded. Returns
+/// `None` the moment a packet fails its MD5, an unknown type cannot be verified, or an unknown
+/// packet is cut short: those are exactly the cases where [`inspect_par2_with`] resynchronises
+/// and must be used instead. When it returns `Some`, the result's `main`, `files`, `ifsc`,
+/// `unicode_names`, `creators` and `truncated` fields equal those of
+/// `inspect_par2_with(data, VerifyMode::Metadata)`; the other fields are left empty.
+pub(crate) fn inspect_for_inventory(data: &[u8]) -> Option<Par2Inspection> {
+    if parse_par1_header(data).is_some() {
+        return None;
+    }
+    let mut r = Par2Inspection { format: detect_format(data), ..Par2Inspection::default() };
+    let finder = memchr::memmem::Finder::new(&PAR2_MAGIC);
+    let mut msgs: Vec<&[u8]> = Vec::new();
+    let mut expected: Vec<[u8; 16]> = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let rest = data.get(pos..)?;
+        let Some(rel) = finder.find(rest) else { break };
+        let off = pos.saturating_add(rel);
+        let (Some(length), Some(md5), Some(set_id), Some(type_bytes)) = (u64_le(data, off.saturating_add(8)), array::<16>(data, off.saturating_add(16)), array::<16>(data, off.saturating_add(32)), array::<16>(data, off.saturating_add(48))) else {
+            r.truncated = true;
+            break;
+        };
+        if !shaped(length) {
+            pos = off.saturating_add(8);
+            continue;
+        }
+        let kind = PacketKind::from_type(&type_bytes);
+        let body_off = off.saturating_add(HEADER_LEN);
+        let body_len_u64 = length - HEADER_LEN as u64;
+        let available_body = data.len().saturating_sub(body_off).min(usize::try_from(body_len_u64).unwrap_or(usize::MAX));
+        let complete = available_body as u64 == body_len_u64;
+        if !complete {
+            if kind == PacketKind::Unknown {
+                return None; // the full scanner resynchronises here
+            }
+            r.truncated = true;
+            break;
+        }
+        let body = take(data, body_off, available_body).unwrap_or(&[]);
+        let bulk = matches!(kind, PacketKind::RecvSlic | PacketKind::PkdRecvS | PacketKind::FileSlic);
+        if !bulk {
+            // set id ‖ type ‖ body is contiguous in the buffer: hash it in place later.
+            msgs.push(take(data, off.saturating_add(32), available_body.saturating_add(32)).unwrap_or(&[]));
+            expected.push(md5);
+        }
+        match kind {
+            PacketKind::Main | PacketKind::PkdMain => {
+                if let Some(m) = parse_main(set_id, body, kind == PacketKind::PkdMain) {
+                    r.main.push(m);
+                }
+            }
+            PacketKind::FileDesc => {
+                if let Some(f) = parse_file_desc(set_id, body) {
+                    r.files.push(f);
+                }
+            }
+            PacketKind::Ifsc => {
+                if let Some(file_id) = array::<16>(body, 0) {
+                    r.ifsc.push(IfscInfo { set_id, file_id, slices: parse_checksum_pairs(body.get(16..).unwrap_or(&[])) });
+                }
+            }
+            PacketKind::UniFileN => {
+                if let Some(file_id) = array::<16>(body, 0) {
+                    r.unicode_names.push(UnicodeNameInfo { set_id, file_id, name: sanitize_utf16le_name(body.get(16..).unwrap_or(&[])) });
+                }
+            }
+            PacketKind::Creator => r.creators.push(CreatorInfo { set_id: Some(set_id), ..CreatorInfo::parse(body) }),
+            _ => {}
+        }
+        pos = usize::try_from(length).ok().and_then(|l| off.checked_add(l))?;
+    }
+    if !msgs.is_empty() {
+        let got = crate::md5simd::md5_many(&msgs);
+        if got.len() != expected.len() || got.iter().zip(&expected).any(|(g, e)| g != e) {
+            return None;
+        }
+    }
+    Some(r)
 }
 
 #[cfg(test)]

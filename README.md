@@ -80,6 +80,22 @@ md5: scalar 0.8 GB/s per core; 16-lane NEON/SSE2 kernel 4.5 GB/s per core (indep
 crc32 (crc32x, 3 streams): ~33 GB/s per core
 ```
 
+Indexer path (single core, M4; the Atlas project's own Rust code measured on a 2.3 GHz Xeon in
+parentheses for scale):
+
+```
+inventory, 200-file index, 19,600 slices, metadata MD5s verified:  2,365 /s   (821 /s, no MD5 check)
+inventory, 2-file index:                                           88,000 /s   (179,000 /s, no MD5 check)
+inventory, recovery volume:                                         1.0 GiB/s  (0.9 GiB/s)
+is_base_par2, mixed subjects:                                      52 M/s      (18.8 M/s)
+fold 94 yEnc part CRCs into a file CRC:                            548,000 /s  (56,000 /s)
+```
+
+`inventory` walks the buffer once trusting packet lengths, hashes every metadata packet in one
+16-lane MD5 batch, and only falls back to the resynchronising scanner when a packet fails
+(`inspect_for_inventory`); folding uses a per-block-size operator table (`Crc32Shift`, four
+lookups per slice instead of a 32-step multiply) once a set has enough slices to pay for it.
+
 What makes the hashing phases fast:
 
 * **Multi-lane MD5** (`md5simd`): per-slice digests are independent messages, so 16 of them share
@@ -176,7 +192,7 @@ CLI front end for manual use: `cargo run --release --example nzbpar -- {create|v
 
 ## Testing
 
-* `cargo test` — 136 unit tests, 2 doctests and 17 integration tests in five suites (`gf2_algebra`, `packet_resilience` — truncation sweeps, bit flips, torn headers, garbage; `bridge_and_verify`; `reed_solomon_repair` — SIMD vs scalar bit identity over sizes and alignments, batch / surgical / disk repair from real volumes; `streaming_repair` — scrambled 7000-byte articles into 8 KiB slices with early cutoff) (every kernel is checked against the scalar reference on every
+* `cargo test` — 136 unit tests, 2 doctests and 20 integration tests in six suites (`gf2_algebra`, `packet_resilience` — truncation sweeps, bit flips, torn headers, garbage; `bridge_and_verify`; `reed_solomon_repair` — SIMD vs scalar bit identity over sizes and alignments, batch / surgical / disk repair from real volumes; `streaming_repair` — scrambled 7000-byte articles into 8 KiB slices with early cutoff; `indexer_and_checker_requests` — the optimistic inventory scan against the resynchronising scanner over every prefix and bit flip, the subject rule, wildcard ignore masks, collection loading) (every kernel is checked against the scalar reference on every
   supported ISA of the host; packet parser against corrupt/shifted/duplicated streams; damage,
   scanner, engine, repairer and renamer end-to-end on temporary directories).
 * `tests/par2cmdline.rs` — differential tests against the `par2` binary when present: sets
@@ -213,6 +229,19 @@ CLI front end for manual use: `cargo run --release --example nzbpar -- {create|v
 * `PacketSet::file_id_by_name` / `file_id_by_hash16k` and the `*_by_name` entry points of
   `StreamingParSession` resolve ties in `libpar2` order; `renamer::direct_par_name` reproduces
   nzbget's `DirectRenamer::par_name`.
+* Indexer requests (Atlas `docs/PARITY_REQUESTS.md`): `Inventory.set_id` (primary set),
+  `MainInfo.body_hashes_to_set_id` (`MD5(body) == set_id`, so the file lists are the ones the set id
+  was made from), `CreatorInfo.set_id` (`None` from `CreatorInfo::parse`), and
+  `gf2::ifsc_interval_crcs` (IFSC slice CRCs on an article grid, to compare with
+  `compute_interval_crcs` interval by interval).
+* `is_base_par2` ends a name right after `.par2`: the next byte must be the end of the subject,
+  whitespace, a quote or a closing bracket (`a.par2.rar` and `a.par2-1` are not par2 files;
+  `"a.par2"`, `(a.par2)`, `[a.par2]` are). No allocation per subject.
+* `RepairOptions::ignore_extensions` entries containing `*` or `?` are wildcard masks on the base
+  name (nzbget `ParIgnoreExt=*`), matched by `repairer::ignore_name_matches`; plain entries stay
+  case-insensitive suffixes.
+* `packet::load_par2_collection(main_path, opts)` loads an index and its sibling volumes into a
+  `PacketSet` without a `Par2Repairer`.
 * `docs/PARITY_LIBRARY.md` is the integration brief exchanged with the RustyGet project.
 
 ## Notes for nzbget-rs integration

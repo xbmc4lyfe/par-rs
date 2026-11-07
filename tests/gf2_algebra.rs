@@ -123,3 +123,84 @@ fn rolling_crc_matches_direct_everywhere() {
         }
     }
 }
+
+#[test]
+fn shift_tables_equal_the_multiply() {
+    for len in [1u64, 7, 4096, 716_800, 10_752_000, 1 << 33] {
+        let s = Crc32Shift::new(len);
+        assert_eq!(s.byte_len(), len);
+        for &c1 in &[0u32, 1, ONE, GF2_POLY, 0xdead_beef, 0x1234_5678, 0xffff_ffff] {
+            for &c2 in &[0u32, 0x0bad_f00d, 0xffff_ffff] {
+                assert_eq!(s.combine(c1, c2), crc32_combine_u64(c1, c2, len), "len {len} c1 {c1:#x} c2 {c2:#x}");
+            }
+        }
+    }
+    // Folding past the table threshold gives the brute-force CRC, equal and unequal parts alike.
+    let file = data(150 * 1024 + 123, 42);
+    let want = crc32(&file);
+    let parts: Vec<(u32, usize)> = file.chunks(1024).map(|c| (crc32(c), c.len())).collect();
+    assert!(parts.len() >= Crc32Shift::MIN_PARTS);
+    assert_eq!(fold_yenc_parts(&parts).unwrap(), want);
+    let indexed: Vec<(usize, u32, usize)> = parts.iter().enumerate().rev().map(|(i, &(c, l))| (i, c, l)).collect();
+    assert_eq!(fold_yenc_indexed_parts(parts.len(), &indexed).unwrap(), want);
+    // Alternating part sizes: the folder gives up on tables and stays correct.
+    let mut alt = Vec::new();
+    let mut off = 0;
+    for i in 0.. {
+        if off >= file.len() {
+            break;
+        }
+        let l = if i % 2 == 0 { 1000 } else { 3000 }.min(file.len() - off);
+        alt.push((crc32(&file[off..off + l]), l));
+        off += l;
+    }
+    assert_eq!(fold_yenc_parts(&alt).unwrap(), want);
+    // IFSC: one shared table for many files of a set.
+    let bs = 1024u64;
+    let shift = Crc32Shift::new(bs);
+    for size in [1usize, 1023, 1024, 1025, 100 * 1024, 150 * 1024 + 123] {
+        let f = &file[..size];
+        let mut padded = f.to_vec();
+        padded.resize(size.div_ceil(bs as usize) * bs as usize, 0);
+        let crcs: Vec<u32> = padded.chunks(bs as usize).map(crc32).collect();
+        assert_eq!(fold_ifsc_crcs_with(&shift, &crcs, size as u64), Some(crc32(f)));
+        assert_eq!(fold_ifsc_crcs(&crcs, bs, size as u64), Some(crc32(f)));
+    }
+}
+
+#[test]
+fn ifsc_crcs_on_an_article_grid() {
+    // A file posted in 7000-byte articles and protected with 1000-byte slices: both sides fold
+    // onto the LCM grid and agree interval by interval, and each interval is the real CRC.
+    let file = data(10 * 7000 * 2 + 4321, 7);
+    let (art, bs) = (7000u64, 1000u64);
+    let grid = lcm_grid(&[art, bs]).unwrap();
+    assert_eq!(grid, 7000);
+    let articles: Vec<(u32, u64)> = file.chunks(art as usize).map(|c| (crc32(c), c.len() as u64)).collect();
+    let mut padded = file.clone();
+    padded.resize(file.len().div_ceil(bs as usize) * bs as usize, 0);
+    let slices: Vec<u32> = padded.chunks(bs as usize).map(crc32).collect();
+    let from_articles = compute_interval_crcs(&articles, grid).unwrap();
+    let from_ifsc = ifsc_interval_crcs(&slices, bs, file.len() as u64, grid).unwrap();
+    let direct: Vec<u32> = file.chunks(grid as usize).map(crc32).collect();
+    assert_eq!(from_ifsc, direct);
+    assert_eq!(from_articles, direct);
+    // Damage one article: exactly that interval differs.
+    let mut bad = articles.clone();
+    bad[3].0 ^= 1;
+    let diff: Vec<usize> = compute_interval_crcs(&bad, grid).unwrap().iter().zip(&from_ifsc).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i).collect();
+    assert_eq!(diff, vec![3]);
+    // Coarser grid, exact multiple of the file, single slice files, and the refusals.
+    assert_eq!(ifsc_interval_crcs(&slices, bs, file.len() as u64, 35_000).unwrap(), file.chunks(35_000).map(crc32).collect::<Vec<_>>());
+    let exact = &file[..140_000];
+    let crcs: Vec<u32> = exact.chunks(bs as usize).map(crc32).collect();
+    assert_eq!(ifsc_interval_crcs(&crcs, bs, 140_000, 7000).unwrap(), exact.chunks(7000).map(crc32).collect::<Vec<_>>());
+    let mut one = file[..999].to_vec();
+    one.resize(1000, 0);
+    assert_eq!(ifsc_interval_crcs(&[crc32(&one)], bs, 999, 5000).unwrap(), vec![crc32(&file[..999])]);
+    assert_eq!(ifsc_interval_crcs(&[], bs, 0, 5000), Some(vec![]));
+    assert_eq!(ifsc_interval_crcs(&slices, bs, file.len() as u64, 1500), None, "grid must be a multiple of the block size");
+    assert_eq!(ifsc_interval_crcs(&slices, 0, file.len() as u64, 7000), None);
+    assert_eq!(ifsc_interval_crcs(&slices, bs, file.len() as u64, 0), None);
+    assert_eq!(ifsc_interval_crcs(&slices[1..], bs, file.len() as u64, 7000), None, "slice count must fit the file");
+}

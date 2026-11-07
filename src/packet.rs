@@ -1492,6 +1492,32 @@ pub fn load_par2_bytes(data: &[u8], opts: ScanOptions) -> io::Result<PacketSet> 
     Ok(set)
 }
 
+/// Convenience: load `main_path` and every other file of its collection in the same directory
+/// (`name.par2`, `name.volXX+YY.par2`, case-insensitive) into a fresh set, without a repairer.
+/// Files of another set are skipped. Returns the set and the files that contributed packets,
+/// `main_path` first; the recovery slice references carry each file's index in that list as
+/// their `source_id`.
+pub fn load_par2_collection(main_path: &Path, opts: ScanOptions) -> io::Result<(PacketSet, Vec<std::path::PathBuf>)> {
+    let mut set = PacketSet::new();
+    set.load_file(main_path, 0, opts)?;
+    let mut loaded = vec![main_path.to_path_buf()];
+    let dir = main_path.parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    let main_name = main_path.file_name().map(crate::filenames::os_str_bytes).unwrap_or_default();
+    let mut siblings: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.file_name() != main_path.file_name() && !p.is_dir()).collect();
+    siblings.sort();
+    for p in siblings {
+        let name = p.file_name().map(crate::filenames::os_str_bytes).unwrap_or_default();
+        if !crate::filenames::same_par_collection(&name, &main_name, true) {
+            continue;
+        }
+        let stats = set.load_file(&p, loaded.len(), opts)?;
+        if stats.added > 0 {
+            loaded.push(p);
+        }
+    }
+    Ok((set, loaded))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------

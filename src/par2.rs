@@ -13,10 +13,9 @@
 //!   file it reports is reported for every longer prefix.
 
 use crate::bytes::{file_id_key, hex};
-use crate::gf2::fold_ifsc_crcs;
+use crate::gf2::{Crc32Shift, fold_ifsc_crcs, fold_ifsc_crcs_with};
 use crate::inspect::{Par2Inspection, VerifyMode, inspect_par2_with};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::OnceLock;
 
 /// One input file of a recovery set.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +43,10 @@ pub struct Par2File {
 /// Summary of every set found in a buffer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inventory {
+    /// Set id of the primary set (the set of the first `Main` packet, else of the first
+    /// `FileDesc`): the set `block_size` and `complete` describe. `None` for a buffer with no
+    /// decodable set.
+    pub set_id: Option<[u8; 16]>,
     /// Files, primary set first, ascending file id within a set (`libpar2` order: the id as a
     /// little-endian 128-bit integer).
     pub files: Vec<Par2File>,
@@ -60,35 +63,64 @@ pub struct Inventory {
     pub sealed: Vec<([u8; 16], [u8; 16])>,
 }
 
-fn base_par2_regex() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // A token ending in `.par2`; volumes are rejected afterwards.
-        #[allow(clippy::expect_used)] // literal pattern, verified by the unit tests
-        regex::Regex::new(r#"(?i)([^"\s<>\[\]()]+)\.par2\b"#).expect("valid regex")
-    })
+/// Bytes that delimit a file name inside a subject: whitespace, quotes and brackets.
+#[inline]
+fn name_delimiter(b: u8) -> bool {
+    b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'<' | b'>' | b'[' | b']' | b'(' | b')')
+}
+
+/// Is `stem` (lower-case insensitive, the name without `.par2`) a `.volNNN+MM` / `.volNNN-MM`
+/// recovery volume name?
+fn is_volume_stem(stem: &[u8]) -> bool {
+    // Find the last `.vol` (case-insensitive) and check what follows is `digits [+-] digits`.
+    let Some(p) = stem.windows(4).rposition(|w| w.eq_ignore_ascii_case(b".vol")) else {
+        return false;
+    };
+    let seg = stem.get(p.saturating_add(4)..).unwrap_or(&[]);
+    let Some(sep) = seg.iter().position(|&b| b == b'+' || b == b'-') else {
+        return false;
+    };
+    let (a, b) = (seg.get(..sep).unwrap_or(&[]), seg.get(sep.saturating_add(1)..).unwrap_or(&[]));
+    !a.is_empty() && !b.is_empty() && a.iter().all(u8::is_ascii_digit) && b.iter().all(u8::is_ascii_digit)
 }
 
 /// Does a Usenet subject refer to the base `.par2` index file (not a `.volNNN+MM.par2`
 /// volume)? Case-insensitive; quoted and unquoted names are recognised.
+///
+/// A name ends right after `.par2`: the next byte must be the end of the subject, whitespace, a
+/// quote or a closing bracket, so `a.par2.rar` and `a.par2-1` are not par2 files while
+/// `"a.par2"`, `(a.par2)` and `[a.par2]` are. No allocation: one pass over the bytes.
 pub fn is_base_par2(subject: &str) -> bool {
-    base_par2_regex().captures_iter(subject).any(|c| {
-        let stem = c.get(1).map_or("", |m| m.as_str()).to_ascii_lowercase();
-        match stem.rfind(".vol") {
-            None => true,
-            Some(p) => {
-                let seg = stem.get(p.saturating_add(4)..).unwrap_or("");
-                let is_volume = seg.split_once(['+', '-']).is_some_and(|(a, b)| !a.is_empty() && !b.is_empty() && a.bytes().all(|x| x.is_ascii_digit()) && b.bytes().all(|x| x.is_ascii_digit()));
-                !is_volume
-            }
+    let s = subject.as_bytes();
+    memchr::memchr_iter(b'.', s).any(|dot| {
+        // `.par2` here, ending the name?
+        if !s.get(dot.saturating_add(1)..dot.saturating_add(5)).is_some_and(|t| t.eq_ignore_ascii_case(b"par2")) {
+            return false;
         }
+        if s.get(dot.saturating_add(5)).is_some_and(|&b| !name_delimiter(b) || matches!(b, b'<' | b'[' | b'(')) {
+            return false;
+        }
+        // The name's stem: back to the previous delimiter; it must not be empty.
+        let start = s.get(..dot).map_or(0, |head| head.iter().rposition(|&b| name_delimiter(b)).map_or(0, |p| p.saturating_add(1)));
+        if start >= dot {
+            return false;
+        }
+        !is_volume_stem(s.get(start..dot).unwrap_or(&[]))
     })
 }
 
 /// Build the inventory of a par2 buffer. Metadata packets are MD5-verified (recovery data is
 /// not hashed), so a corrupt description is never reported as a file.
+///
+/// Intact buffers take a single optimistic pass with the metadata MD5s checked in one SIMD
+/// batch; a buffer with a failed MD5 or an unverifiable packet falls back to the full
+/// resynchronising scanner, so the result always equals
+/// `inventory_from(&inspect_par2_with(data, VerifyMode::Metadata))`.
 pub fn inventory(data: &[u8]) -> Inventory {
-    inventory_from(&inspect_par2_with(data, VerifyMode::Metadata))
+    match crate::inspect::inspect_for_inventory(data) {
+        Some(lean) => inventory_from(&lean),
+        None => inventory_from(&inspect_par2_with(data, VerifyMode::Metadata)),
+    }
 }
 
 /// Build the inventory from an existing inspection.
@@ -111,7 +143,11 @@ pub fn inventory_from(insp: &Par2Inspection) -> Inventory {
         }
     }
     let primary = set_order.first().copied();
+    inv.set_id = primary;
     inv.block_size = primary.and_then(|s| block_sizes.get(&s).copied()).filter(|&b| b > 0);
+    // One fold operator per set block size: four lookups per slice instead of a multiply.
+    let mut shifts: HashMap<u64, Crc32Shift> = HashMap::new();
+    let mut slices_seen: HashMap<u64, usize> = HashMap::new();
 
     let unicode: HashMap<([u8; 16], [u8; 16]), &str> = insp.unicode_names.iter().map(|u| ((u.set_id, u.file_id), u.name.as_str())).collect();
     type IfscMap<'a> = HashMap<([u8; 16], [u8; 16]), &'a [([u8; 16], u32)]>;
@@ -131,7 +167,14 @@ pub fn inventory_from(insp: &Par2Inspection) -> Inventory {
         let mut crc32 = None;
         if let (Some(bs), Some(slices)) = (block, ifsc.get(&(f.set_id, f.file_id))) {
             let crcs: Vec<u32> = slices.iter().map(|(_, c)| *c).collect();
-            crc32 = fold_ifsc_crcs(&crcs, bs, f.length);
+            // Build the set's table once there is enough folding ahead to pay for it.
+            let seen = slices_seen.entry(bs).or_insert(0);
+            *seen = seen.saturating_add(crcs.len());
+            crc32 = if *seen >= Crc32Shift::MIN_PARTS {
+                fold_ifsc_crcs_with(shifts.entry(bs).or_insert_with(|| Crc32Shift::new(bs)), &crcs, f.length)
+            } else {
+                fold_ifsc_crcs(&crcs, bs, f.length)
+            };
             if crc32.is_some() {
                 inv.sealed.push((f.set_id, f.file_id));
             }

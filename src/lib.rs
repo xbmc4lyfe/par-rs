@@ -113,8 +113,9 @@ pub mod twin;
 // signatures remain available under `crc::`.
 pub use crc::{Crc32, Crc32Combiner, WindowTable};
 pub use gf2::{
-    FoldError, GF2_ORDER, GF2_POLY, RollingCrc32, compute_interval_crcs, crc32, crc32_combine, crc32_combine_u64, crc32_uncombine_prefix, crc32_uncombine_suffix,
-    crc32_unzero, crc32_zero_unpad, crc32_zeros, fold_ifsc_crcs, fold_yenc_indexed_parts, fold_yenc_parts, lcm_grid, multmodp, x2nmodp, xpow,
+    Crc32Shift, FoldError, GF2_ORDER, GF2_POLY, RollingCrc32, compute_interval_crcs, crc32, crc32_combine, crc32_combine_u64, crc32_uncombine_prefix,
+    crc32_uncombine_suffix, crc32_unzero, crc32_zero_unpad, crc32_zeros, fold_ifsc_crcs, fold_ifsc_crcs_with, fold_yenc_indexed_parts, fold_yenc_parts,
+    ifsc_interval_crcs, lcm_grid, multmodp, x2nmodp, xpow,
 };
 pub use inspect::{CreatorInfo, CreatorTool, PacketKind, Par1Header, Par2FileName, Par2Inspection, Par3PacketHeader, ParFormat, VerifyMode, detect_format, inspect_par2, inspect_par2_with, parse_par2_filename};
 pub use par2::{Inventory, Par2File, display_name, file_descriptions, inventory, is_base_par2};
