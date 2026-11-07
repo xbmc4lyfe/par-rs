@@ -234,8 +234,8 @@ CLI front end for manual use: `cargo run --release --example nzbpar -- {create|v
   was made from), `CreatorInfo.set_id` (`None` from `CreatorInfo::parse`), and
   `gf2::ifsc_interval_crcs` (IFSC slice CRCs on an article grid, to compare with
   `compute_interval_crcs` interval by interval).
-* `is_base_par2` ends a name right after `.par2`: the next byte must be the end of the subject,
-  whitespace, a quote or a closing bracket (`a.par2.rar` and `a.par2-1` are not par2 files;
+* `is_base_par2` ends a name right after `.par2`: the next character must be the end of the subject,
+  whitespace (ASCII or Unicode), a quote or a closing bracket (`a.par2.rar` and `a.par2-1` are not par2 files;
   `"a.par2"`, `(a.par2)`, `[a.par2]` are). The name starts after the previous whitespace, quote
   or opening bracket, so `Show (2026).par2` and `Movie[rartv].par2` are par2 files too, as is
   the bare `".par2"` of an obfuscated post. No allocation per subject.
