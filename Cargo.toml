@@ -1,0 +1,48 @@
+[package]
+name = "par-rs"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-2.0-or-later"
+authors = ["xbmc4lyfe"]
+repository = "https://github.com/xbmc4lyfe/par-rs"
+readme = "README.md"
+description = "General-purpose SIMD-accelerated PAR2 parity crate: GF(2) checksum algebra, PAR1/PAR2/PAR3 packet introspection, obfuscated-file resolution, verification, Reed-Solomon repair, repair-while-downloading and recovery-set creation"
+keywords = ["par2", "parity", "reed-solomon", "crc32", "usenet"]
+categories = ["algorithms", "encoding"]
+
+[lib]
+name = "par_rs"
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = ["parallel", "mmap"]
+# Rayon-parallel hashing and syndrome work in `create` / `repair` (the engine's own thread pool is always on).
+parallel = ["dep:rayon"]
+# Memory-mapped file access for disk repair.
+mmap = ["dep:memmap2"]
+
+[dependencies]
+md-5 = { version = "0.10", default-features = false }
+memchr = { version = "2.7", default-features = false, features = ["std"] }
+crc32fast = "1.4"
+sha1 = "0.10"
+regex = "1"
+thiserror = "2"
+rayon = { version = "1.10", optional = true }
+memmap2 = { version = "0.9", optional = true }
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+
+[profile.test]
+opt-level = 2

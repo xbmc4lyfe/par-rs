@@ -1,0 +1,8 @@
+/target
+/bench/work
+/bench/data
+*.par2.bak
+.DS_Store
+# working notes, not part of the published crate
+/PLAN.md
+/full_spec.md
