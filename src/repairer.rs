@@ -80,9 +80,10 @@ pub struct RepairOptions {
 }
 
 /// Does one `RepairOptions::ignore_extensions` entry cover `local_name`? Entries with `*` or
-/// `?` are wildcard masks on the base name (`*` any run of bytes, `?` one byte); any entry also
-/// matches as a case-insensitive suffix of the whole local name, so `.nfo`, `nfo`, `*.nfo` and
-/// `*` all ignore `release.nfo`. Mirrors nzbget's `Util::MatchFileExt` + `WildMask`.
+/// `?` are wildcard masks on the base name (`*` any run of bytes, `?` one byte, and inside a
+/// mask `#` one ASCII digit); any entry also matches as a case-insensitive suffix of the whole
+/// local name, so `.nfo`, `nfo`, `*.nfo`, `readme.nfo` and `*` all ignore `release.nfo` or
+/// `readme.nfo`. Mirrors nzbget's `Util::MatchFileExt` + `WildMask`.
 pub fn ignore_name_matches(local_name: &str, entry: &str) -> bool {
     let name = local_name.as_bytes();
     let pat = entry.as_bytes();
@@ -99,7 +100,8 @@ pub fn ignore_name_matches(local_name: &str, entry: &str) -> bool {
     false
 }
 
-/// Case-insensitive glob (`*`, `?`) over bytes, iterative (no recursion, linear in the input).
+/// Case-insensitive glob (`*`, `?`, `#` = digit) over bytes, iterative (no recursion, linear in
+/// the input).
 fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
     let (mut p, mut t) = (0usize, 0usize);
     let mut star: Option<(usize, usize)> = None; // (pattern index after '*', text index it covers)
@@ -109,7 +111,7 @@ fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
                 star = Some((p.saturating_add(1), t));
                 p = p.saturating_add(1);
             }
-            Some(&pc) if pc == b'?' || text.get(t).is_some_and(|&tc| tc.eq_ignore_ascii_case(&pc)) => {
+            Some(&pc) if pc == b'?' || (pc == b'#' && text.get(t).is_some_and(u8::is_ascii_digit)) || text.get(t).is_some_and(|&tc| tc.eq_ignore_ascii_case(&pc)) => {
                 p = p.saturating_add(1);
                 t = t.saturating_add(1);
             }

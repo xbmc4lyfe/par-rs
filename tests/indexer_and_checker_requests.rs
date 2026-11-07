@@ -154,6 +154,14 @@ fn ignore_extensions_accept_wildcard_masks() {
         ("aaab", "*ab", true),
         ("aaab", "*a?b", true),
         ("aaab", "a*c", false),
+        // nzbget's WildMask: `#` is one digit inside a mask; a literal file name is a suffix match.
+        ("sample01.nfo", "sample##.*", true),
+        ("sample1.nfo", "sample##.*", false),
+        ("sampleAB.nfo", "sample##.*", false),
+        ("readme.nfo", "readme.nfo", true),
+        ("README.NFO", "readme.nfo", true),
+        ("xreadme.nfo", "readme.nfo", true),
+        ("sub/readme.nfo", "readme.nfo", true),
     ] {
         assert_eq!(ignore_name_matches(name, entry), want, "{name:?} vs {entry:?}");
     }

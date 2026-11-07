@@ -238,8 +238,9 @@ CLI front end for manual use: `cargo run --release --example nzbpar -- {create|v
   whitespace, a quote or a closing bracket (`a.par2.rar` and `a.par2-1` are not par2 files;
   `"a.par2"`, `(a.par2)`, `[a.par2]` are). No allocation per subject.
 * `RepairOptions::ignore_extensions` entries containing `*` or `?` are wildcard masks on the base
-  name (nzbget `ParIgnoreExt=*`), matched by `repairer::ignore_name_matches`; plain entries stay
-  case-insensitive suffixes.
+  name (nzbget `ParIgnoreExt=*`; inside a mask `#` is one digit, as in nzbget's `WildMask`),
+  matched by `repairer::ignore_name_matches`; every entry is also a case-insensitive suffix, so a
+  literal file name works too.
 * `packet::load_par2_collection(main_path, opts)` loads an index and its sibling volumes into a
   `PacketSet` without a `Par2Repairer`.
 * `docs/PARITY_LIBRARY.md` is the integration brief exchanged with the RustyGet project.
