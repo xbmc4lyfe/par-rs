@@ -21,7 +21,7 @@
 //! against the scalar reference** before accepting it, falling back to the next candidate on
 //! any mismatch. The scalar kernel is always available.
 
-use crate::gf16::{mul_acc_scalar, mul_acc_split_scalar, MulTables, ShuffleTables};
+use crate::gf16::{MulTables, ShuffleTables, mul_acc_scalar, mul_acc_split_scalar};
 
 /// Instruction set used by a [`Kernel`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -67,7 +67,8 @@ impl Isa {
             Isa::Avx2 => std::arch::is_x86_feature_detected!("avx2"),
             #[cfg(target_arch = "x86_64")]
             Isa::Avx512bw => {
-                std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512bw")
+                std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx512bw")
             }
             #[allow(unreachable_patterns)]
             _ => false,
@@ -125,7 +126,10 @@ impl<'a> Plane<'a> {
 
     /// Sub-range `[start, end)` of words.
     pub fn slice(&self, start: usize, end: usize) -> Plane<'a> {
-        Plane { lo: &self.lo[start..end], hi: &self.hi[start..end] }
+        Plane {
+            lo: &self.lo[start..end],
+            hi: &self.hi[start..end],
+        }
     }
 }
 
@@ -157,12 +161,18 @@ impl<'a> PlaneMut<'a> {
 
     /// Reborrow as read-only planes.
     pub fn as_plane(&self) -> Plane<'_> {
-        Plane { lo: self.lo, hi: self.hi }
+        Plane {
+            lo: self.lo,
+            hi: self.hi,
+        }
     }
 
     /// Reborrow a sub-range `[start, end)` of words mutably.
     pub fn slice_mut(&mut self, start: usize, end: usize) -> PlaneMut<'_> {
-        PlaneMut { lo: &mut self.lo[start..end], hi: &mut self.hi[start..end] }
+        PlaneMut {
+            lo: &mut self.lo[start..end],
+            hi: &mut self.hi[start..end],
+        }
     }
 }
 
@@ -241,7 +251,9 @@ impl Kernel {
         }
         for count in 1..=MAX_MULTI {
             let coeffs: Vec<u16> = (0..count).map(|_| rnd() as u16).collect();
-            let init: Vec<Vec<u8>> = (0..count).map(|_| (0..2 * n).map(|_| rnd() as u8).collect()).collect();
+            let init: Vec<Vec<u8>> = (0..count)
+                .map(|_| (0..2 * n).map(|_| rnd() as u8).collect())
+                .collect();
             let mut expect = init.clone();
             for (d, &c) in expect.iter_mut().zip(&coeffs) {
                 mul_acc_scalar(d, &src, &MulTables::new(c));
@@ -287,18 +299,32 @@ impl Kernel {
 
     /// `dst ^= coeff * src` on split planes.
     pub fn mul_acc_split(&self, dst: &mut PlaneMut, src: Plane, coeff: u16) {
-        let mut one = [PlaneMut { lo: dst.lo, hi: dst.hi }];
+        let mut one = [PlaneMut {
+            lo: dst.lo,
+            hi: dst.hi,
+        }];
         self.mul_acc_multi_split(&mut one, src, &[coeff]);
     }
 
     /// `dsts[i] ^= coeffs[i] * src` for every destination, loading `src` once per group of
     /// up to [`MAX_MULTI`] destinations.
     pub fn mul_acc_multi_split(&self, dsts: &mut [PlaneMut], src: Plane, coeffs: &[u16]) {
-        assert_eq!(dsts.len(), coeffs.len(), "mul_acc_multi_split: one coefficient per destination");
+        assert_eq!(
+            dsts.len(),
+            coeffs.len(),
+            "mul_acc_multi_split: one coefficient per destination"
+        );
         let n = src.lo.len();
-        assert_eq!(src.hi.len(), n, "mul_acc_multi_split: source planes differ in length");
+        assert_eq!(
+            src.hi.len(),
+            n,
+            "mul_acc_multi_split: source planes differ in length"
+        );
         for d in dsts.iter() {
-            assert!(d.lo.len() == n && d.hi.len() == n, "mul_acc_multi_split: destination length mismatch");
+            assert!(
+                d.lo.len() == n && d.hi.len() == n,
+                "mul_acc_multi_split: destination length mismatch"
+            );
         }
         if n == 0 || dsts.is_empty() {
             return;
@@ -371,9 +397,17 @@ impl Kernel {
     /// Buffers must all have the same length. An odd trailing byte is handled as by
     /// [`mul_acc_scalar`].
     pub fn mul_acc_multi(&self, dsts: &mut [&mut [u8]], src: &[u8], coeffs: &[u16]) {
-        assert_eq!(dsts.len(), coeffs.len(), "mul_acc_multi: one coefficient per destination");
+        assert_eq!(
+            dsts.len(),
+            coeffs.len(),
+            "mul_acc_multi: one coefficient per destination"
+        );
         for d in dsts.iter() {
-            assert_eq!(d.len(), src.len(), "mul_acc_multi: destination length mismatch");
+            assert_eq!(
+                d.len(),
+                src.len(),
+                "mul_acc_multi: destination length mismatch"
+            );
         }
         if dsts.is_empty() || src.is_empty() {
             return;
@@ -397,14 +431,20 @@ impl Kernel {
             let end = (start + TILE_WORDS).min(words);
             let n = end - start;
             self.deinterleave(&src[2 * start..2 * end], &mut slo[..n], &mut shi[..n]);
-            let srcp = Plane { lo: &slo[..n], hi: &shi[..n] };
+            let srcp = Plane {
+                lo: &slo[..n],
+                hi: &shi[..n],
+            };
             for (d, &c) in dsts.iter_mut().zip(coeffs) {
                 if c == 0 {
                     continue;
                 }
                 let tile = &mut d[2 * start..2 * end];
                 self.deinterleave(tile, &mut dlo[0][..n], &mut dhi[0][..n]);
-                let mut p = PlaneMut { lo: &mut dlo[0][..n], hi: &mut dhi[0][..n] };
+                let mut p = PlaneMut {
+                    lo: &mut dlo[0][..n],
+                    hi: &mut dhi[0][..n],
+                };
                 self.mul_acc_split(&mut p, srcp, c);
                 self.interleave(&dlo[0][..n], &dhi[0][..n], tile);
             }
@@ -427,7 +467,10 @@ impl Kernel {
     /// Split natural layout `src` (even length) into `lo`/`hi` planes of `src.len() / 2`.
     pub fn deinterleave(&self, src: &[u8], lo: &mut [u8], hi: &mut [u8]) {
         let n = src.len() / 2;
-        assert!(lo.len() == n && hi.len() == n && src.len().is_multiple_of(2), "deinterleave: length mismatch");
+        assert!(
+            lo.len() == n && hi.len() == n && src.len().is_multiple_of(2),
+            "deinterleave: length mismatch"
+        );
         match self.isa {
             Isa::Scalar => deinterleave_scalar(src, lo, hi),
             #[cfg(target_arch = "aarch64")]
@@ -444,7 +487,10 @@ impl Kernel {
     /// Merge `lo`/`hi` planes into natural layout `dst` of `2 * lo.len()`.
     pub fn interleave(&self, lo: &[u8], hi: &[u8], dst: &mut [u8]) {
         let n = lo.len();
-        assert!(hi.len() == n && dst.len() == 2 * n, "interleave: length mismatch");
+        assert!(
+            hi.len() == n && dst.len() == 2 * n,
+            "interleave: length mismatch"
+        );
         match self.isa {
             Isa::Scalar => interleave_scalar(lo, hi, dst),
             #[cfg(target_arch = "aarch64")]
@@ -496,7 +542,13 @@ fn scalar_tail(dsts: &mut [PlaneMut], src: Plane, tables: &[ShuffleTables], from
             continue;
         }
         let mt = MulTables::new(c);
-        mul_acc_split_scalar(&mut d.lo[from..n], &mut d.hi[from..n], &src.lo[from..n], &src.hi[from..n], &mt);
+        mul_acc_split_scalar(
+            &mut d.lo[from..n],
+            &mut d.hi[from..n],
+            &src.lo[from..n],
+            &src.hi[from..n],
+            &mt,
+        );
     }
 }
 
@@ -525,7 +577,11 @@ trait Simd: Copy {
 /// `dst ^= coeff * src` for `N` destinations using register type `S`.
 #[allow(dead_code)]
 #[inline(always)]
-unsafe fn simd_group<S: Simd, const N: usize>(dsts: &mut [PlaneMut], src: Plane, tables: &[ShuffleTables]) {
+unsafe fn simd_group<S: Simd, const N: usize>(
+    dsts: &mut [PlaneMut],
+    src: Plane,
+    tables: &[ShuffleTables],
+) {
     debug_assert!(dsts.len() == N && tables.len() == N);
     let n = src.lo.len();
     let vec_end = n - n % S::WIDTH;
@@ -836,10 +892,22 @@ mod arch {
         while i < vec_end {
             // SAFETY: 32 source bytes / 16 plane bytes in bounds.
             unsafe {
-                let a = _mm_shuffle_epi8(_mm_loadu_si128(src.as_ptr().add(2 * i) as *const __m128i), mask);
-                let b = _mm_shuffle_epi8(_mm_loadu_si128(src.as_ptr().add(2 * i + 16) as *const __m128i), mask);
-                _mm_storeu_si128(lo.as_mut_ptr().add(i) as *mut __m128i, _mm_unpacklo_epi64(a, b));
-                _mm_storeu_si128(hi.as_mut_ptr().add(i) as *mut __m128i, _mm_unpackhi_epi64(a, b));
+                let a = _mm_shuffle_epi8(
+                    _mm_loadu_si128(src.as_ptr().add(2 * i) as *const __m128i),
+                    mask,
+                );
+                let b = _mm_shuffle_epi8(
+                    _mm_loadu_si128(src.as_ptr().add(2 * i + 16) as *const __m128i),
+                    mask,
+                );
+                _mm_storeu_si128(
+                    lo.as_mut_ptr().add(i) as *mut __m128i,
+                    _mm_unpacklo_epi64(a, b),
+                );
+                _mm_storeu_si128(
+                    hi.as_mut_ptr().add(i) as *mut __m128i,
+                    _mm_unpackhi_epi64(a, b),
+                );
             }
             i += 16;
         }
@@ -856,8 +924,14 @@ mod arch {
             unsafe {
                 let a = _mm_loadu_si128(lo.as_ptr().add(i) as *const __m128i);
                 let b = _mm_loadu_si128(hi.as_ptr().add(i) as *const __m128i);
-                _mm_storeu_si128(dst.as_mut_ptr().add(2 * i) as *mut __m128i, _mm_unpacklo_epi8(a, b));
-                _mm_storeu_si128(dst.as_mut_ptr().add(2 * i + 16) as *mut __m128i, _mm_unpackhi_epi8(a, b));
+                _mm_storeu_si128(
+                    dst.as_mut_ptr().add(2 * i) as *mut __m128i,
+                    _mm_unpacklo_epi8(a, b),
+                );
+                _mm_storeu_si128(
+                    dst.as_mut_ptr().add(2 * i + 16) as *mut __m128i,
+                    _mm_unpackhi_epi8(a, b),
+                );
             }
             i += 16;
         }
@@ -868,13 +942,21 @@ mod arch {
     pub(super) unsafe fn avx2_deinterleave(src: &[u8], lo: &mut [u8], hi: &mut [u8]) {
         let n = lo.len();
         let vec_end = n - n % 32;
-        let mask = unsafe { _mm256_broadcastsi128_si256(_mm_loadu_si128(EVEN_ODD.as_ptr() as *const __m128i)) };
+        let mask = unsafe {
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(EVEN_ODD.as_ptr() as *const __m128i))
+        };
         let mut i = 0;
         while i < vec_end {
             // SAFETY: 64 source bytes / 32 plane bytes in bounds.
             unsafe {
-                let a = _mm256_shuffle_epi8(_mm256_loadu_si256(src.as_ptr().add(2 * i) as *const __m256i), mask);
-                let b = _mm256_shuffle_epi8(_mm256_loadu_si256(src.as_ptr().add(2 * i + 32) as *const __m256i), mask);
+                let a = _mm256_shuffle_epi8(
+                    _mm256_loadu_si256(src.as_ptr().add(2 * i) as *const __m256i),
+                    mask,
+                );
+                let b = _mm256_shuffle_epi8(
+                    _mm256_loadu_si256(src.as_ptr().add(2 * i + 32) as *const __m256i),
+                    mask,
+                );
                 // Per 128-bit lane: [a_lane lows | b_lane lows]; fix the qword order to
                 // [a0 a1 b0 b1] with a cross-lane qword permute (0,2,1,3).
                 let l = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_unpacklo_epi64(a, b));
@@ -896,10 +978,20 @@ mod arch {
             // SAFETY: bounds as above.
             unsafe {
                 // Reorder qwords (0,2,1,3) so that each 128-bit lane holds consecutive words.
-                let a = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_loadu_si256(lo.as_ptr().add(i) as *const __m256i));
-                let b = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_loadu_si256(hi.as_ptr().add(i) as *const __m256i));
-                _mm256_storeu_si256(dst.as_mut_ptr().add(2 * i) as *mut __m256i, _mm256_unpacklo_epi8(a, b));
-                _mm256_storeu_si256(dst.as_mut_ptr().add(2 * i + 32) as *mut __m256i, _mm256_unpackhi_epi8(a, b));
+                let a = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_loadu_si256(
+                    lo.as_ptr().add(i) as *const __m256i,
+                ));
+                let b = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_loadu_si256(
+                    hi.as_ptr().add(i) as *const __m256i,
+                ));
+                _mm256_storeu_si256(
+                    dst.as_mut_ptr().add(2 * i) as *mut __m256i,
+                    _mm256_unpacklo_epi8(a, b),
+                );
+                _mm256_storeu_si256(
+                    dst.as_mut_ptr().add(2 * i + 32) as *mut __m256i,
+                    _mm256_unpackhi_epi8(a, b),
+                );
             }
             i += 32;
         }
@@ -954,13 +1046,18 @@ mod tests {
     #[test]
     fn natural_layout_matches_reference_for_all_kernels() {
         for k in all_kernels() {
-            for len in [0usize, 1, 2, 3, 31, 32, 33, 64, 127, 128, 1000, 1001, 8192, 8193, 20_000] {
+            for len in [
+                0usize, 1, 2, 3, 31, 32, 33, 64, 127, 128, 1000, 1001, 8192, 8193, 20_000,
+            ] {
                 let src = rnd_bytes(len, 1);
                 let coeffs = [0u16, 1, 0x1234, 0xFFFF, 0x8001, 7];
-                let mut bufs: Vec<Vec<u8>> = (0..coeffs.len()).map(|i| rnd_bytes(len, 100 + i as u64)).collect();
+                let mut bufs: Vec<Vec<u8>> = (0..coeffs.len())
+                    .map(|i| rnd_bytes(len, 100 + i as u64))
+                    .collect();
                 let orig = bufs.clone();
                 {
-                    let mut refs: Vec<&mut [u8]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
+                    let mut refs: Vec<&mut [u8]> =
+                        bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
                     k.mul_acc_multi(&mut refs, &src, &coeffs);
                 }
                 for (j, &c) in coeffs.iter().enumerate() {
@@ -982,13 +1079,22 @@ mod tests {
             for n in [0usize, 1, 15, 16, 17, 63, 64, 65, 500, 4096 + 3] {
                 let slo = rnd_bytes(n, 3);
                 let shi = rnd_bytes(n, 4);
-                let coeffs: Vec<u16> = (0..(MAX_MULTI + 3) as u16).map(|i| i.wrapping_mul(0x9E37).wrapping_add(1)).collect();
-                let mut dl: Vec<Vec<u8>> = (0..coeffs.len()).map(|i| rnd_bytes(n, 50 + i as u64)).collect();
-                let mut dh: Vec<Vec<u8>> = (0..coeffs.len()).map(|i| rnd_bytes(n, 80 + i as u64)).collect();
+                let coeffs: Vec<u16> = (0..(MAX_MULTI + 3) as u16)
+                    .map(|i| i.wrapping_mul(0x9E37).wrapping_add(1))
+                    .collect();
+                let mut dl: Vec<Vec<u8>> = (0..coeffs.len())
+                    .map(|i| rnd_bytes(n, 50 + i as u64))
+                    .collect();
+                let mut dh: Vec<Vec<u8>> = (0..coeffs.len())
+                    .map(|i| rnd_bytes(n, 80 + i as u64))
+                    .collect();
                 let (ol, oh) = (dl.clone(), dh.clone());
                 {
-                    let mut planes: Vec<PlaneMut> =
-                        dl.iter_mut().zip(dh.iter_mut()).map(|(l, h)| PlaneMut { lo: l, hi: h }).collect();
+                    let mut planes: Vec<PlaneMut> = dl
+                        .iter_mut()
+                        .zip(dh.iter_mut())
+                        .map(|(l, h)| PlaneMut { lo: l, hi: h })
+                        .collect();
                     k.mul_acc_multi_split(&mut planes, Plane { lo: &slo, hi: &shi }, &coeffs);
                 }
                 for (j, &c) in coeffs.iter().enumerate() {

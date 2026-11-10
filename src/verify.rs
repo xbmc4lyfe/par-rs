@@ -78,7 +78,9 @@ pub struct FileVerification {
 impl FileVerification {
     /// Every slice verified at its natural offset and the size matches.
     pub fn is_intact(&self) -> bool {
-        self.size_ok && self.slices.iter().all(|s| *s == SliceStatus::Verified) && self.md5_ok != Some(false)
+        self.size_ok
+            && self.slices.iter().all(|s| *s == SliceStatus::Verified)
+            && self.md5_ok != Some(false)
     }
 }
 
@@ -150,7 +152,14 @@ impl SetVerifier {
                 }
             }
         }
-        Some(Self { block_size, files, first_slice, total, index, filter })
+        Some(Self {
+            block_size,
+            files,
+            first_slice,
+            total,
+            index,
+            filter,
+        })
     }
 
     /// Verifier for the primary set of an inspection (the set of its first `Main` packet).
@@ -161,14 +170,24 @@ impl SetVerifier {
             .recovery_set
             .iter()
             .filter_map(|id| {
-                let desc = insp.files.iter().find(|f| f.set_id == main.set_id && f.file_id == *id);
-                let ifsc = insp.ifsc.iter().find(|i| i.set_id == main.set_id && i.file_id == *id)?;
+                let desc = insp
+                    .files
+                    .iter()
+                    .find(|f| f.set_id == main.set_id && f.file_id == *id);
+                let ifsc = insp
+                    .ifsc
+                    .iter()
+                    .find(|i| i.set_id == main.set_id && i.file_id == *id)?;
                 let size = desc.map(|d| d.length)?;
                 Some(SourceSpec {
                     file_id: *id,
                     size,
                     md5: desc.map(|d| d.md5),
-                    slices: ifsc.slices.iter().map(|&(md5, crc32)| SliceChecksum { md5, crc32 }).collect(),
+                    slices: ifsc
+                        .slices
+                        .iter()
+                        .map(|&(md5, crc32)| SliceChecksum { md5, crc32 })
+                        .collect(),
                 })
             })
             .collect();
@@ -198,12 +217,21 @@ impl SetVerifier {
     /// Global slice number of slice `slice` of file `file`.
     pub fn global_slice(&self, file: usize, slice: usize) -> Option<usize> {
         let f = self.files.get(file)?;
-        (slice < f.slices.len()).then(|| self.first_slice.get(file).copied().unwrap_or(0).saturating_add(slice))
+        (slice < f.slices.len()).then(|| {
+            self.first_slice
+                .get(file)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(slice)
+        })
     }
 
     /// `(file, slice)` of a global slice number.
     pub fn locate_global(&self, global: usize) -> Option<(usize, usize)> {
-        let fi = self.first_slice.partition_point(|&s| s <= global).checked_sub(1)?;
+        let fi = self
+            .first_slice
+            .partition_point(|&s| s <= global)
+            .checked_sub(1)?;
         let first = *self.first_slice.get(fi)?;
         let slice = global.checked_sub(first)?;
         (slice < self.files.get(fi)?.slices.len()).then_some((fi, slice))
@@ -212,7 +240,9 @@ impl SetVerifier {
     #[inline]
     fn may_contain(&self, crc: u32) -> bool {
         let bit = (crc & 0xFFFF) as usize;
-        self.filter.get(bit / 64).is_some_and(|w| w & (1u64 << (bit % 64)) != 0)
+        self.filter
+            .get(bit / 64)
+            .is_some_and(|w| w & (1u64 << (bit % 64)) != 0)
     }
 
     /// MD5 of `data` zero padded to the block size.
@@ -237,14 +267,29 @@ impl SetVerifier {
         if data.len() > bs {
             return false;
         }
-        let crc = if data.len() == bs { crc32(data) } else { crate::gf2::crc32_combine(crc32(data), crate::gf2::crc32_zeros(bs - data.len()), bs - data.len()) };
+        let crc = if data.len() == bs {
+            crc32(data)
+        } else {
+            crate::gf2::crc32_combine(
+                crc32(data),
+                crate::gf2::crc32_zeros(bs - data.len()),
+                bs - data.len(),
+            )
+        };
         crc == expected.crc32 && self.padded_md5(data) == expected.md5
     }
 
     /// Verify `data` as the contents of file `file`.
     pub fn verify_file(&self, file: usize, data: &[u8]) -> FileVerification {
         let Some(spec) = self.files.get(file) else {
-            return FileVerification { file, size_ok: false, md5_ok: None, slices: Vec::new(), found: Vec::new(), verified: 0 };
+            return FileVerification {
+                file,
+                size_ok: false,
+                md5_ok: None,
+                slices: Vec::new(),
+                found: Vec::new(),
+                verified: 0,
+            };
         };
         let bs = usize::try_from(self.block_size).unwrap_or(usize::MAX);
         let size_ok = data.len() as u64 == spec.size;
@@ -265,10 +310,15 @@ impl SetVerifier {
                 slices.push(SliceStatus::Damaged);
             }
         }
-        let md5_ok = spec.md5.filter(|_| size_ok).map(|m| <[u8; 16]>::from(Md5::digest(data)) == m);
+        let md5_ok = spec
+            .md5
+            .filter(|_| size_ok)
+            .map(|m| <[u8; 16]>::from(Md5::digest(data)) == m);
         let mut found = Vec::new();
         if slices.iter().any(|s| *s != SliceStatus::Verified) {
-            found = self.sliding_search(data, |fi, si| fi == file && slices.get(si).is_some_and(|s| *s == SliceStatus::Verified));
+            found = self.sliding_search(data, |fi, si| {
+                fi == file && slices.get(si).is_some_and(|s| *s == SliceStatus::Verified)
+            });
             for f in &found {
                 if f.file == file
                     && let Some(s) = slices.get_mut(f.slice)
@@ -281,35 +331,61 @@ impl SetVerifier {
                 }
             }
         }
-        FileVerification { file, size_ok, md5_ok, slices, found, verified }
+        FileVerification {
+            file,
+            size_ok,
+            md5_ok,
+            slices,
+            found,
+            verified,
+        }
     }
 
     /// Slide a block-sized window over `data` (continuing into virtual zero padding at the end)
     /// and report every slice of the set found, skipping `(file, slice)` pairs for which
     /// `already(file, slice)` is true.
-    pub fn sliding_search(&self, data: &[u8], already: impl Fn(usize, usize) -> bool) -> Vec<FoundSlice> {
+    pub fn sliding_search(
+        &self,
+        data: &[u8],
+        already: impl Fn(usize, usize) -> bool,
+    ) -> Vec<FoundSlice> {
         let mut out = Vec::new();
         let bs = usize::try_from(self.block_size).unwrap_or(usize::MAX);
-        let Some(roller) = RollingCrc32::new(self.block_size) else { return out };
+        let Some(roller) = RollingCrc32::new(self.block_size) else {
+            return out;
+        };
         if data.is_empty() {
             return out;
         }
         // Initial window: the first `bs` bytes (zero padded when the buffer is shorter).
         let first_len = data.len().min(bs);
         let first = data.get(..first_len).unwrap_or(&[]);
-        let mut crc = if first_len == bs { crc32(first) } else { crate::gf2::crc32_combine(crc32(first), crate::gf2::crc32_zeros(bs - first_len), bs - first_len) };
+        let mut crc = if first_len == bs {
+            crc32(first)
+        } else {
+            crate::gf2::crc32_combine(
+                crc32(first),
+                crate::gf2::crc32_zeros(bs - first_len),
+                bs - first_len,
+            )
+        };
         let mut reported: HashMap<(usize, usize), ()> = HashMap::new();
         let last_start = data.len().saturating_sub(1);
         for pos in 0..=last_start {
             if pos != 0 {
                 let out_byte = data.get(pos - 1).copied().unwrap_or(0);
-                let in_byte = data.get(pos.saturating_add(bs).saturating_sub(1)).copied().unwrap_or(0);
+                let in_byte = data
+                    .get(pos.saturating_add(bs).saturating_sub(1))
+                    .copied()
+                    .unwrap_or(0);
                 crc = roller.roll(crc, out_byte, in_byte);
             }
             if !self.may_contain(crc) {
                 continue;
             }
-            let Some(cands) = self.index.get(&crc) else { continue };
+            let Some(cands) = self.index.get(&crc) else {
+                continue;
+            };
             let end = pos.saturating_add(bs).min(data.len());
             let chunk = data.get(pos..end).unwrap_or(&[]);
             let mut digest: Option<[u8; 16]> = None;
@@ -317,11 +393,23 @@ impl SetVerifier {
                 if already(fi, si) || reported.contains_key(&(fi, si)) {
                     continue;
                 }
-                let Some(exp) = self.files.get(fi).and_then(|f| f.slices.get(si)) else { continue };
+                let Some(exp) = self.files.get(fi).and_then(|f| f.slices.get(si)) else {
+                    continue;
+                };
                 let d = *digest.get_or_insert_with(|| self.padded_md5(chunk));
                 if d == exp.md5 {
                     reported.insert((fi, si), ());
-                    out.push(FoundSlice { file: fi, slice: si, global: self.first_slice.get(fi).copied().unwrap_or(0).saturating_add(si), offset: pos as u64 });
+                    out.push(FoundSlice {
+                        file: fi,
+                        slice: si,
+                        global: self
+                            .first_slice
+                            .get(fi)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_add(si),
+                        offset: pos as u64,
+                    });
                 }
             }
         }
@@ -330,7 +418,11 @@ impl SetVerifier {
 
     /// Verify several buffers (`(file index, contents)`) and locate every slice of the set.
     pub fn verify_files(&self, buffers: &[(usize, &[u8])]) -> VerificationReport {
-        let mut report = VerificationReport { total_slices: self.total, located: vec![None; self.total], ..VerificationReport::default() };
+        let mut report = VerificationReport {
+            total_slices: self.total,
+            located: vec![None; self.total],
+            ..VerificationReport::default()
+        };
         for (bi, &(file, data)) in buffers.iter().enumerate() {
             let fv = self.verify_file(file, data);
             let bs = self.block_size;
@@ -357,14 +449,26 @@ impl SetVerifier {
             }
             report.files.push(fv);
         }
-        report.missing = report.located.iter().enumerate().filter(|(_, l)| l.is_none()).map(|(g, _)| g).collect();
+        report.missing = report
+            .located
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.is_none())
+            .map(|(g, _)| g)
+            .collect();
         report
     }
 
     /// Repairability given `recovery_slices` usable recovery slices.
     pub fn assess(&self, report: &VerificationReport, recovery_slices: usize) -> RepairAssessment {
         let missing = report.missing.len();
-        RepairAssessment { total_slices: self.total, missing_slices: missing, recovery_slices, repairable: missing <= recovery_slices, shortfall: missing.saturating_sub(recovery_slices) }
+        RepairAssessment {
+            total_slices: self.total,
+            missing_slices: missing,
+            recovery_slices,
+            repairable: missing <= recovery_slices,
+            shortfall: missing.saturating_sub(recovery_slices),
+        }
     }
 }
 
@@ -373,7 +477,9 @@ mod tests {
     use super::*;
 
     fn data(n: usize, seed: u32) -> Vec<u8> {
-        (0..n as u32).map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8).collect()
+        (0..n as u32)
+            .map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8)
+            .collect()
     }
 
     fn spec(id: u8, bytes: &[u8], bs: usize) -> SourceSpec {
@@ -382,10 +488,18 @@ mod tests {
             .map(|c| {
                 let mut p = c.to_vec();
                 p.resize(bs, 0);
-                SliceChecksum { md5: Md5::digest(&p).into(), crc32: crc32(&p) }
+                SliceChecksum {
+                    md5: Md5::digest(&p).into(),
+                    crc32: crc32(&p),
+                }
             })
             .collect();
-        SourceSpec { file_id: [id; 16], size: bytes.len() as u64, md5: Some(Md5::digest(bytes).into()), slices }
+        SourceSpec {
+            file_id: [id; 16],
+            size: bytes.len() as u64,
+            md5: Some(Md5::digest(bytes).into()),
+            slices,
+        }
     }
 
     #[test]
@@ -434,7 +548,11 @@ mod tests {
 
         // A buffer that is really file b, offered as file a: its slices are found via sliding.
         let r = v.verify_file(1, &b);
-        let found_b: Vec<(usize, usize, u64)> = r.found.iter().map(|f| (f.file, f.slice, f.offset)).collect();
+        let found_b: Vec<(usize, usize, u64)> = r
+            .found
+            .iter()
+            .map(|f| (f.file, f.slice, f.offset))
+            .collect();
         assert_eq!(found_b, vec![(0, 0, 0), (0, 1, 1000)]);
 
         let report = v.verify_files(&[(1, &dmg), (0, &b)]);
@@ -446,7 +564,10 @@ mod tests {
         assert!(asmt.repairable);
         assert_eq!(asmt.shortfall, 0);
         let asmt = v.assess(&report, 0);
-        assert_eq!((asmt.repairable, asmt.shortfall, asmt.missing_slices), (false, 1, 1));
+        assert_eq!(
+            (asmt.repairable, asmt.shortfall, asmt.missing_slices),
+            (false, 1, 1)
+        );
 
         assert!(v.verify_file(5, &a).slices.is_empty());
         assert!(SetVerifier::new(0, vec![]).is_none());

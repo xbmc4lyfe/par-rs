@@ -5,14 +5,18 @@
 //! * Sets created by `par2 create` must be parsed, verified and repaired by this crate,
 //!   including recovery data produced by `par2cmdline`'s own GF(2^16) implementation.
 
-use par_rs::create::{create, CreateOptions, SourceFile, VolumeScheme};
-use par_rs::packet::{load_par2_file, ScanOptions};
+use par_rs::create::{CreateOptions, SourceFile, VolumeScheme, create};
+use par_rs::packet::{ScanOptions, load_par2_file};
 use par_rs::repairer::{NullObserver, Par2Repairer, RepairOptions, RepairResult};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn par2_available() -> bool {
-    Command::new("par2").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("par2")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn rnd(n: usize, seed: u64) -> Vec<u8> {
@@ -35,8 +39,16 @@ fn tmpdir(tag: &str) -> PathBuf {
 }
 
 fn par2(dir: &Path, args: &[&str]) -> (bool, String) {
-    let out = Command::new("par2").args(args).current_dir(dir).output().expect("run par2");
-    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let out = Command::new("par2")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run par2");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     (out.status.success(), text)
 }
 
@@ -67,8 +79,16 @@ fn par2cmdline_verifies_and_repairs_our_sets() {
     }
     let dir = tmpdir("ours");
     let files = write_files(&dir, &[200_000, 70_001, 4096, 0]);
-    let sources: Vec<SourceFile> = files.iter().map(|(n, _)| SourceFile::new(dir.join(n))).collect();
-    let opts = CreateOptions { slice_size: 4096, recovery_blocks: 20, volumes: VolumeScheme::Exponential, ..CreateOptions::default() };
+    let sources: Vec<SourceFile> = files
+        .iter()
+        .map(|(n, _)| SourceFile::new(dir.join(n)))
+        .collect();
+    let opts = CreateOptions {
+        slice_size: 4096,
+        recovery_blocks: 20,
+        volumes: VolumeScheme::Exponential,
+        ..CreateOptions::default()
+    };
     create(&sources, &dir, "ours", &opts, None, &mut |_, _, _| {}).unwrap();
 
     let (ok, text) = par2(&dir, &["verify", "ours.par2"]);
@@ -87,7 +107,10 @@ fn par2cmdline_verifies_and_repairs_our_sets() {
     // 4 + 18 + 1 = 23 missing > 20 → par2 must report repair impossible with the loaded volumes.
     let (ok, text) = par2(&dir, &["verify", "ours.par2"]);
     assert!(!ok);
-    assert!(text.contains("Repair is not possible") || text.contains("need"), "{text}");
+    assert!(
+        text.contains("Repair is not possible") || text.contains("need"),
+        "{text}"
+    );
 
     // Restore data1 partially (first half) so 4 + 9 + 1 = 14 ≤ 20 and repair with par2.
     std::fs::write(dir.join("data1.bin"), &files[1].1[..36_000]).unwrap();
@@ -105,7 +128,20 @@ fn we_verify_and_repair_par2cmdline_sets() {
     }
     let dir = tmpdir("theirs");
     let files = write_files(&dir, &[150_000, 33_333, 10, 0]);
-    let (ok, text) = par2(&dir, &["create", "-s4000", "-c15", "-n3", "theirs.par2", "data0.bin", "data1.bin", "data2.bin", "data3.bin"]);
+    let (ok, text) = par2(
+        &dir,
+        &[
+            "create",
+            "-s4000",
+            "-c15",
+            "-n3",
+            "theirs.par2",
+            "data0.bin",
+            "data1.bin",
+            "data2.bin",
+            "data3.bin",
+        ],
+    );
     assert!(ok, "par2 create failed:\n{text}");
 
     // Parse everything par2cmdline wrote.
@@ -143,7 +179,16 @@ fn we_verify_and_repair_par2cmdline_sets() {
     assert_eq!(v.missing_blocks, 4 + 9 + 1);
     assert!(v.repair_possible);
     let res = r.repair(&mut NullObserver).unwrap();
-    assert!(matches!(res, RepairResult::Repaired { blocks_recovered: 14, .. }), "{res:?}");
+    assert!(
+        matches!(
+            res,
+            RepairResult::Repaired {
+                blocks_recovered: 14,
+                ..
+            }
+        ),
+        "{res:?}"
+    );
     check(&dir, &files);
     // par2cmdline agrees the result is correct.
     let (ok, text) = par2(&dir, &["verify", "theirs.par2"]);
@@ -160,7 +205,17 @@ fn renamed_and_split_files_with_par2cmdline_set() {
     }
     let dir = tmpdir("renamed");
     let files = write_files(&dir, &[64_000, 30_000]);
-    let (ok, text) = par2(&dir, &["create", "-s2000", "-c6", "set.par2", "data0.bin", "data1.bin"]);
+    let (ok, text) = par2(
+        &dir,
+        &[
+            "create",
+            "-s2000",
+            "-c6",
+            "set.par2",
+            "data0.bin",
+            "data1.bin",
+        ],
+    );
     assert!(ok, "{text}");
     // Obfuscate data0, split data1 into misaligned pieces.
     std::fs::rename(dir.join("data0.bin"), dir.join("a1b2c3.xyz")).unwrap();
@@ -179,7 +234,13 @@ fn renamed_and_split_files_with_par2cmdline_set() {
     // The block straddling offset 11111 (block 5: 10000..12000) is lost; everything else found.
     assert_eq!(r.missing_blocks(), 1);
     let res = r.repair(&mut NullObserver).unwrap();
-    assert!(matches!(res, RepairResult::Repaired { blocks_recovered: 1, .. }));
+    assert!(matches!(
+        res,
+        RepairResult::Repaired {
+            blocks_recovered: 1,
+            ..
+        }
+    ));
     check(&dir, &files);
     let (ok, text) = par2(&dir, &["verify", "set.par2"]);
     assert!(ok, "{text}");
@@ -195,7 +256,10 @@ fn large_slice_count_and_many_missing_blocks() {
     let dir = tmpdir("many");
     let files = write_files(&dir, &[1_000_000]);
     // 1000 input blocks, 300 recovery blocks from par2cmdline.
-    let (ok, text) = par2(&dir, &["create", "-s1000", "-c300", "-n1", "many.par2", "data0.bin"]);
+    let (ok, text) = par2(
+        &dir,
+        &["create", "-s1000", "-c300", "-n1", "many.par2", "data0.bin"],
+    );
     assert!(ok, "{text}");
     let p = dir.join("data0.bin");
     let d = std::fs::read(&p).unwrap();
@@ -205,7 +269,13 @@ fn large_slice_count_and_many_missing_blocks() {
         dmg[b * 1000..(b + 1) * 1000].fill(0);
     }
     std::fs::write(&p, &dmg).unwrap();
-    let mut r = Par2Repairer::new(&dir, RepairOptions { num_threads: 0, ..RepairOptions::default() });
+    let mut r = Par2Repairer::new(
+        &dir,
+        RepairOptions {
+            num_threads: 0,
+            ..RepairOptions::default()
+        },
+    );
     r.load_par2_set(&dir.join("many.par2")).unwrap();
     r.finalize().unwrap();
     let v = r.verify(None, &mut NullObserver).unwrap();
@@ -213,7 +283,13 @@ fn large_slice_count_and_many_missing_blocks() {
     let t = std::time::Instant::now();
     let res = r.repair(&mut NullObserver).unwrap();
     eprintln!("repaired 250 blocks in {:.2}s", t.elapsed().as_secs_f64());
-    assert!(matches!(res, RepairResult::Repaired { blocks_recovered: 250, .. }));
+    assert!(matches!(
+        res,
+        RepairResult::Repaired {
+            blocks_recovered: 250,
+            ..
+        }
+    ));
     check(&dir, &files);
     std::fs::remove_dir_all(&dir).unwrap();
 }

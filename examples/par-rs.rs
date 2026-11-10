@@ -9,9 +9,11 @@
 //! par-rs info <file.par2>
 //! ```
 
-use par_rs::create::{create, CreateOptions, SourceFile, VolumeScheme};
+use par_rs::create::{CreateOptions, SourceFile, VolumeScheme, create};
 use par_rs::renamer::{ParRenamer, RenamerEvent, RenamerOptions};
-use par_rs::repairer::{Level, Par2Repairer, RepairObserver, RepairOptions, RepairResult, SourceFileState, Stage};
+use par_rs::repairer::{
+    Level, Par2Repairer, RepairObserver, RepairOptions, RepairResult, SourceFileState, Stage,
+};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -25,7 +27,10 @@ impl RepairObserver for Console {
         eprintln!("== {stage:?} (t+{:.3}s)", self.t0.elapsed().as_secs_f64());
     }
     fn file_verified(&mut self, f: &SourceFileState) {
-        eprintln!("   {:<40} {:?} ({}/{} blocks)", f.target_filename, f.status, f.available_blocks, f.block_count);
+        eprintln!(
+            "   {:<40} {:?} ({}/{} blocks)",
+            f.target_filename, f.status, f.available_blocks, f.block_count
+        );
     }
     fn message(&mut self, level: Level, text: &str) {
         if self.verbose || level != Level::Detail {
@@ -37,7 +42,9 @@ impl RepairObserver for Console {
 fn usage() -> ExitCode {
     eprintln!("usage: par-rs create [-s slice] [-r blocks] [-n N|exp|single] <base> <files...>");
     eprintln!("       par-rs verify [--extra dir] [--threads N] [--full-md5] <file.par2>");
-    eprintln!("       par-rs repair [--extra dir] [--threads N] [--mem MiB] [--no-verify] [--full-md5] [--sync] <file.par2>");
+    eprintln!(
+        "       par-rs repair [--extra dir] [--threads N] [--mem MiB] [--no-verify] [--full-md5] [--sync] <file.par2>"
+    );
     eprintln!("       par-rs rename [--dry-run] <dir>");
     eprintln!("       par-rs info <file.par2>");
     ExitCode::from(2)
@@ -87,13 +94,29 @@ fn cmd_create(args: &[String]) -> ExitCode {
         return usage();
     }
     let base_path = PathBuf::from(rest[0]);
-    let out_dir = base_path.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    let base = base_path.file_name().map(|n| n.to_string_lossy().trim_end_matches(".par2").to_string()).unwrap_or_default();
-    let sources: Vec<SourceFile> = rest[1..].iter().map(|p| SourceFile::new(PathBuf::from(p))).collect();
+    let out_dir = base_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let base = base_path
+        .file_name()
+        .map(|n| n.to_string_lossy().trim_end_matches(".par2").to_string())
+        .unwrap_or_default();
+    let sources: Vec<SourceFile> = rest[1..]
+        .iter()
+        .map(|p| SourceFile::new(PathBuf::from(p)))
+        .collect();
     let t = std::time::Instant::now();
     match create(&sources, &out_dir, &base, &opts, None, &mut |_, _, _| {}) {
         Ok(rep) => {
-            eprintln!("created set {} with {} input blocks and {} recovery blocks in {:.2}s", rep.set_id, rep.input_slices, rep.recovery_slices, t.elapsed().as_secs_f64());
+            eprintln!(
+                "created set {} with {} input blocks and {} recovery blocks in {:.2}s",
+                rep.set_id,
+                rep.input_slices,
+                rep.recovery_slices,
+                t.elapsed().as_secs_f64()
+            );
             for f in rep.files {
                 eprintln!("   {}", f.display());
             }
@@ -126,7 +149,11 @@ fn cmd_repair(args: &[String], do_repair: bool) -> ExitCode {
             }
             "--mem" => {
                 i += 1;
-                opts.mem_limit_bytes = args.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(256) << 20;
+                opts.mem_limit_bytes = args
+                    .get(i)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(256)
+                    << 20;
             }
             "--no-verify" => opts.verify_repaired = false,
             "--full-md5" => opts.full_file_md5 = true,
@@ -139,8 +166,15 @@ fn cmd_repair(args: &[String], do_repair: bool) -> ExitCode {
     let Some(par) = target else {
         return usage();
     };
-    let dir = par.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    let mut obs = Console { verbose, t0: std::time::Instant::now() };
+    let dir = par
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut obs = Console {
+        verbose,
+        t0: std::time::Instant::now(),
+    };
     let mut r = Par2Repairer::new(&dir, opts);
     let t = std::time::Instant::now();
     let loaded = match r.load_par2_set(&par) {
@@ -150,7 +184,12 @@ fn cmd_repair(args: &[String], do_repair: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("loaded {} par2 file(s), {} recovery blocks, block size {}", loaded.len(), r.recovery_blocks(), r.block_size());
+    eprintln!(
+        "loaded {} par2 file(s), {} recovery blocks, block size {}",
+        loaded.len(),
+        r.recovery_blocks(),
+        r.block_size()
+    );
     if let Err(e) = r.finalize() {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
@@ -162,9 +201,17 @@ fn cmd_repair(args: &[String], do_repair: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("verified in {:.2}s: missing {} block(s), {} recovery block(s) available", t.elapsed().as_secs_f64(), v.missing_blocks, v.recovery_blocks);
+    eprintln!(
+        "verified in {:.2}s: missing {} block(s), {} recovery block(s) available",
+        t.elapsed().as_secs_f64(),
+        v.missing_blocks,
+        v.recovery_blocks
+    );
     for d in &extra {
-        match r.add_split_fragments(d, &mut obs).and_then(|a| r.add_extra_files_from_dir(d, &mut obs).map(|b| a + b)) {
+        match r
+            .add_split_fragments(d, &mut obs)
+            .and_then(|a| r.add_extra_files_from_dir(d, &mut obs).map(|b| a + b))
+        {
             Ok(n) => eprintln!("extra files in {} supplied {n} block(s)", d.display()),
             Err(e) => eprintln!("error scanning {}: {e}", d.display()),
         }
@@ -174,7 +221,14 @@ fn cmd_repair(args: &[String], do_repair: bool) -> ExitCode {
             eprintln!("All files are correct.");
             return ExitCode::SUCCESS;
         }
-        eprintln!("Repair {}.", if r.repair_possible() { "is possible" } else { "is NOT possible" });
+        eprintln!(
+            "Repair {}.",
+            if r.repair_possible() {
+                "is possible"
+            } else {
+                "is NOT possible"
+            }
+        );
         return ExitCode::FAILURE;
     }
     let t = std::time::Instant::now();
@@ -183,11 +237,19 @@ fn cmd_repair(args: &[String], do_repair: bool) -> ExitCode {
             eprintln!("Repair not needed.");
             ExitCode::SUCCESS
         }
-        Ok(RepairResult::Repaired { files, blocks_recovered, leftovers }) => {
+        Ok(RepairResult::Repaired {
+            files,
+            blocks_recovered,
+            leftovers,
+        }) => {
             for l in &leftovers {
                 eprintln!("   leftover: {}", l.display());
             }
-            eprintln!("Repaired {} file(s), {blocks_recovered} block(s) reconstructed in {:.2}s", files.len(), t.elapsed().as_secs_f64());
+            eprintln!(
+                "Repaired {} file(s), {blocks_recovered} block(s) reconstructed in {:.2}s",
+                files.len(),
+                t.elapsed().as_secs_f64()
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -202,13 +264,21 @@ fn cmd_rename(args: &[String]) -> ExitCode {
     let Some(dir) = args.iter().find(|a| !a.starts_with("--")) else {
         return usage();
     };
-    let opts = RenamerOptions { detect_missing: true, dry_run: dry, ..Default::default() };
+    let opts = RenamerOptions {
+        detect_missing: true,
+        dry_run: dry,
+        ..Default::default()
+    };
     match ParRenamer::new(PathBuf::from(dir), opts).run(None, &mut |e| match e {
         RenamerEvent::Progress(_, _) => {}
         other => eprintln!("   {other:?}"),
     }) {
         Ok(rep) => {
-            eprintln!("{} file(s) renamed, {} missing", rep.renamed_count(), rep.missing.len());
+            eprintln!(
+                "{} file(s) renamed, {} missing",
+                rep.renamed_count(),
+                rep.missing.len()
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -224,14 +294,29 @@ fn cmd_info(args: &[String]) -> ExitCode {
     };
     match par_rs::packet::load_par2_file(Path::new(p), par_rs::packet::ScanOptions::FULL) {
         Ok(set) => {
-            println!("set id:      {}", set.set_id.map(|s| s.to_string()).unwrap_or_default());
+            println!(
+                "set id:      {}",
+                set.set_id.map(|s| s.to_string()).unwrap_or_default()
+            );
             println!("slice size:  {}", set.slice_size().unwrap_or(0));
             println!("creator:     {}", set.creator_string());
             println!("files:       {}", set.file_descs.len());
             for fd in set.file_descs.values() {
-                println!("   {:<40} {:>12} bytes  {} slices", fd.local_name(), fd.file_length, set.ifscs.get(&fd.file_id).map(|i| i.slice_count()).unwrap_or(0));
+                println!(
+                    "   {:<40} {:>12} bytes  {} slices",
+                    fd.local_name(),
+                    fd.file_length,
+                    set.ifscs
+                        .get(&fd.file_id)
+                        .map(|i| i.slice_count())
+                        .unwrap_or(0)
+                );
             }
-            println!("recovery:    {} slice(s): {:?}", set.recovery.len(), set.recovery.keys().collect::<Vec<_>>());
+            println!(
+                "recovery:    {} slice(s): {:?}",
+                set.recovery.len(),
+                set.recovery.keys().collect::<Vec<_>>()
+            );
             println!("stats:       {:?}", set.stats);
             ExitCode::SUCCESS
         }

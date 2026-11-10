@@ -3,14 +3,29 @@
 use par_rs::gf2::*;
 
 fn data(n: usize, seed: u32) -> Vec<u8> {
-    (0..n as u32).map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed.wrapping_mul(97)) >> 13) as u8).collect()
+    (0..n as u32)
+        .map(|i| {
+            (i.wrapping_mul(2654435761)
+                .wrapping_add(seed.wrapping_mul(97))
+                >> 13) as u8
+        })
+        .collect()
 }
 
 const ONE: u32 = 1 << 31;
 
 #[test]
 fn ring_laws() {
-    let xs = [0u32, 1, ONE, GF2_POLY, 0xdead_beef, 0x1234_5678, 0xffff_ffff, 0x8000_0001];
+    let xs = [
+        0u32,
+        1,
+        ONE,
+        GF2_POLY,
+        0xdead_beef,
+        0x1234_5678,
+        0xffff_ffff,
+        0x8000_0001,
+    ];
     for &a in &xs {
         assert_eq!(multmodp(a, ONE), a);
         assert_eq!(multmodp(ONE, a), a);
@@ -18,26 +33,52 @@ fn ring_laws() {
         for &b in &xs {
             assert_eq!(multmodp(a, b), multmodp(b, a), "commutative");
             for &c in &xs {
-                assert_eq!(multmodp(multmodp(a, b), c), multmodp(a, multmodp(b, c)), "associative");
-                assert_eq!(multmodp(a, b ^ c), multmodp(a, b) ^ multmodp(a, c), "distributive");
+                assert_eq!(
+                    multmodp(multmodp(a, b), c),
+                    multmodp(a, multmodp(b, c)),
+                    "associative"
+                );
+                assert_eq!(
+                    multmodp(a, b ^ c),
+                    multmodp(a, b) ^ multmodp(a, c),
+                    "distributive"
+                );
             }
         }
     }
     // x^(a+b) = x^a · x^b and the order of x.
-    for (a, b) in [(1u64, 2u64), (31, 1), (100, 923), (1 << 20, 7), (GF2_ORDER - 5, 5)] {
+    for (a, b) in [
+        (1u64, 2u64),
+        (31, 1),
+        (100, 923),
+        (1 << 20, 7),
+        (GF2_ORDER - 5, 5),
+    ] {
         assert_eq!(xpow(a + b), multmodp(xpow(a), xpow(b)));
     }
     assert_eq!(xpow(GF2_ORDER), ONE);
     assert_eq!(xpow(GF2_ORDER + 3), xpow(3));
     for k in 0..40u32 {
-        assert_eq!(x2nmodp(1, k), xpow(1u64 << (k % 32)), "x^(2^k) wraps with period 32");
+        assert_eq!(
+            x2nmodp(1, k),
+            xpow(1u64 << (k % 32)),
+            "x^(2^k) wraps with period 32"
+        );
     }
     assert_eq!(x2nmodp(13, 3), xpow(13 * 8));
 }
 
 #[test]
 fn combine_family_round_trips() {
-    for (la, lb) in [(0usize, 0usize), (1, 0), (0, 1), (5, 7), (1000, 3), (4096, 4096), (70_001, 999)] {
+    for (la, lb) in [
+        (0usize, 0usize),
+        (1, 0),
+        (0, 1),
+        (5, 7),
+        (1000, 3),
+        (4096, 4096),
+        (70_001, 999),
+    ] {
         let a = data(la, 1);
         let b = data(lb, 2);
         let ab: Vec<u8> = a.iter().chain(&b).copied().collect();
@@ -65,10 +106,20 @@ fn yenc_and_ifsc_folding() {
     let art = 716_800usize;
     let parts: Vec<(u32, usize)> = file.chunks(art).map(|c| (crc32(c), c.len())).collect();
     assert_eq!(fold_yenc_parts(&parts), Ok(crc32(&file)));
-    let mut indexed: Vec<(usize, u32, usize)> = parts.iter().enumerate().map(|(i, &(c, l))| (i, c, l)).collect();
+    let mut indexed: Vec<(usize, u32, usize)> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, &(c, l))| (i, c, l))
+        .collect();
     indexed.reverse();
-    assert_eq!(fold_yenc_indexed_parts(parts.len(), &indexed), Ok(crc32(&file)));
-    assert_eq!(fold_yenc_indexed_parts(parts.len(), &indexed[1..]), Err(FoldError::MissingPart(parts.len() - 1)));
+    assert_eq!(
+        fold_yenc_indexed_parts(parts.len(), &indexed),
+        Ok(crc32(&file))
+    );
+    assert_eq!(
+        fold_yenc_indexed_parts(parts.len(), &indexed[1..]),
+        Err(FoldError::MissingPart(parts.len() - 1))
+    );
     assert_eq!(fold_yenc_parts(&[]), Err(FoldError::Empty));
 
     // IFSC slices of 1 MiB with the last one zero padded.
@@ -81,15 +132,24 @@ fn yenc_and_ifsc_folding() {
             crc32(&p)
         })
         .collect();
-    assert_eq!(fold_ifsc_crcs(&crcs, bs as u64, file.len() as u64), Some(crc32(&file)));
-    assert_eq!(fold_ifsc_crcs(&crcs, bs as u64, file.len() as u64 + bs as u64), None);
+    assert_eq!(
+        fold_ifsc_crcs(&crcs, bs as u64, file.len() as u64),
+        Some(crc32(&file))
+    );
+    assert_eq!(
+        fold_ifsc_crcs(&crcs, bs as u64, file.len() as u64 + bs as u64),
+        None
+    );
 
     // Interval CRCs on the LCM grid of two article sizes.
     let grid = lcm_grid(&[716_800, 768_000]).unwrap();
     assert_eq!(grid, 10_752_000);
     let big = data(2 * grid as usize + 12_345, 4);
     for art in [716_800usize, 768_000] {
-        let parts: Vec<(u32, u64)> = big.chunks(art).map(|c| (crc32(c), c.len() as u64)).collect();
+        let parts: Vec<(u32, u64)> = big
+            .chunks(art)
+            .map(|c| (crc32(c), c.len() as u64))
+            .collect();
         let iv = compute_interval_crcs(&parts, grid).unwrap();
         assert_eq!(iv.len(), 3);
         for (k, c) in iv.iter().enumerate() {
@@ -129,9 +189,21 @@ fn shift_tables_equal_the_multiply() {
     for len in [1u64, 7, 4096, 716_800, 10_752_000, 1 << 33] {
         let s = Crc32Shift::new(len);
         assert_eq!(s.byte_len(), len);
-        for &c1 in &[0u32, 1, ONE, GF2_POLY, 0xdead_beef, 0x1234_5678, 0xffff_ffff] {
+        for &c1 in &[
+            0u32,
+            1,
+            ONE,
+            GF2_POLY,
+            0xdead_beef,
+            0x1234_5678,
+            0xffff_ffff,
+        ] {
             for &c2 in &[0u32, 0x0bad_f00d, 0xffff_ffff] {
-                assert_eq!(s.combine(c1, c2), crc32_combine_u64(c1, c2, len), "len {len} c1 {c1:#x} c2 {c2:#x}");
+                assert_eq!(
+                    s.combine(c1, c2),
+                    crc32_combine_u64(c1, c2, len),
+                    "len {len} c1 {c1:#x} c2 {c2:#x}"
+                );
             }
         }
     }
@@ -141,8 +213,16 @@ fn shift_tables_equal_the_multiply() {
     let parts: Vec<(u32, usize)> = file.chunks(1024).map(|c| (crc32(c), c.len())).collect();
     assert!(parts.len() >= Crc32Shift::MIN_PARTS);
     assert_eq!(fold_yenc_parts(&parts).unwrap(), want);
-    let indexed: Vec<(usize, u32, usize)> = parts.iter().enumerate().rev().map(|(i, &(c, l))| (i, c, l)).collect();
-    assert_eq!(fold_yenc_indexed_parts(parts.len(), &indexed).unwrap(), want);
+    let indexed: Vec<(usize, u32, usize)> = parts
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, &(c, l))| (i, c, l))
+        .collect();
+    assert_eq!(
+        fold_yenc_indexed_parts(parts.len(), &indexed).unwrap(),
+        want
+    );
     // Alternating part sizes: the folder gives up on tables and stays correct.
     let mut alt = Vec::new();
     let mut off = 0;
@@ -163,7 +243,10 @@ fn shift_tables_equal_the_multiply() {
         let mut padded = f.to_vec();
         padded.resize(size.div_ceil(bs as usize) * bs as usize, 0);
         let crcs: Vec<u32> = padded.chunks(bs as usize).map(crc32).collect();
-        assert_eq!(fold_ifsc_crcs_with(&shift, &crcs, size as u64), Some(crc32(f)));
+        assert_eq!(
+            fold_ifsc_crcs_with(&shift, &crcs, size as u64),
+            Some(crc32(f))
+        );
         assert_eq!(fold_ifsc_crcs(&crcs, bs, size as u64), Some(crc32(f)));
     }
 }
@@ -176,7 +259,10 @@ fn ifsc_crcs_on_an_article_grid() {
     let (art, bs) = (7000u64, 1000u64);
     let grid = lcm_grid(&[art, bs]).unwrap();
     assert_eq!(grid, 7000);
-    let articles: Vec<(u32, u64)> = file.chunks(art as usize).map(|c| (crc32(c), c.len() as u64)).collect();
+    let articles: Vec<(u32, u64)> = file
+        .chunks(art as usize)
+        .map(|c| (crc32(c), c.len() as u64))
+        .collect();
     let mut padded = file.clone();
     padded.resize(file.len().div_ceil(bs as usize) * bs as usize, 0);
     let slices: Vec<u32> = padded.chunks(bs as usize).map(crc32).collect();
@@ -188,19 +274,46 @@ fn ifsc_crcs_on_an_article_grid() {
     // Damage one article: exactly that interval differs.
     let mut bad = articles.clone();
     bad[3].0 ^= 1;
-    let diff: Vec<usize> = compute_interval_crcs(&bad, grid).unwrap().iter().zip(&from_ifsc).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i).collect();
+    let diff: Vec<usize> = compute_interval_crcs(&bad, grid)
+        .unwrap()
+        .iter()
+        .zip(&from_ifsc)
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, _)| i)
+        .collect();
     assert_eq!(diff, vec![3]);
     // Coarser grid, exact multiple of the file, single slice files, and the refusals.
-    assert_eq!(ifsc_interval_crcs(&slices, bs, file.len() as u64, 35_000).unwrap(), file.chunks(35_000).map(crc32).collect::<Vec<_>>());
+    assert_eq!(
+        ifsc_interval_crcs(&slices, bs, file.len() as u64, 35_000).unwrap(),
+        file.chunks(35_000).map(crc32).collect::<Vec<_>>()
+    );
     let exact = &file[..140_000];
     let crcs: Vec<u32> = exact.chunks(bs as usize).map(crc32).collect();
-    assert_eq!(ifsc_interval_crcs(&crcs, bs, 140_000, 7000).unwrap(), exact.chunks(7000).map(crc32).collect::<Vec<_>>());
+    assert_eq!(
+        ifsc_interval_crcs(&crcs, bs, 140_000, 7000).unwrap(),
+        exact.chunks(7000).map(crc32).collect::<Vec<_>>()
+    );
     let mut one = file[..999].to_vec();
     one.resize(1000, 0);
-    assert_eq!(ifsc_interval_crcs(&[crc32(&one)], bs, 999, 5000).unwrap(), vec![crc32(&file[..999])]);
+    assert_eq!(
+        ifsc_interval_crcs(&[crc32(&one)], bs, 999, 5000).unwrap(),
+        vec![crc32(&file[..999])]
+    );
     assert_eq!(ifsc_interval_crcs(&[], bs, 0, 5000), Some(vec![]));
-    assert_eq!(ifsc_interval_crcs(&slices, bs, file.len() as u64, 1500), None, "grid must be a multiple of the block size");
-    assert_eq!(ifsc_interval_crcs(&slices, 0, file.len() as u64, 7000), None);
+    assert_eq!(
+        ifsc_interval_crcs(&slices, bs, file.len() as u64, 1500),
+        None,
+        "grid must be a multiple of the block size"
+    );
+    assert_eq!(
+        ifsc_interval_crcs(&slices, 0, file.len() as u64, 7000),
+        None
+    );
     assert_eq!(ifsc_interval_crcs(&slices, bs, file.len() as u64, 0), None);
-    assert_eq!(ifsc_interval_crcs(&slices[1..], bs, file.len() as u64, 7000), None, "slice count must fit the file");
+    assert_eq!(
+        ifsc_interval_crcs(&slices[1..], bs, file.len() as u64, 7000),
+        None,
+        "slice count must fit the file"
+    );
 }

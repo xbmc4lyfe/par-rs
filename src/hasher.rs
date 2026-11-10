@@ -46,7 +46,12 @@ impl Default for FileHasher {
 impl FileHasher {
     /// New hasher.
     pub fn new() -> Self {
-        Self { crc: Crc32::new(), md5: Md5::new(), md5_16k: Md5::new(), len: 0 }
+        Self {
+            crc: Crc32::new(),
+            md5: Md5::new(),
+            md5_16k: Md5::new(),
+            len: 0,
+        }
     }
 
     /// Feed data (one pass over `data` for all digests).
@@ -155,7 +160,9 @@ mod tests {
 
     #[test]
     fn fused_hasher_matches_separate_digests() {
-        let data: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(2654435761u32) >> 13) as u8).collect();
+        let data: Vec<u8> = (0..40_000u32)
+            .map(|i| (i.wrapping_mul(2654435761u32) >> 13) as u8)
+            .collect();
         let mut h = FileHasher::new();
         assert!(h.is_empty());
         for chunk in data.chunks(1234) {

@@ -23,10 +23,14 @@
 use crate::damage::{self, DownloadStatus, QuickVerdict, Segment};
 use crate::gf16::input_constant_logs;
 use crate::gf16::simd::Kernel;
-use crate::packet::{read_exact_at, FileId, PacketSet, RecoverySliceRef, ScanOptions, SetId};
-use crate::reed_solomon::{plan_recovery, Engine, EngineConfig, InputKind, InputReader, InputSpec, OutputSink, RsError};
-use crate::parhash::{file_hashes_parallel, hash_ranges_parallel, slice_ranges, HashRange};
-use crate::scanner::{entries_for_file, scan_file, BlockRef, ChecksumEntry, ChecksumIndex, ScanConfig, ScanReport};
+use crate::packet::{FileId, PacketSet, RecoverySliceRef, ScanOptions, SetId, read_exact_at};
+use crate::parhash::{HashRange, file_hashes_parallel, hash_ranges_parallel, slice_ranges};
+use crate::reed_solomon::{
+    Engine, EngineConfig, InputKind, InputReader, InputSpec, OutputSink, RsError, plan_recovery,
+};
+use crate::scanner::{
+    BlockRef, ChecksumEntry, ChecksumIndex, ScanConfig, ScanReport, entries_for_file, scan_file,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -92,7 +96,11 @@ pub fn ignore_name_matches(local_name: &str, entry: &str) -> bool {
     if pat.is_empty() {
         return false;
     }
-    if name.len() >= pat.len() && name.get(name.len() - pat.len()..).is_some_and(|tail| tail.eq_ignore_ascii_case(pat)) {
+    if name.len() >= pat.len()
+        && name
+            .get(name.len() - pat.len()..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(pat))
+    {
         return true;
     }
     if pat.iter().any(|&b| b == b'*' || b == b'?') {
@@ -112,7 +120,11 @@ fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
                 star = Some((p.saturating_add(1), t));
                 p = p.saturating_add(1);
             }
-            Some(&pc) if pc == b'?' || (pc == b'#' && text.get(t).is_some_and(u8::is_ascii_digit)) || text.get(t).is_some_and(|&tc| tc.eq_ignore_ascii_case(&pc)) => {
+            Some(&pc)
+                if pc == b'?'
+                    || (pc == b'#' && text.get(t).is_some_and(u8::is_ascii_digit))
+                    || text.get(t).is_some_and(|&tc| tc.eq_ignore_ascii_case(&pc)) =>
+            {
                 p = p.saturating_add(1);
                 t = t.saturating_add(1);
             }
@@ -126,7 +138,9 @@ fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
             },
         }
     }
-    pattern.get(p..).is_some_and(|rest| rest.iter().all(|&b| b == b'*'))
+    pattern
+        .get(p..)
+        .is_some_and(|rest| rest.iter().all(|&b| b == b'*'))
 }
 
 impl Default for RepairOptions {
@@ -336,17 +350,34 @@ pub enum RepairError {
 impl fmt::Display for RepairError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RepairError::NoMainPacket => f.write_str("no main packet found in the loaded par2 files"),
-            RepairError::IncompleteMetadata { missing_descriptions } => {
-                write!(f, "file descriptions missing for {} file(s)", missing_descriptions.len())
+            RepairError::NoMainPacket => {
+                f.write_str("no main packet found in the loaded par2 files")
+            }
+            RepairError::IncompleteMetadata {
+                missing_descriptions,
+            } => {
+                write!(
+                    f,
+                    "file descriptions missing for {} file(s)",
+                    missing_descriptions.len()
+                )
             }
             RepairError::NotFinalized => f.write_str("repairer not finalized"),
-            RepairError::WrongSet { expected, found } => write!(f, "par2 file belongs to set {found}, expected {expected}"),
+            RepairError::WrongSet { expected, found } => {
+                write!(f, "par2 file belongs to set {found}, expected {expected}")
+            }
             RepairError::NotEnoughRecovery { needed, available } => {
-                write!(f, "not enough recovery blocks: {needed} needed, {available} available")
+                write!(
+                    f,
+                    "not enough recovery blocks: {needed} needed, {available} available"
+                )
             }
             RepairError::Singular => f.write_str("recovery matrix is singular"),
-            RepairError::VerificationFailed { files } => write!(f, "repaired files failed verification: {}", files.join(", ")),
+            RepairError::VerificationFailed { files } => write!(
+                f,
+                "repaired files failed verification: {}",
+                files.join(", ")
+            ),
             RepairError::Io { context, source } => write!(f, "{context}: {source}"),
             RepairError::Cancelled => f.write_str("cancelled"),
             RepairError::UnknownFile(id) => write!(f, "file {id} is not part of the recovery set"),
@@ -373,7 +404,10 @@ fn hash_err(e: io::Error) -> RepairError {
 }
 
 pub(crate) fn io_ctx(context: impl Into<String>) -> impl FnOnce(io::Error) -> RepairError {
-    move |source| RepairError::Io { context: context.into(), source }
+    move |source| RepairError::Io {
+        context: context.into(),
+        source,
+    }
 }
 
 /// Outcome of [`Par2Repairer::verify`].
@@ -575,7 +609,10 @@ impl Par2Repairer {
     pub fn load_par2_file(&mut self, path: &Path) -> Result<usize, RepairError> {
         let before = self.packets.recovery.len();
         let source_id = self.par_files.len();
-        let stats = self.packets.load_file(path, source_id, ScanOptions::METADATA).map_err(io_ctx(format!("loading {}", path.display())))?;
+        let stats = self
+            .packets
+            .load_file(path, source_id, ScanOptions::METADATA)
+            .map_err(io_ctx(format!("loading {}", path.display())))?;
         self.par_files.push(path.to_path_buf());
         if stats.foreign > 0 && stats.added == 0 {
             // Entire file belongs to another set.
@@ -600,8 +637,15 @@ impl Par2Repairer {
     pub fn load_par2_set(&mut self, main_path: &Path) -> Result<Vec<PathBuf>, RepairError> {
         let mut loaded = vec![main_path.to_path_buf()];
         self.load_par2_file(main_path)?;
-        let dir = main_path.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-        let main_name = main_path.file_name().map(crate::filenames::os_str_bytes).unwrap_or_default();
+        let dir = main_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let main_name = main_path
+            .file_name()
+            .map(crate::filenames::os_str_bytes)
+            .unwrap_or_default();
         let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map_err(io_ctx(format!("reading {}", dir.display())))?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -611,7 +655,10 @@ impl Par2Repairer {
             if p.file_name() == main_path.file_name() || p.is_dir() {
                 continue;
             }
-            let name = p.file_name().map(crate::filenames::os_str_bytes).unwrap_or_default();
+            let name = p
+                .file_name()
+                .map(crate::filenames::os_str_bytes)
+                .unwrap_or_default();
             if crate::filenames::same_par_collection(&name, &main_name, true) {
                 match self.load_par2_file(&p) {
                     Ok(_) => loaded.push(p),
@@ -626,17 +673,29 @@ impl Par2Repairer {
     /// Load in-memory par2 data (e.g. a volume kept in RAM). `label` names the source.
     pub fn load_par2_bytes(&mut self, data: Vec<u8>, label: &str) -> Result<usize, RepairError> {
         // Materialise to a temporary file so recovery payloads can be streamed later.
-        let tmp = std::env::temp_dir().join(format!("par-rs-{}-{}.par2", std::process::id(), self.par_files.len()));
-        std::fs::write(&tmp, &data).map_err(io_ctx(format!("writing temporary copy of {label}")))?;
+        let tmp = std::env::temp_dir().join(format!(
+            "par-rs-{}-{}.par2",
+            std::process::id(),
+            self.par_files.len()
+        ));
+        std::fs::write(&tmp, &data)
+            .map_err(io_ctx(format!("writing temporary copy of {label}")))?;
         self.load_par2_file(&tmp)
     }
 
     /// Build the file and block tables. Must be called after loading and before verifying.
     pub fn finalize(&mut self) -> Result<(), RepairError> {
         let main = self.packets.main.clone().ok_or(RepairError::NoMainPacket)?;
-        let missing: Vec<FileId> = main.recoverable_file_ids.iter().filter(|id| !self.packets.file_descs.contains_key(id)).copied().collect();
+        let missing: Vec<FileId> = main
+            .recoverable_file_ids
+            .iter()
+            .filter(|id| !self.packets.file_descs.contains_key(id))
+            .copied()
+            .collect();
         if !missing.is_empty() {
-            return Err(RepairError::IncompleteMetadata { missing_descriptions: missing });
+            return Err(RepairError::IncompleteMetadata {
+                missing_descriptions: missing,
+            });
         }
         let ss = main.slice_size;
         self.files.clear();
@@ -666,7 +725,11 @@ impl Par2Repairer {
                 None
             };
             self.checksums.push(cs);
-            let ignored = self.options.ignore_extensions.iter().any(|e| ignore_name_matches(&local, e));
+            let ignored = self
+                .options
+                .ignore_extensions
+                .iter()
+                .any(|e| ignore_name_matches(&local, e));
             self.files.push(SourceFileState {
                 file_id: *id,
                 target_filename: local,
@@ -724,7 +787,13 @@ impl Par2Repairer {
         present: &[bool],
         allowed: Option<&[u32]>,
         observer: &mut dyn RepairObserver,
-    ) -> Result<(crate::reed_solomon::RecoveryPlan, BTreeMap<u32, RecoverySliceRef>), RepairError> {
+    ) -> Result<
+        (
+            crate::reed_solomon::RecoveryPlan,
+            BTreeMap<u32, RecoverySliceRef>,
+        ),
+        RepairError,
+    > {
         let mut usable: BTreeMap<u32, RecoverySliceRef> = self.packets.recovery.clone();
         if let Some(a) = allowed {
             usable.retain(|e, _| a.contains(e));
@@ -735,10 +804,18 @@ impl Par2Repairer {
             let plan = match plan_recovery(logs, present, &exps, &self.options.kernel) {
                 Ok(p) => p,
                 Err(RsError::NotEnoughRecovery { needed, available }) => {
-                    return Err(RepairError::NotEnoughRecovery { needed: needed as u64, available: available as u64 })
+                    return Err(RepairError::NotEnoughRecovery {
+                        needed: needed as u64,
+                        available: available as u64,
+                    });
                 }
                 Err(RsError::Singular) => return Err(RepairError::Singular),
-                Err(RsError::Io(e)) => return Err(RepairError::Io { context: "planning recovery".into(), source: e }),
+                Err(RsError::Io(e)) => {
+                    return Err(RepairError::Io {
+                        context: "planning recovery".into(),
+                        source: e,
+                    });
+                }
                 Err(_) => return Err(RepairError::Singular),
             };
             let mut bad = Vec::new();
@@ -760,7 +837,13 @@ impl Par2Repairer {
                     if ok {
                         verified_ok.insert(e);
                     } else {
-                        observer.message(Level::Warning, &format!("Recovery block {e} in {} is corrupt, ignoring", self.par_files[usable[&e].source_id].display()));
+                        observer.message(
+                            Level::Warning,
+                            &format!(
+                                "Recovery block {e} in {} is corrupt, ignoring",
+                                self.par_files[usable[&e].source_id].display()
+                            ),
+                        );
                         bad.push(e);
                     }
                 }
@@ -777,8 +860,11 @@ impl Par2Repairer {
 
     /// Verify the packet MD5 of several recovery slices (all cores). A packet whose header no
     /// longer parses or fits its file counts as corrupt.
-    fn verify_recovery_parallel(&self, refs: &[RecoverySliceRef]) -> Result<Vec<bool>, RepairError> {
-        use crate::packet::{PacketHeader, HEADER_LEN};
+    fn verify_recovery_parallel(
+        &self,
+        refs: &[RecoverySliceRef],
+    ) -> Result<Vec<bool>, RepairError> {
+        use crate::packet::{HEADER_LEN, PacketHeader};
         let paths: Vec<&Path> = self.par_files.iter().map(|p| p.as_path()).collect();
         let mut ranges: Vec<HashRange> = Vec::new();
         let mut expected: Vec<Option<[u8; 16]>> = Vec::with_capacity(refs.len());
@@ -789,29 +875,48 @@ impl Par2Repairer {
             let flen = match lens.get(&r.source_id) {
                 Some(&l) => l,
                 None => {
-                    let l = file.metadata().map(|m| m.len()).map_err(io_ctx(format!("reading {}", path.display())))?;
+                    let l = file
+                        .metadata()
+                        .map(|m| m.len())
+                        .map_err(io_ctx(format!("reading {}", path.display())))?;
                     lens.insert(r.source_id, l);
                     l
                 }
             };
             let mut hdr = [0u8; HEADER_LEN];
             let parsed = match read_exact_at(&file, r.packet_offset, &mut hdr) {
-                Ok(()) => PacketHeader::parse(&hdr).filter(|h| h.length == r.header_length() && h.fits(r.packet_offset, flen)),
+                Ok(()) => PacketHeader::parse(&hdr)
+                    .filter(|h| h.length == r.header_length() && h.fits(r.packet_offset, flen)),
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => None,
                 Err(e) => return Err(io_ctx(format!("reading {}", path.display()))(e)),
             };
             match parsed {
                 Some(h) => {
                     let body = h.length - 32;
-                    ranges.push(HashRange { file: r.source_id, offset: r.packet_offset + 32, len: body, pad_to: body });
+                    ranges.push(HashRange {
+                        file: r.source_id,
+                        offset: r.packet_offset + 32,
+                        len: body,
+                        pad_to: body,
+                    });
                     expected.push(Some(h.packet_md5));
                 }
                 None => expected.push(None),
             }
         }
-        let digests = hash_ranges_parallel(&paths, &ranges, self.options.num_threads, Some(&self.cancel), &mut |_| {}).map_err(hash_err)?;
+        let digests = hash_ranges_parallel(
+            &paths,
+            &ranges,
+            self.options.num_threads,
+            Some(&self.cancel),
+            &mut |_| {},
+        )
+        .map_err(hash_err)?;
         let mut d = digests.iter();
-        Ok(expected.iter().map(|e| e.is_some_and(|md5| d.next().is_some_and(|(_, got)| *got == md5))).collect())
+        Ok(expected
+            .iter()
+            .map(|e| e.is_some_and(|md5| d.next().is_some_and(|(_, got)| *got == md5)))
+            .collect())
     }
 
     fn disk_file_index(&mut self, path: &Path) -> usize {
@@ -846,7 +951,11 @@ impl Par2Repairer {
     /// verifier), then one slice-level pass over every remaining file on all cores (multi-lane
     /// MD5 + hardware CRC), then the sliding scan of the files that pass is not enough for,
     /// in parallel across files, reusing the slices the second phase already verified.
-    pub fn verify(&mut self, mut quick: Option<&mut dyn QuickVerifier>, observer: &mut dyn RepairObserver) -> Result<VerifyResult, RepairError> {
+    pub fn verify(
+        &mut self,
+        mut quick: Option<&mut dyn QuickVerifier>,
+        observer: &mut dyn RepairObserver,
+    ) -> Result<VerifyResult, RepairError> {
         if !self.finalized {
             return Err(RepairError::NotFinalized);
         }
@@ -862,13 +971,20 @@ impl Par2Repairer {
             if matches!(self.files[fi].status, FileStatus::Complete) {
                 continue;
             }
-            observer.progress((fi * 1000 / total_files) as u32, &format!("Verifying {}", self.files[fi].target_filename));
+            observer.progress(
+                (fi * 1000 / total_files) as u32,
+                &format!("Verifying {}", self.files[fi].target_filename),
+            );
             let path = self.files[fi].target_path.clone();
             let exists = path.is_file();
             self.files[fi].target_exists = exists;
             if !exists {
                 if self.files[fi].status == FileStatus::Unknown {
-                    self.files[fi].status = if self.files[fi].complete_file.is_some() { FileStatus::Misnamed } else { FileStatus::Missing };
+                    self.files[fi].status = if self.files[fi].complete_file.is_some() {
+                        FileStatus::Misnamed
+                    } else {
+                        FileStatus::Missing
+                    };
                 }
                 observer.file_verified(&self.files[fi]);
                 continue;
@@ -876,8 +992,15 @@ impl Par2Repairer {
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             // Empty expected file.
             if self.files[fi].block_count == 0 {
-                let ok = size == 0 || crate::hasher::hash_file(&path).map(|h| h.md5_full == self.files[fi].hash_full).unwrap_or(false);
-                self.files[fi].status = if ok { FileStatus::Complete } else { FileStatus::Damaged };
+                let ok = size == 0
+                    || crate::hasher::hash_file(&path)
+                        .map(|h| h.md5_full == self.files[fi].hash_full)
+                        .unwrap_or(false);
+                self.files[fi].status = if ok {
+                    FileStatus::Complete
+                } else {
+                    FileStatus::Damaged
+                };
                 if ok {
                     self.files[fi].complete_file = Some(path.clone());
                 }
@@ -893,55 +1016,103 @@ impl Par2Repairer {
             }
             // Quick path (skipped when one of the file's block CRCs is not unique in the set:
             // a CRC-only verdict could then be fooled by another file's block, as in nzbget).
-            let has_dup_crc = self.checksums[fi].as_ref().is_some_and(|cs| cs.iter().any(|e| self.duplicate_crcs.contains(&e.crc32)));
-            if let (false, false, Some(q), Some(cs)) = (handled, has_dup_crc, quick.as_deref_mut(), self.checksums[fi].as_ref())
-                && let Some(info) = q.quick_info(&self.files[fi].target_filename) {
-                    let crcs: Vec<u32> = cs.iter().map(|e| e.crc32).collect();
-                    let verdict = match &info {
-                        QuickInfo::Success { crc } => {
-                            damage::quick_verify(&DownloadStatus::Success { crc: *crc }, size, &crcs, ss, &mut damage::NoDiskAccess)
-                        }
-                        QuickInfo::Partial { segments } => {
-                            let mut f = File::open(&path).map_err(io_ctx(format!("opening {}", path.display())))?;
-                            damage::quick_verify(&DownloadStatus::Partial { segments }, size, &crcs, ss, &mut f)
-                        }
-                        QuickInfo::Failure => Ok(QuickVerdict::Partial(vec![false; crcs.len()])),
+            let has_dup_crc = self.checksums[fi]
+                .as_ref()
+                .is_some_and(|cs| cs.iter().any(|e| self.duplicate_crcs.contains(&e.crc32)));
+            if let (false, false, Some(q), Some(cs)) = (
+                handled,
+                has_dup_crc,
+                quick.as_deref_mut(),
+                self.checksums[fi].as_ref(),
+            ) && let Some(info) = q.quick_info(&self.files[fi].target_filename)
+            {
+                let crcs: Vec<u32> = cs.iter().map(|e| e.crc32).collect();
+                let verdict = match &info {
+                    QuickInfo::Success { crc } => damage::quick_verify(
+                        &DownloadStatus::Success { crc: *crc },
+                        size,
+                        &crcs,
+                        ss,
+                        &mut damage::NoDiskAccess,
+                    ),
+                    QuickInfo::Partial { segments } => {
+                        let mut f = File::open(&path)
+                            .map_err(io_ctx(format!("opening {}", path.display())))?;
+                        damage::quick_verify(
+                            &DownloadStatus::Partial { segments },
+                            size,
+                            &crcs,
+                            ss,
+                            &mut f,
+                        )
                     }
-                    .map_err(io_ctx(format!("quick-verifying {}", path.display())))?;
-                    match verdict {
-                        QuickVerdict::Complete if size == self.files[fi].file_length => {
-                            let di = self.disk_file_index(&path);
-                            for b in 0..self.files[fi].block_count {
-                                self.set_location(BlockRef { file_index: fi as u32, block_index: b }, BlockLocation { file: di, offset: b as u64 * ss });
-                            }
-                            self.files[fi].status = FileStatus::Complete;
-                            self.files[fi].complete_file = Some(path.clone());
-                            self.files[fi].quick_verified = true;
-                            self.quick_verified_files += 1;
-                            observer.message(Level::Detail, &format!("Quickly verified good file {}", self.files[fi].target_filename));
-                            handled = true;
+                    QuickInfo::Failure => Ok(QuickVerdict::Partial(vec![false; crcs.len()])),
+                }
+                .map_err(io_ctx(format!("quick-verifying {}", path.display())))?;
+                match verdict {
+                    QuickVerdict::Complete if size == self.files[fi].file_length => {
+                        let di = self.disk_file_index(&path);
+                        for b in 0..self.files[fi].block_count {
+                            self.set_location(
+                                BlockRef {
+                                    file_index: fi as u32,
+                                    block_index: b,
+                                },
+                                BlockLocation {
+                                    file: di,
+                                    offset: b as u64 * ss,
+                                },
+                            );
                         }
-                        QuickVerdict::Partial(valid) if size <= self.files[fi].file_length => {
-                            let di = self.disk_file_index(&path);
-                            for (b, ok) in valid.iter().enumerate() {
-                                if *ok {
-                                    self.set_location(BlockRef { file_index: fi as u32, block_index: b as u32 }, BlockLocation { file: di, offset: b as u64 * ss });
-                                }
+                        self.files[fi].status = FileStatus::Complete;
+                        self.files[fi].complete_file = Some(path.clone());
+                        self.files[fi].quick_verified = true;
+                        self.quick_verified_files += 1;
+                        observer.message(
+                            Level::Detail,
+                            &format!(
+                                "Quickly verified good file {}",
+                                self.files[fi].target_filename
+                            ),
+                        );
+                        handled = true;
+                    }
+                    QuickVerdict::Partial(valid) if size <= self.files[fi].file_length => {
+                        let di = self.disk_file_index(&path);
+                        for (b, ok) in valid.iter().enumerate() {
+                            if *ok {
+                                self.set_location(
+                                    BlockRef {
+                                        file_index: fi as u32,
+                                        block_index: b as u32,
+                                    },
+                                    BlockLocation {
+                                        file: di,
+                                        offset: b as u64 * ss,
+                                    },
+                                );
                             }
-                            self.files[fi].status = FileStatus::Damaged;
-                            self.files[fi].quick_verified = true;
-                            self.quick_verified_files += 1;
-                            observer.message(Level::Detail, &format!("Quickly verified damaged file {}", self.files[fi].target_filename));
-                            handled = true;
                         }
-                        _ => {
-                            observer.message(
+                        self.files[fi].status = FileStatus::Damaged;
+                        self.files[fi].quick_verified = true;
+                        self.quick_verified_files += 1;
+                        observer.message(
+                            Level::Detail,
+                            &format!(
+                                "Quickly verified damaged file {}",
+                                self.files[fi].target_filename
+                            ),
+                        );
+                        handled = true;
+                    }
+                    _ => {
+                        observer.message(
                                 Level::Warning,
                                 &format!("Quick verification failed for file {}, performing full verification instead", self.files[fi].target_filename),
                             );
-                        }
                     }
                 }
+            }
             if handled {
                 observer.file_verified(&self.files[fi]);
             } else {
@@ -951,10 +1122,23 @@ impl Par2Repairer {
 
         // ---- phase 2: slice-level check of every pending file on all cores ----
         let mut need_scan: Vec<(usize, Option<Vec<bool>>)> = Vec::new();
-        let with_cs: Vec<usize> = pending.iter().copied().filter(|&fi| self.checksums[fi].is_some()).collect();
-        need_scan.extend(pending.iter().copied().filter(|&fi| self.checksums[fi].is_none()).map(|fi| (fi, None)));
+        let with_cs: Vec<usize> = pending
+            .iter()
+            .copied()
+            .filter(|&fi| self.checksums[fi].is_some())
+            .collect();
+        need_scan.extend(
+            pending
+                .iter()
+                .copied()
+                .filter(|&fi| self.checksums[fi].is_none())
+                .map(|fi| (fi, None)),
+        );
         if !with_cs.is_empty() {
-            let paths: Vec<&Path> = with_cs.iter().map(|&fi| self.files[fi].target_path.as_path()).collect();
+            let paths: Vec<&Path> = with_cs
+                .iter()
+                .map(|&fi| self.files[fi].target_path.as_path())
+                .collect();
             let mut ranges: Vec<HashRange> = Vec::new();
             let mut sizes: Vec<u64> = Vec::with_capacity(with_cs.len());
             for (k, &fi) in with_cs.iter().enumerate() {
@@ -963,12 +1147,24 @@ impl Par2Repairer {
                 ranges.extend(slice_ranges(k, size, ss, self.files[fi].block_count as u64));
             }
             let total_bytes = sizes.iter().sum::<u64>().max(1);
-            let results = hash_ranges_parallel(&paths, &ranges, self.options.num_threads, Some(&self.cancel), &mut |done| {
-                observer.progress((done * 1000 / total_bytes).min(1000) as u32, "Verifying slices");
-            })
+            let results = hash_ranges_parallel(
+                &paths,
+                &ranges,
+                self.options.num_threads,
+                Some(&self.cancel),
+                &mut |done| {
+                    observer.progress(
+                        (done * 1000 / total_bytes).min(1000) as u32,
+                        "Verifying slices",
+                    );
+                },
+            )
             .map_err(hash_err)?;
             let full = if self.options.full_file_md5 {
-                Some(file_hashes_parallel(&paths, self.options.num_threads, Some(&self.cancel)).map_err(hash_err)?)
+                Some(
+                    file_hashes_parallel(&paths, self.options.num_threads, Some(&self.cancel))
+                        .map_err(hash_err)?,
+                )
             } else {
                 None
             };
@@ -978,14 +1174,30 @@ impl Par2Repairer {
                 let got = &results[cursor..cursor + n];
                 cursor += n;
                 let exp = self.checksums[fi].as_deref().unwrap_or(&[]);
-                let matches: Vec<bool> = got.iter().zip(exp).map(|((c, m), e)| *c == e.crc32 && *m == e.md5).collect();
+                let matches: Vec<bool> = got
+                    .iter()
+                    .zip(exp)
+                    .map(|((c, m), e)| *c == e.crc32 && *m == e.md5)
+                    .collect();
                 let size_ok = sizes[k] == self.files[fi].file_length;
-                let hash_ok = full.as_ref().is_none_or(|h| h[k].md5_full == self.files[fi].hash_full && h[k].md5_16k == self.files[fi].hash_16k);
+                let hash_ok = full.as_ref().is_none_or(|h| {
+                    h[k].md5_full == self.files[fi].hash_full
+                        && h[k].md5_16k == self.files[fi].hash_16k
+                });
                 if size_ok && hash_ok && matches.len() == n && matches.iter().all(|&m| m) {
                     let path = self.files[fi].target_path.clone();
                     let di = self.disk_file_index(&path);
                     for b in 0..n {
-                        self.set_location(BlockRef { file_index: fi as u32, block_index: b as u32 }, BlockLocation { file: di, offset: b as u64 * ss });
+                        self.set_location(
+                            BlockRef {
+                                file_index: fi as u32,
+                                block_index: b as u32,
+                            },
+                            BlockLocation {
+                                file: di,
+                                offset: b as u64 * ss,
+                            },
+                        );
                     }
                     self.files[fi].status = FileStatus::Complete;
                     self.files[fi].complete_file = Some(path);
@@ -1001,7 +1213,10 @@ impl Par2Repairer {
             let reports = self.scan_many(&need_scan, observer)?;
             for (fi, report) in reports {
                 let path = self.files[fi].target_path.clone();
-                let label = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 self.apply_scan(&path, &label, Some(fi), &report, observer);
                 if self.files[fi].status == FileStatus::Unknown {
                     self.files[fi].status = FileStatus::Damaged;
@@ -1009,9 +1224,18 @@ impl Par2Repairer {
                 observer.file_verified(&self.files[fi]);
             }
         }
-        for f in self.files.iter().filter(|f| f.ignored && f.status != FileStatus::Complete) {
+        for f in self
+            .files
+            .iter()
+            .filter(|f| f.ignored && f.status != FileStatus::Complete)
+        {
             let msg = if f.target_exists {
-                format!("File {} has {} bad block(s) of total {} block(s) (ignored)", f.target_filename, f.missing_blocks(), f.block_count)
+                format!(
+                    "File {} has {} bad block(s) of total {} block(s) (ignored)",
+                    f.target_filename,
+                    f.missing_blocks(),
+                    f.block_count
+                )
             } else {
                 format!("File {} is missing (ignored)", f.target_filename)
             };
@@ -1024,14 +1248,19 @@ impl Par2Repairer {
 
     /// Scan several files (sliding window) on up to `num_threads` threads; `known` is the
     /// slice-level verdict of an earlier aligned pass. Reports come back in input order.
-    fn scan_many(&self, items: &[(usize, Option<Vec<bool>>)], observer: &mut dyn RepairObserver) -> Result<Vec<(usize, ScanReport)>, RepairError> {
+    fn scan_many(
+        &self,
+        items: &[(usize, Option<Vec<bool>>)],
+        observer: &mut dyn RepairObserver,
+    ) -> Result<Vec<(usize, ScanReport)>, RepairError> {
         let Some(index) = self.index.as_ref() else {
             return Err(RepairError::NotFinalized);
         };
         let threads = crate::parhash::thread_count(self.options.num_threads).clamp(1, items.len());
         let next = AtomicUsize::new(0);
         let cancel = &self.cancel;
-        let results: Mutex<Vec<Option<io::Result<ScanReport>>>> = Mutex::new((0..items.len()).map(|_| None).collect());
+        let results: Mutex<Vec<Option<io::Result<ScanReport>>>> =
+            Mutex::new((0..items.len()).map(|_| None).collect());
         let work = |progress: &mut dyn FnMut(u64, u64, &str)| loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some((fi, known)) = items.get(i) else {
@@ -1041,10 +1270,22 @@ impl Par2Repairer {
             // A target that already matched some of its own slices is not a complete copy of
             // another source file, so its whole-file hash is not needed.
             let hash_file = !known.as_ref().is_some_and(|k| k.iter().any(|&b| b));
-            let cfg = ScanConfig { buffer_size: self.options.scan_buffer, known_aligned: known.as_deref(), hash_file, ..ScanConfig::default() };
+            let cfg = ScanConfig {
+                buffer_size: self.options.scan_buffer,
+                known_aligned: known.as_deref(),
+                hash_file,
+                ..ScanConfig::default()
+            };
             let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0).max(1);
             let label = &self.files[*fi].target_filename;
-            let r = scan_file(path, index, self.checksums[*fi].as_deref(), &cfg, Some(cancel), &mut |done| progress(done, size, label));
+            let r = scan_file(
+                path,
+                index,
+                self.checksums[*fi].as_deref(),
+                &cfg,
+                Some(cancel),
+                &mut |done| progress(done, size, label),
+            );
             results.lock().unwrap_or_else(|p| p.into_inner())[i] = Some(r);
             if cancel.load(Ordering::Relaxed) {
                 return;
@@ -1054,13 +1295,20 @@ impl Par2Repairer {
             for _ in 1..threads {
                 s.spawn(|| work(&mut |_, _, _| {}));
             }
-            work(&mut |done, size, label| observer.progress(((done.min(size) * 1000) / size) as u32, &format!("Scanning {label}")));
+            work(&mut |done, size, label| {
+                observer.progress(
+                    ((done.min(size) * 1000) / size) as u32,
+                    &format!("Scanning {label}"),
+                )
+            });
         });
         let results = results.into_inner().unwrap_or_else(|p| p.into_inner());
         let mut out = Vec::with_capacity(items.len());
         for ((fi, _), r) in items.iter().zip(results) {
             let path = &self.files[*fi].target_path;
-            let report = r.ok_or(RepairError::Cancelled)?.map_err(io_ctx(format!("scanning {}", path.display())))?;
+            let report = r
+                .ok_or(RepairError::Cancelled)?
+                .map_err(io_ctx(format!("scanning {}", path.display())))?;
             if report.cancelled {
                 return Err(RepairError::Cancelled);
             }
@@ -1074,10 +1322,18 @@ impl Par2Repairer {
         let missing = self.missing_blocks();
         let recovery = self.recovery_blocks();
         let all_complete = self.files.iter().all(|f| f.status == FileStatus::Complete);
-        let ignored_damaged: Vec<String> = self.files.iter().filter(|f| f.ignored && f.status != FileStatus::Complete).map(|f| f.target_filename.clone()).collect();
+        let ignored_damaged: Vec<String> = self
+            .files
+            .iter()
+            .filter(|f| f.ignored && f.status != FileStatus::Complete)
+            .map(|f| f.target_filename.clone())
+            .collect();
         // nzbget: damage confined to ignored files (`ParIgnoreExt`) is reported but does not
         // trigger a repair (or `.vol` unpausing).
-        let repair_needed = self.files.iter().any(|f| !f.ignored && f.status != FileStatus::Complete);
+        let repair_needed = self
+            .files
+            .iter()
+            .any(|f| !f.ignored && f.status != FileStatus::Complete);
         VerifyResult {
             all_complete,
             missing_blocks: missing,
@@ -1090,17 +1346,31 @@ impl Par2Repairer {
     }
 
     /// Scan a file for blocks; `expected` is the source file it is believed to be.
-    fn scan_path_into(&mut self, path: &Path, expected: Option<usize>, observer: &mut dyn RepairObserver) -> Result<usize, RepairError> {
+    fn scan_path_into(
+        &mut self,
+        path: &Path,
+        expected: Option<usize>,
+        observer: &mut dyn RepairObserver,
+    ) -> Result<usize, RepairError> {
         let Some(index) = self.index.as_ref() else {
             return Err(RepairError::NotFinalized);
         };
         let exp_entries = expected.and_then(|fi| self.checksums[fi].as_deref());
-        let cfg = ScanConfig { buffer_size: self.options.scan_buffer, ..ScanConfig::default() };
+        let cfg = ScanConfig {
+            buffer_size: self.options.scan_buffer,
+            ..ScanConfig::default()
+        };
         let cancel = self.cancel.clone();
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0).max(1);
-        let label = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let report = scan_file(path, index, exp_entries, &cfg, Some(&cancel), &mut |done| {
-            observer.progress(((done.min(size) * 1000) / size) as u32, &format!("Scanning {label}"));
+            observer.progress(
+                ((done.min(size) * 1000) / size) as u32,
+                &format!("Scanning {label}"),
+            );
         })
         .map_err(io_ctx(format!("scanning {}", path.display())))?;
         if report.cancelled {
@@ -1111,18 +1381,34 @@ impl Par2Repairer {
 
     /// Record the blocks and whole-file identities a scan of `path` found. Returns the number
     /// of previously missing blocks it supplied.
-    fn apply_scan(&mut self, path: &Path, label: &str, expected: Option<usize>, report: &ScanReport, observer: &mut dyn RepairObserver) -> usize {
+    fn apply_scan(
+        &mut self,
+        path: &Path,
+        label: &str,
+        expected: Option<usize>,
+        report: &ScanReport,
+        observer: &mut dyn RepairObserver,
+    ) -> usize {
         let di = self.disk_file_index(path);
         let mut new_blocks = 0usize;
         for f in &report.found {
-            if self.set_location(f.block, BlockLocation { file: di, offset: f.offset }) {
+            if self.set_location(
+                f.block,
+                BlockLocation {
+                    file: di,
+                    offset: f.offset,
+                },
+            ) {
                 new_blocks += 1;
             }
         }
         // Whole-file identity: a complete (possibly misnamed) copy of some source file?
         if let Some(h) = report.file_hashes {
             for fi in 0..self.files.len() {
-                if self.files[fi].file_length == h.len && self.files[fi].hash_full == h.md5_full && self.files[fi].hash_16k == h.md5_16k {
+                if self.files[fi].file_length == h.len
+                    && self.files[fi].hash_full == h.md5_full
+                    && self.files[fi].hash_16k == h.md5_16k
+                {
                     if self.files[fi].complete_file.is_none() || expected == Some(fi) {
                         self.files[fi].complete_file = Some(path.to_path_buf());
                     }
@@ -1133,7 +1419,10 @@ impl Par2Repairer {
                             for b in 0..self.files[fi].block_count {
                                 let g = self.files[fi].first_block + b as usize;
                                 if self.locations[g].is_none() {
-                                    self.locations[g] = Some(BlockLocation { file: di, offset: b as u64 * self.block_size() });
+                                    self.locations[g] = Some(BlockLocation {
+                                        file: di,
+                                        offset: b as u64 * self.block_size(),
+                                    });
                                     self.files[fi].available_blocks += 1;
                                 }
                             }
@@ -1144,12 +1433,21 @@ impl Par2Repairer {
                             for b in 0..self.files[fi].block_count {
                                 let g = self.files[fi].first_block + b as usize;
                                 if self.locations[g].is_none() {
-                                    self.locations[g] = Some(BlockLocation { file: di, offset: b as u64 * self.block_size() });
+                                    self.locations[g] = Some(BlockLocation {
+                                        file: di,
+                                        offset: b as u64 * self.block_size(),
+                                    });
                                     self.files[fi].available_blocks += 1;
                                 }
                             }
                         }
-                        observer.message(Level::Info, &format!("File {} is a complete copy of {}", label, self.files[fi].target_filename));
+                        observer.message(
+                            Level::Info,
+                            &format!(
+                                "File {} is a complete copy of {}",
+                                label, self.files[fi].target_filename
+                            ),
+                        );
                     }
                 }
             }
@@ -1157,10 +1455,20 @@ impl Par2Repairer {
         if let Some(fi) = expected {
             let f = &self.files[fi];
             if f.status != FileStatus::Complete {
-                let found_here = report.found.iter().filter(|b| b.block.file_index as usize == fi).count();
+                let found_here = report
+                    .found
+                    .iter()
+                    .filter(|b| b.block.file_index as usize == fi)
+                    .count();
                 observer.message(
                     Level::Detail,
-                    &format!("File {}: {} of {} blocks found ({} other-file blocks)", f.target_filename, found_here, f.block_count, report.found.len() - found_here),
+                    &format!(
+                        "File {}: {} of {} blocks found ({} other-file blocks)",
+                        f.target_filename,
+                        found_here,
+                        f.block_count,
+                        report.found.len() - found_here
+                    ),
                 );
             }
         }
@@ -1169,19 +1477,32 @@ impl Par2Repairer {
 
     /// Scan an additional file (renamed download, duplicate, fragment). Returns the number of
     /// previously missing blocks it supplied.
-    pub fn add_extra_file(&mut self, path: &Path, observer: &mut dyn RepairObserver) -> Result<usize, RepairError> {
+    pub fn add_extra_file(
+        &mut self,
+        path: &Path,
+        observer: &mut dyn RepairObserver,
+    ) -> Result<usize, RepairError> {
         if !self.finalized {
             return Err(RepairError::NotFinalized);
         }
         let canonical = path.to_path_buf();
-        if self.scanned_extra.contains(&canonical) || self.files.iter().any(|f| f.target_path == canonical && f.status == FileStatus::Complete) {
+        if self.scanned_extra.contains(&canonical)
+            || self
+                .files
+                .iter()
+                .any(|f| f.target_path == canonical && f.status == FileStatus::Complete)
+        {
             return Ok(0);
         }
-        if self.missing_blocks() == 0 && self.files.iter().all(|f| f.status == FileStatus::Complete) {
+        if self.missing_blocks() == 0 && self.files.iter().all(|f| f.status == FileStatus::Complete)
+        {
             return Ok(0);
         }
         observer.stage(Stage::ScanningExtra);
-        observer.message(Level::Info, &format!("Scanning extra file {}", path.display()));
+        observer.message(
+            Level::Info,
+            &format!("Scanning extra file {}", path.display()),
+        );
         let n = self.scan_path_into(path, None, observer)?;
         self.scanned_extra.insert(canonical);
         Ok(n)
@@ -1189,21 +1510,36 @@ impl Par2Repairer {
 
     /// Scan every regular file in `dir` that is neither a target, a par2 file of this set, nor
     /// already scanned, for missing blocks. Stops early once nothing is missing.
-    pub fn add_extra_files_from_dir(&mut self, dir: &Path, observer: &mut dyn RepairObserver) -> Result<usize, RepairError> {
+    pub fn add_extra_files_from_dir(
+        &mut self,
+        dir: &Path,
+        observer: &mut dyn RepairObserver,
+    ) -> Result<usize, RepairError> {
         if !self.finalized {
             return Err(RepairError::NotFinalized);
         }
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir).map_err(io_ctx(format!("reading {}", dir.display())))?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map_err(io_ctx(format!("reading {}", dir.display())))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
         entries.sort();
         let mut total = 0;
         for p in entries {
             if self.cancelled() {
                 return Err(RepairError::Cancelled);
             }
-            if self.missing_blocks() == 0 && self.files.iter().all(|f| f.status == FileStatus::Complete || f.complete_file.is_some()) {
+            if self.missing_blocks() == 0
+                && self
+                    .files
+                    .iter()
+                    .all(|f| f.status == FileStatus::Complete || f.complete_file.is_some())
+            {
                 break;
             }
-            if p.is_dir() || self.par_files.contains(&p) || self.files.iter().any(|f| f.target_path == p) {
+            if p.is_dir()
+                || self.par_files.contains(&p)
+                || self.files.iter().any(|f| f.target_path == p)
+            {
                 continue;
             }
             total += self.add_extra_file(&p, observer)?;
@@ -1213,21 +1549,41 @@ impl Par2Repairer {
 
     /// Scan files in `dir` whose names look like split fragments of a target
     /// (`target.001`, `target.bin.002`, ...). Returns blocks gained.
-    pub fn add_split_fragments(&mut self, dir: &Path, observer: &mut dyn RepairObserver) -> Result<usize, RepairError> {
+    pub fn add_split_fragments(
+        &mut self,
+        dir: &Path,
+        observer: &mut dyn RepairObserver,
+    ) -> Result<usize, RepairError> {
         if !self.finalized {
             return Err(RepairError::NotFinalized);
         }
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir).map_err(io_ctx(format!("reading {}", dir.display())))?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map_err(io_ctx(format!("reading {}", dir.display())))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
         entries.sort();
-        let targets: Vec<Vec<u8>> = self.files.iter().map(|f| f.target_filename.as_bytes().to_vec()).collect();
+        let targets: Vec<Vec<u8>> = self
+            .files
+            .iter()
+            .map(|f| f.target_filename.as_bytes().to_vec())
+            .collect();
         let mut total = 0;
         for p in entries {
             if p.is_dir() || self.files.iter().any(|f| f.target_path == p) {
                 continue;
             }
-            let name = p.file_name().map(crate::filenames::os_str_bytes).unwrap_or_default();
-            if targets.iter().any(|t| crate::renamer::maybe_split_fragment(&name, t)) {
-                observer.message(Level::Detail, &format!("Found split fragment {}", p.display()));
+            let name = p
+                .file_name()
+                .map(crate::filenames::os_str_bytes)
+                .unwrap_or_default();
+            if targets
+                .iter()
+                .any(|t| crate::renamer::maybe_split_fragment(&name, t))
+            {
+                observer.message(
+                    Level::Detail,
+                    &format!("Found split fragment {}", p.display()),
+                );
                 total += self.add_extra_file(&p, observer)?;
                 if !self.split_fragments.contains(&p) {
                     self.split_fragments.push(p.clone());
@@ -1256,7 +1612,11 @@ impl Par2Repairer {
                 }
                 BackupPolicy::RenameBak => {
                     let mut s = path.as_os_str().to_owned();
-                    s.push(if n == 1 { ".bak".to_string() } else { format!(".bak.{}", n - 1) });
+                    s.push(if n == 1 {
+                        ".bak".to_string()
+                    } else {
+                        format!(".bak.{}", n - 1)
+                    });
                     PathBuf::from(s)
                 }
             };
@@ -1265,7 +1625,11 @@ impl Par2Repairer {
                     return Ok((candidate, true));
                 }
                 let _ = std::fs::remove_file(&candidate);
-                std::fs::rename(path, &candidate).map_err(io_ctx(format!("renaming {} to {}", path.display(), candidate.display())))?;
+                std::fs::rename(path, &candidate).map_err(io_ctx(format!(
+                    "renaming {} to {}",
+                    path.display(),
+                    candidate.display()
+                )))?;
                 return Ok((candidate, false));
             }
             n += 1;
@@ -1273,7 +1637,10 @@ impl Par2Repairer {
     }
 
     /// Repair all incomplete files. Call after [`verify`](Self::verify).
-    pub fn repair(&mut self, observer: &mut dyn RepairObserver) -> Result<RepairResult, RepairError> {
+    pub fn repair(
+        &mut self,
+        observer: &mut dyn RepairObserver,
+    ) -> Result<RepairResult, RepairError> {
         if !self.finalized {
             return Err(RepairError::NotFinalized);
         }
@@ -1281,18 +1648,28 @@ impl Par2Repairer {
             self.verify(None, observer)?;
         }
         let ss = self.block_size();
-        let incomplete: Vec<usize> = (0..self.files.len()).filter(|&i| self.files[i].status != FileStatus::Complete).collect();
+        let incomplete: Vec<usize> = (0..self.files.len())
+            .filter(|&i| self.files[i].status != FileStatus::Complete)
+            .collect();
         if incomplete.is_empty() {
             return Ok(RepairResult::NotNeeded);
         }
         let missing_total = self.missing_blocks();
         let recovery_total = self.recovery_blocks();
         if missing_total > recovery_total {
-            return Err(RepairError::NotEnoughRecovery { needed: missing_total, available: recovery_total });
+            return Err(RepairError::NotEnoughRecovery {
+                needed: missing_total,
+                available: recovery_total,
+            });
         }
         observer.stage(Stage::Repairing);
         let t_start = std::time::Instant::now();
-        let lap = |observer: &mut dyn RepairObserver, what: &str| observer.message(Level::Detail, &format!("{what} done at t+{:.3}s", t_start.elapsed().as_secs_f64()));
+        let lap = |observer: &mut dyn RepairObserver, what: &str| {
+            observer.message(
+                Level::Detail,
+                &format!("{what} done at t+{:.3}s", t_start.elapsed().as_secs_f64()),
+            )
+        };
 
         // ---- 1. rotate damaged targets, rename misnamed complete copies ----
         let mut backups: Vec<PathBuf> = Vec::new();
@@ -1308,7 +1685,14 @@ impl Par2Repairer {
             let target = self.files[fi].target_path.clone();
             if target.is_file() {
                 let (backup, patched_in_place) = self.make_backup(&target)?;
-                observer.message(Level::Info, &format!("Kept damaged file {} as {}", target.display(), backup.display()));
+                observer.message(
+                    Level::Info,
+                    &format!(
+                        "Kept damaged file {} as {}",
+                        target.display(),
+                        backup.display()
+                    ),
+                );
                 // Blocks located in the target are read from the pristine backup from now on
                 // (the target is about to be rewritten).
                 let di = self.disk_index.get(&target).copied();
@@ -1326,21 +1710,35 @@ impl Par2Repairer {
                 backups.push(backup);
             }
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(io_ctx(format!("creating {}", parent.display())))?;
+                std::fs::create_dir_all(parent)
+                    .map_err(io_ctx(format!("creating {}", parent.display())))?;
             }
-            let complete_copy = self.files[fi].complete_file.clone().filter(|p| p.is_file() && p != &target);
+            let complete_copy = self.files[fi]
+                .complete_file
+                .clone()
+                .filter(|p| p.is_file() && p != &target);
             if let (Some(copy), true) = (complete_copy, self.options.rename_misnamed) {
                 // Is the copy an exclusive source? Other files may read blocks from it; copying
                 // is safer than renaming when any other file's blocks live there.
                 let di = self.disk_index.get(&copy).copied();
                 let shared = di.is_some_and(|di| {
                     self.locations.iter().enumerate().any(|(g, l)| {
-                        l.as_ref().is_some_and(|l| l.file == di) && !(self.files[fi].first_block..self.files[fi].first_block + self.files[fi].block_count as usize).contains(&g)
+                        l.as_ref().is_some_and(|l| l.file == di)
+                            && !(self.files[fi].first_block
+                                ..self.files[fi].first_block + self.files[fi].block_count as usize)
+                                .contains(&g)
                     })
                 });
                 if !shared {
-                    std::fs::rename(&copy, &target).map_err(io_ctx(format!("renaming {} to {}", copy.display(), target.display())))?;
-                    observer.message(Level::Info, &format!("Renamed {} to {}", copy.display(), target.display()));
+                    std::fs::rename(&copy, &target).map_err(io_ctx(format!(
+                        "renaming {} to {}",
+                        copy.display(),
+                        target.display()
+                    )))?;
+                    observer.message(
+                        Level::Info,
+                        &format!("Renamed {} to {}", copy.display(), target.display()),
+                    );
                     if let Some(di) = di {
                         self.disk_files[di] = target.clone();
                         self.disk_index.remove(&copy);
@@ -1377,7 +1775,9 @@ impl Par2Repairer {
                 .truncate(cloned_from.is_none())
                 .open(&f.target_path)
                 .map_err(io_ctx(format!("creating {}", f.target_path.display())))?;
-            target.set_len(f.file_length).map_err(io_ctx(format!("sizing {}", f.target_path.display())))?;
+            target
+                .set_len(f.file_length)
+                .map_err(io_ctx(format!("sizing {}", f.target_path.display())))?;
             let mut sources: HashMap<usize, File> = HashMap::new();
             for b in 0..f.block_count {
                 if self.cancelled() {
@@ -1396,7 +1796,10 @@ impl Par2Repairer {
                     Some(s) => s,
                     None => {
                         let p = &self.disk_files[loc.file];
-                        sources.insert(loc.file, File::open(p).map_err(io_ctx(format!("opening {}", p.display())))?);
+                        sources.insert(
+                            loc.file,
+                            File::open(p).map_err(io_ctx(format!("opening {}", p.display())))?,
+                        );
                         &sources[&loc.file]
                     }
                 };
@@ -1407,15 +1810,21 @@ impl Par2Repairer {
                 let mut done = 0u64;
                 while done < avail {
                     let n = ((avail - done) as usize).min(buf.len());
-                    read_exact_at(src, loc.offset + done, &mut buf[..n]).map_err(io_ctx(format!("reading {}", self.disk_files[loc.file].display())))?;
-                    write_all_at(&target, dst_off + done, &buf[..n]).map_err(io_ctx(format!("writing {}", f.target_path.display())))?;
+                    read_exact_at(src, loc.offset + done, &mut buf[..n]).map_err(io_ctx(
+                        format!("reading {}", self.disk_files[loc.file].display()),
+                    ))?;
+                    write_all_at(&target, dst_off + done, &buf[..n])
+                        .map_err(io_ctx(format!("writing {}", f.target_path.display())))?;
                     done += n as u64;
                 }
                 // Any shortfall (block located at the end of a shorter file) stays zero, which
                 // is exactly the padded content the checksum covered.
                 copied += 1;
                 if let Some(p) = (copied * 500).checked_div(copy_total) {
-                    observer.progress(p as u32, &format!("Copying blocks of {}", f.target_filename));
+                    observer.progress(
+                        p as u32,
+                        &format!("Copying blocks of {}", f.target_filename),
+                    );
                 }
             }
             targets.insert(fi, target);
@@ -1423,10 +1832,13 @@ impl Par2Repairer {
 
         lap(observer, "target files");
         // ---- 3. Reed-Solomon for missing blocks ----
-        let missing_globals: Vec<usize> = (0..self.locations.len()).filter(|&g| self.locations[g].is_none()).collect();
+        let missing_globals: Vec<usize> = (0..self.locations.len())
+            .filter(|&g| self.locations[g].is_none())
+            .collect();
         let mut blocks_recovered = 0u64;
         if !missing_globals.is_empty() {
-            let logs = input_constant_logs(self.locations.len()).map_err(|_| RepairError::Singular)?;
+            let logs =
+                input_constant_logs(self.locations.len()).map_err(|_| RepairError::Singular)?;
             let present: Vec<bool> = self.locations.iter().map(|l| l.is_some()).collect();
             let streaming = self.streaming.is_some();
             if streaming {
@@ -1435,61 +1847,99 @@ impl Par2Repairer {
                 self.streaming_backfill(observer)?;
             }
             let allowed: Option<Vec<u32>> = self.streaming.as_ref().map(|st| st.exponents.clone());
-            let (plan, usable) = self.plan_with_verified_recovery(&logs, &present, allowed.as_deref(), observer)?;
+            let (plan, usable) =
+                self.plan_with_verified_recovery(&logs, &present, allowed.as_deref(), observer)?;
             lap(observer, "recovery plan + packet verification");
 
-            let mut reader = RepairReader { files: Vec::new(), by_path: HashMap::new(), slices: Vec::new(), mem: &[], kernel: self.options.kernel };
+            let mut reader = RepairReader {
+                files: Vec::new(),
+                by_path: HashMap::new(),
+                slices: Vec::new(),
+                mem: &[],
+                kernel: self.options.kernel,
+            };
             let mut specs: Vec<InputSpec> = Vec::with_capacity(present.len());
             if let Some(st) = self.streaming.as_ref() {
                 // Present blocks are already folded into the syndromes: inputs are the
                 // syndromes plus the recovery slices, both contributing 1 to output j.
                 reader.mem = &st.syndromes;
                 for (j, &e) in plan.used_exponents.iter().enumerate() {
-                    let si = st.exponents.iter().position(|&x| x == e).expect("tracked exponent");
+                    let si = st
+                        .exponents
+                        .iter()
+                        .position(|&x| x == e)
+                        .expect("tracked exponent");
                     let sidx = reader.slices.len();
                     reader.slices.push(SliceSrc::Mem(si));
-                    specs.push(InputSpec { kind: InputKind::Recovery { output: j }, source: sidx });
+                    specs.push(InputSpec {
+                        kind: InputKind::Recovery { output: j },
+                        source: sidx,
+                    });
                 }
             } else {
                 // Blocks of an in-place target at their natural offsets are read from the
                 // target itself (same bytes, page cache hot) rather than its backup.
-                let natural: HashMap<usize, usize> = in_place.iter().map(|(&fi, &di)| (di, fi)).collect();
+                let natural: HashMap<usize, usize> =
+                    in_place.iter().map(|(&fi, &di)| (di, fi)).collect();
                 for (g, loc) in self.locations.iter().enumerate() {
                     if let Some(loc) = loc {
                         let mut path = &self.disk_files[loc.file];
                         if let Some(&fi) = natural.get(&loc.file) {
                             let f = &self.files[fi];
-                            if g >= f.first_block && g < f.first_block + f.block_count as usize && loc.offset == (g - f.first_block) as u64 * ss {
+                            if g >= f.first_block
+                                && g < f.first_block + f.block_count as usize
+                                && loc.offset == (g - f.first_block) as u64 * ss
+                            {
                                 path = &f.target_path;
                             }
                         }
-                        let fidx = reader.file_index(path).map_err(io_ctx(format!("opening {}", path.display())))?;
+                        let fidx = reader
+                            .file_index(path)
+                            .map_err(io_ctx(format!("opening {}", path.display())))?;
                         let src_len = reader.files[fidx].metadata().map(|m| m.len()).unwrap_or(0);
                         let avail = src_len.saturating_sub(loc.offset).min(ss);
                         let sidx = reader.slices.len();
                         reader.slices.push(SliceSrc::File(fidx, loc.offset, avail));
-                        specs.push(InputSpec { kind: InputKind::Data { logbase: logs[g] }, source: sidx });
+                        specs.push(InputSpec {
+                            kind: InputKind::Data { logbase: logs[g] },
+                            source: sidx,
+                        });
                     }
                 }
             }
             for (j, &e) in plan.used_exponents.iter().enumerate() {
                 let r = usable[&e];
                 let path = &self.par_files[r.source_id];
-                let fidx = reader.file_index(path).map_err(io_ctx(format!("opening {}", path.display())))?;
+                let fidx = reader
+                    .file_index(path)
+                    .map_err(io_ctx(format!("opening {}", path.display())))?;
                 let sidx = reader.slices.len();
-                reader.slices.push(SliceSrc::File(fidx, r.data_offset, r.slice_size));
-                specs.push(InputSpec { kind: InputKind::Recovery { output: j }, source: sidx });
+                reader
+                    .slices
+                    .push(SliceSrc::File(fidx, r.data_offset, r.slice_size));
+                specs.push(InputSpec {
+                    kind: InputKind::Recovery { output: j },
+                    source: sidx,
+                });
             }
             // Outputs: missing blocks → (target file, offset, length).
             let mut out_map: Vec<(usize, u64, u64)> = Vec::with_capacity(plan.missing.len());
             for &g in &plan.missing {
-                let fi = self.files.iter().position(|f| g >= f.first_block && g < f.first_block + f.block_count as usize).expect("block belongs to a file");
+                let fi = self
+                    .files
+                    .iter()
+                    .position(|f| g >= f.first_block && g < f.first_block + f.block_count as usize)
+                    .expect("block belongs to a file");
                 let b = (g - self.files[fi].first_block) as u64;
                 let off = b * ss;
                 let len = (self.files[fi].file_length - off).min(ss);
                 out_map.push((fi, off, len));
             }
-            let config = EngineConfig { num_threads: self.options.num_threads, mem_limit_bytes: self.options.mem_limit_bytes, ..EngineConfig::default() };
+            let config = EngineConfig {
+                num_threads: self.options.num_threads,
+                mem_limit_bytes: self.options.mem_limit_bytes,
+                ..EngineConfig::default()
+            };
             let engine = Engine {
                 slice_size: ss,
                 inputs: &specs,
@@ -1498,7 +1948,10 @@ impl Par2Repairer {
                 config,
                 kernel: self.options.kernel,
             };
-            let mut sink = TargetSink { targets: &targets, map: &out_map };
+            let mut sink = TargetSink {
+                targets: &targets,
+                map: &out_map,
+            };
             let cancel = self.cancel.clone();
             let total_inputs = specs.len().max(1);
             observer.message(
@@ -1507,7 +1960,11 @@ impl Par2Repairer {
                     "Reconstructing {} block(s) from {} recovery block(s){}",
                     plan.missing.len(),
                     plan.used_exponents.len(),
-                    if streaming { " using streamed syndromes" } else { "" }
+                    if streaming {
+                        " using streamed syndromes"
+                    } else {
+                        ""
+                    }
                 ),
             );
             engine
@@ -1518,8 +1975,16 @@ impl Par2Repairer {
                 })
                 .map_err(|e| match e {
                     RsError::Cancelled => RepairError::Cancelled,
-                    RsError::Io(e) => RepairError::Io { context: "reconstructing blocks".into(), source: e },
-                    RsError::NotEnoughRecovery { needed, available } => RepairError::NotEnoughRecovery { needed: needed as u64, available: available as u64 },
+                    RsError::Io(e) => RepairError::Io {
+                        context: "reconstructing blocks".into(),
+                        source: e,
+                    },
+                    RsError::NotEnoughRecovery { needed, available } => {
+                        RepairError::NotEnoughRecovery {
+                            needed: needed as u64,
+                            available: available as u64,
+                        }
+                    }
                     _ => RepairError::Singular,
                 })?;
             blocks_recovered = plan.missing.len() as u64;
@@ -1528,7 +1993,10 @@ impl Par2Repairer {
 
         if self.options.sync_repaired {
             for (&fi, t) in &targets {
-                t.sync_data().map_err(io_ctx(format!("syncing {}", self.files[fi].target_path.display())))?;
+                t.sync_data().map_err(io_ctx(format!(
+                    "syncing {}",
+                    self.files[fi].target_path.display()
+                )))?;
             }
         }
         drop(targets);
@@ -1539,7 +2007,10 @@ impl Par2Repairer {
         if self.options.verify_repaired {
             observer.stage(Stage::VerifyingRepaired);
             let ss = self.block_size();
-            let paths: Vec<&Path> = to_rebuild.iter().map(|&fi| self.files[fi].target_path.as_path()).collect();
+            let paths: Vec<&Path> = to_rebuild
+                .iter()
+                .map(|&fi| self.files[fi].target_path.as_path())
+                .collect();
             let mut ranges: Vec<HashRange> = Vec::new();
             let mut sizes: Vec<u64> = Vec::with_capacity(to_rebuild.len());
             let mut full_idx: Vec<usize> = Vec::new();
@@ -1554,12 +2025,23 @@ impl Par2Repairer {
                 }
             }
             let total_bytes = sizes.iter().sum::<u64>().max(1);
-            let results = hash_ranges_parallel(&paths, &ranges, self.options.num_threads, Some(&self.cancel), &mut |done| {
-                observer.progress((done * 1000 / total_bytes).min(1000) as u32, "Verifying repaired files");
-            })
+            let results = hash_ranges_parallel(
+                &paths,
+                &ranges,
+                self.options.num_threads,
+                Some(&self.cancel),
+                &mut |done| {
+                    observer.progress(
+                        (done * 1000 / total_bytes).min(1000) as u32,
+                        "Verifying repaired files",
+                    );
+                },
+            )
             .map_err(hash_err)?;
             let full_paths: Vec<&Path> = full_idx.iter().map(|&k| paths[k]).collect();
-            let full = file_hashes_parallel(&full_paths, self.options.num_threads, Some(&self.cancel)).map_err(hash_err)?;
+            let full =
+                file_hashes_parallel(&full_paths, self.options.num_threads, Some(&self.cancel))
+                    .map_err(hash_err)?;
             let mut cursor = 0usize;
             for (k, &fi) in to_rebuild.iter().enumerate() {
                 let mut ok = sizes[k] == self.files[fi].file_length;
@@ -1567,10 +2049,14 @@ impl Par2Repairer {
                     let n = self.files[fi].block_count as usize;
                     let got = &results[cursor..cursor + n];
                     cursor += n;
-                    ok &= got.iter().zip(exp).all(|((c, m), e)| *c == e.crc32 && *m == e.md5);
+                    ok &= got
+                        .iter()
+                        .zip(exp)
+                        .all(|((c, m), e)| *c == e.crc32 && *m == e.md5);
                 }
                 if let Some(j) = full_idx.iter().position(|&x| x == k) {
-                    ok &= full[j].md5_full == self.files[fi].hash_full && full[j].len == self.files[fi].file_length;
+                    ok &= full[j].md5_full == self.files[fi].hash_full
+                        && full[j].len == self.files[fi].file_length;
                 }
                 if ok {
                     self.mark_rebuilt_complete(fi);
@@ -1592,7 +2078,10 @@ impl Par2Repairer {
         // Leftovers: backups plus split fragments whose blocks were used and that are not targets.
         let mut leftovers: Vec<PathBuf> = backups;
         for frag in &self.split_fragments {
-            let used = self.disk_index.get(frag).is_some_and(|&di| self.locations.iter().flatten().any(|l| l.file == di));
+            let used = self
+                .disk_index
+                .get(frag)
+                .is_some_and(|&di| self.locations.iter().flatten().any(|l| l.file == di));
             let is_target = self.files.iter().any(|f| &f.target_path == frag);
             if used && !is_target && frag.is_file() && !leftovers.contains(frag) {
                 leftovers.push(frag.clone());
@@ -1601,23 +2090,36 @@ impl Par2Repairer {
         if self.options.backup == BackupPolicy::DeleteAfterRepair {
             for b in &leftovers {
                 if let Err(e) = std::fs::remove_file(b) {
-                    observer.message(Level::Warning, &format!("Could not delete {}: {e}", b.display()));
+                    observer.message(
+                        Level::Warning,
+                        &format!("Could not delete {}: {e}", b.display()),
+                    );
                 } else {
                     observer.message(Level::Info, &format!("Deleted {}", b.display()));
                 }
             }
         }
         observer.progress(1000, "Repair complete");
-        Ok(RepairResult::Repaired { files: repaired_names, blocks_recovered, leftovers })
+        Ok(RepairResult::Repaired {
+            files: repaired_names,
+            blocks_recovered,
+            leftovers,
+        })
     }
 
     fn mark_rebuilt_complete(&mut self, fi: usize) {
         let target = self.files[fi].target_path.clone();
         let di = self.disk_file_index(&target);
         let ss = self.block_size();
-        let (first, count) = (self.files[fi].first_block, self.files[fi].block_count as usize);
+        let (first, count) = (
+            self.files[fi].first_block,
+            self.files[fi].block_count as usize,
+        );
         for b in 0..count {
-            self.locations[first + b] = Some(BlockLocation { file: di, offset: b as u64 * ss });
+            self.locations[first + b] = Some(BlockLocation {
+                file: di,
+                offset: b as u64 * ss,
+            });
         }
         self.files[fi].available_blocks = count as u32;
         self.files[fi].status = FileStatus::Complete;
@@ -1676,9 +2178,13 @@ impl InputReader for RepairReader<'_> {
                 let w0 = (offset / 2) as usize;
                 let n = buf.len() / 2;
                 if w0 + n > words || !offset.is_multiple_of(2) || !buf.len().is_multiple_of(2) {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "syndrome range out of bounds"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "syndrome range out of bounds",
+                    ));
                 }
-                self.kernel.interleave(&s[w0..w0 + n], &s[words + w0..words + w0 + n], buf);
+                self.kernel
+                    .interleave(&s[w0..w0 + n], &s[words + w0..words + w0 + n], buf);
                 Ok(())
             }
         }
@@ -1699,7 +2205,10 @@ impl OutputSink for TargetSink<'_> {
             return Ok(());
         }
         let n = ((block_len - offset) as usize).min(data.len());
-        let f = self.targets.get(&fi).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "target not open"))?;
+        let f = self
+            .targets
+            .get(&fi)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "target not open"))?;
         write_all_at(f, block_off + offset, &data[..n])
     }
 }
@@ -1722,7 +2231,7 @@ pub(crate) fn write_all_at(file: &File, offset: u64, data: &[u8]) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::create::{create, CreateOptions, SourceFile, VolumeScheme};
+    use crate::create::{CreateOptions, SourceFile, VolumeScheme, create};
 
     fn rnd(n: usize, seed: u64) -> Vec<u8> {
         let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -1755,9 +2264,18 @@ mod tests {
             sources.push(SourceFile::new(dir.join(&name)));
             files.push((name, data));
         }
-        let opts = CreateOptions { slice_size: slice, recovery_blocks: recovery, volumes: VolumeScheme::Exponential, ..CreateOptions::default() };
+        let opts = CreateOptions {
+            slice_size: slice,
+            recovery_blocks: recovery,
+            volumes: VolumeScheme::Exponential,
+            ..CreateOptions::default()
+        };
         create(&sources, &dir, "set", &opts, None, &mut |_, _, _| {}).unwrap();
-        Fixture { dir: dir.clone(), files, main: dir.join("set.par2") }
+        Fixture {
+            dir: dir.clone(),
+            files,
+            main: dir.join("set.par2"),
+        }
     }
 
     fn check_all(fx: &Fixture) {
@@ -1767,7 +2285,10 @@ mod tests {
     }
 
     fn by_name<'a>(r: &'a Par2Repairer, name: &str) -> &'a SourceFileState {
-        r.source_files().iter().find(|f| f.target_filename == name).unwrap()
+        r.source_files()
+            .iter()
+            .find(|f| f.target_filename == name)
+            .unwrap()
     }
 
     fn repairer(fx: &Fixture) -> Par2Repairer {
@@ -1792,7 +2313,8 @@ mod tests {
             self.messages.push((l, t.to_string()));
         }
         fn file_verified(&mut self, f: &SourceFileState) {
-            self.verified.push((f.target_filename.clone(), f.status.clone()));
+            self.verified
+                .push((f.target_filename.clone(), f.status.clone()));
         }
         fn progress(&mut self, p: u32, _l: &str) {
             assert!(p <= 1000);
@@ -1815,7 +2337,13 @@ mod tests {
         assert_eq!(v.missing_blocks, 0);
         assert_eq!(v.blocks_needed(), 0);
         assert_eq!(r.available_blocks(), 14);
-        assert!(r.source_files().iter().all(|f| f.status == FileStatus::Complete && f.missing_blocks() == 0 && f.verifiable));
+        assert!(
+            r.source_files()
+                .iter()
+                .all(|f| f.status == FileStatus::Complete
+                    && f.missing_blocks() == 0
+                    && f.verifiable)
+        );
         assert_eq!(r.repair(&mut obs).unwrap(), RepairResult::NotNeeded);
         assert!(obs.stages.contains(&Stage::Verifying));
         assert_eq!(obs.verified.len(), 4);
@@ -1856,7 +2384,11 @@ mod tests {
         assert_eq!(by_name(&r, "file2.bin").available_blocks, 1);
         let res = r.repair(&mut obs).unwrap();
         match res {
-            RepairResult::Repaired { files, blocks_recovered, .. } => {
+            RepairResult::Repaired {
+                files,
+                blocks_recovered,
+                ..
+            } => {
                 assert_eq!(blocks_recovered, 10);
                 assert_eq!(files.len(), 3);
             }
@@ -1866,8 +2398,15 @@ mod tests {
         assert!(fx.dir.join("file0.bin.1").exists());
         assert!(fx.dir.join("file2.bin.1").exists());
         assert!(!fx.dir.join("file1.bin.1").exists());
-        assert!(obs.stages.contains(&Stage::Repairing) && obs.stages.contains(&Stage::VerifyingRepaired));
-        assert!(r.source_files().iter().all(|f| f.status == FileStatus::Complete));
+        assert!(
+            obs.stages.contains(&Stage::Repairing)
+                && obs.stages.contains(&Stage::VerifyingRepaired)
+        );
+        assert!(
+            r.source_files()
+                .iter()
+                .all(|f| f.status == FileStatus::Complete)
+        );
         // Re-verify from scratch.
         let mut r2 = repairer(&fx);
         assert!(r2.verify(None, &mut NullObserver).unwrap().all_complete);
@@ -1893,15 +2432,33 @@ mod tests {
         assert_eq!(v.recovery_blocks, 1);
         assert!(!v.repair_possible);
         assert_eq!(v.blocks_needed(), 4);
-        assert!(matches!(r.repair(&mut NullObserver), Err(RepairError::NotEnoughRecovery { needed: 5, available: 1 })));
+        assert!(matches!(
+            r.repair(&mut NullObserver),
+            Err(RepairError::NotEnoughRecovery {
+                needed: 5,
+                available: 1
+            })
+        ));
         // More volumes arrive (as nzbget's ParChecker::AddParFile does).
-        assert_eq!(r.load_par2_file(&fx.dir.join("set.vol01+02.par2")).unwrap(), 2);
+        assert_eq!(
+            r.load_par2_file(&fx.dir.join("set.vol01+02.par2")).unwrap(),
+            2
+        );
         assert_eq!(r.blocks_needed(), 2);
         assert!(!r.repair_possible());
-        assert_eq!(r.load_par2_file(&fx.dir.join("set.vol03+03.par2")).unwrap(), 3);
+        assert_eq!(
+            r.load_par2_file(&fx.dir.join("set.vol03+03.par2")).unwrap(),
+            3
+        );
         assert!(r.repair_possible());
         let res = r.repair(&mut NullObserver).unwrap();
-        assert!(matches!(res, RepairResult::Repaired { blocks_recovered: 5, .. }));
+        assert!(matches!(
+            res,
+            RepairResult::Repaired {
+                blocks_recovered: 5,
+                ..
+            }
+        ));
         check_all(&fx);
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
@@ -1940,14 +2497,24 @@ mod tests {
         assert_eq!(r.missing_blocks(), 1);
         assert!(r.repair_possible());
         assert_eq!(by_name(&r, "file0.bin").status, FileStatus::Misnamed);
-        assert_eq!(by_name(&r, "file0.bin").complete_file, Some(fx.dir.join("obfuscated.dat")));
+        assert_eq!(
+            by_name(&r, "file0.bin").complete_file,
+            Some(fx.dir.join("obfuscated.dat"))
+        );
         assert_eq!(by_name(&r, "file1.bin").status, FileStatus::Missing);
         // The dupe copy is a complete copy of file2 → treated as misnamed (used whole).
         assert_eq!(by_name(&r, "file2.bin").status, FileStatus::Misnamed);
-        assert_eq!(by_name(&r, "file2.bin").complete_file, Some(fx.dir.join("dupe_copy.bin")));
+        assert_eq!(
+            by_name(&r, "file2.bin").complete_file,
+            Some(fx.dir.join("dupe_copy.bin"))
+        );
         let res = r.repair(&mut obs).unwrap();
         match res {
-            RepairResult::Repaired { files, blocks_recovered, .. } => {
+            RepairResult::Repaired {
+                files,
+                blocks_recovered,
+                ..
+            } => {
                 assert_eq!(blocks_recovered, 1);
                 assert_eq!(files.len(), 3);
             }
@@ -1959,7 +2526,11 @@ mod tests {
         assert!(fx.dir.join("file2.bin.1").exists()); // damaged original rotated away
         assert!(fx.dir.join("file1.bin.001").exists());
         // Scanning an already scanned file is a no-op; scanning when complete is a no-op.
-        assert_eq!(r.add_extra_file(&fx.dir.join("notes.txt"), &mut obs).unwrap(), 0);
+        assert_eq!(
+            r.add_extra_file(&fx.dir.join("notes.txt"), &mut obs)
+                .unwrap(),
+            0
+        );
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
 
@@ -1976,7 +2547,12 @@ mod tests {
             .1
             .chunks(700)
             .enumerate()
-            .map(|(i, c)| Segment { offset: (i * 700) as i64, size: c.len() as i64, crc: crate::crc::crc32(c), success: i != 2 })
+            .map(|(i, c)| Segment {
+                offset: (i * 700) as i64,
+                size: c.len() as i64,
+                crc: crate::crc::crc32(c),
+                success: i != 2,
+            })
             .collect();
         let mut r = repairer(&fx);
         let mut asked = Vec::new();
@@ -1984,7 +2560,9 @@ mod tests {
             asked.push(name.to_string());
             match name {
                 "file0.bin" => Some(QuickInfo::Success { crc: crc0 }),
-                "file1.bin" => Some(QuickInfo::Partial { segments: segments.clone() }),
+                "file1.bin" => Some(QuickInfo::Partial {
+                    segments: segments.clone(),
+                }),
                 _ => None,
             }
         };
@@ -2005,10 +2583,20 @@ mod tests {
         let v = r.verify(Some(&mut quick), &mut obs).unwrap();
         assert!(v.all_complete);
         assert_eq!(v.quick_verified_files, 0);
-        assert!(obs.messages.iter().any(|(l, m)| *l == Level::Warning && m.contains("Quick verification failed")));
+        assert!(
+            obs.messages
+                .iter()
+                .any(|(l, m)| *l == Level::Warning && m.contains("Quick verification failed"))
+        );
         // Failure status → all blocks missing without reading.
         let mut r = repairer(&fx);
-        let mut quick = |n: &str| if n == "file1.bin" { Some(QuickInfo::Failure) } else { None };
+        let mut quick = |n: &str| {
+            if n == "file1.bin" {
+                Some(QuickInfo::Failure)
+            } else {
+                None
+            }
+        };
         let v = r.verify(Some(&mut quick), &mut NullObserver).unwrap();
         assert_eq!(v.missing_blocks, 3);
         std::fs::remove_dir_all(&fx.dir).unwrap();
@@ -2026,21 +2614,43 @@ mod tests {
         let mut f0 = std::fs::read(&p).unwrap();
         f0[10] ^= 1;
         std::fs::write(&p, &f0).unwrap();
-        let mut r = Par2Repairer::new(&fx.dir, RepairOptions { backup: BackupPolicy::RenameBak, ..RepairOptions::default() });
+        let mut r = Par2Repairer::new(
+            &fx.dir,
+            RepairOptions {
+                backup: BackupPolicy::RenameBak,
+                ..RepairOptions::default()
+            },
+        );
         r.load_par2_set(&fx.main).unwrap();
         r.finalize().unwrap();
         assert_eq!(r.recovery_blocks(), 4); // metadata scan does not hash payloads
         let mut obs = Collect::default();
         r.verify(None, &mut obs).unwrap();
         let res = r.repair(&mut obs).unwrap();
-        assert!(matches!(res, RepairResult::Repaired { blocks_recovered: 1, .. }));
-        assert!(obs.messages.iter().any(|(l, m)| *l == Level::Warning && m.contains("corrupt")));
+        assert!(matches!(
+            res,
+            RepairResult::Repaired {
+                blocks_recovered: 1,
+                ..
+            }
+        ));
+        assert!(
+            obs.messages
+                .iter()
+                .any(|(l, m)| *l == Level::Warning && m.contains("corrupt"))
+        );
         assert_eq!(r.recovery_blocks(), 3);
         check_all(&fx);
         assert!(fx.dir.join("file0.bin.bak").exists());
         // Damage again: .bak exists → .bak.1
         std::fs::write(&p, &f0).unwrap();
-        let mut r = Par2Repairer::new(&fx.dir, RepairOptions { backup: BackupPolicy::RenameBak, ..RepairOptions::default() });
+        let mut r = Par2Repairer::new(
+            &fx.dir,
+            RepairOptions {
+                backup: BackupPolicy::RenameBak,
+                ..RepairOptions::default()
+            },
+        );
         r.load_par2_set(&fx.main).unwrap();
         r.finalize().unwrap();
         r.verify(None, &mut NullObserver).unwrap();
@@ -2048,7 +2658,13 @@ mod tests {
         assert!(fx.dir.join("file0.bin.bak.1").exists());
         // Delete-after-repair policy.
         std::fs::write(&p, &f0).unwrap();
-        let mut r = Par2Repairer::new(&fx.dir, RepairOptions { backup: BackupPolicy::DeleteAfterRepair, ..RepairOptions::default() });
+        let mut r = Par2Repairer::new(
+            &fx.dir,
+            RepairOptions {
+                backup: BackupPolicy::DeleteAfterRepair,
+                ..RepairOptions::default()
+            },
+        );
         r.load_par2_set(&fx.main).unwrap();
         r.finalize().unwrap();
         r.verify(None, &mut NullObserver).unwrap();
@@ -2063,26 +2679,53 @@ mod tests {
         let fx = fixture("errs", &[2000], 1000, 2);
         let mut r = Par2Repairer::new(&fx.dir, RepairOptions::default());
         assert!(matches!(r.finalize(), Err(RepairError::NoMainPacket)));
-        assert!(matches!(r.verify(None, &mut NullObserver), Err(RepairError::NotFinalized)));
-        assert!(matches!(r.repair(&mut NullObserver), Err(RepairError::NotFinalized)));
-        assert!(matches!(r.add_extra_file(&fx.main, &mut NullObserver), Err(RepairError::NotFinalized)));
-        assert!(matches!(r.add_extra_files_from_dir(&fx.dir, &mut NullObserver), Err(RepairError::NotFinalized)));
-        assert!(matches!(r.add_split_fragments(&fx.dir, &mut NullObserver), Err(RepairError::NotFinalized)));
-        assert!(matches!(r.load_par2_file(&fx.dir.join("nope.par2")), Err(RepairError::Io { .. })));
+        assert!(matches!(
+            r.verify(None, &mut NullObserver),
+            Err(RepairError::NotFinalized)
+        ));
+        assert!(matches!(
+            r.repair(&mut NullObserver),
+            Err(RepairError::NotFinalized)
+        ));
+        assert!(matches!(
+            r.add_extra_file(&fx.main, &mut NullObserver),
+            Err(RepairError::NotFinalized)
+        ));
+        assert!(matches!(
+            r.add_extra_files_from_dir(&fx.dir, &mut NullObserver),
+            Err(RepairError::NotFinalized)
+        ));
+        assert!(matches!(
+            r.add_split_fragments(&fx.dir, &mut NullObserver),
+            Err(RepairError::NotFinalized)
+        ));
+        assert!(matches!(
+            r.load_par2_file(&fx.dir.join("nope.par2")),
+            Err(RepairError::Io { .. })
+        ));
         r.load_par2_file(&fx.main).unwrap();
         // A file of another set is rejected.
         let other = fixture("errs-other", &[1000], 1000, 1);
-        assert!(matches!(r.load_par2_file(&other.main), Err(RepairError::WrongSet { .. })));
+        assert!(matches!(
+            r.load_par2_file(&other.main),
+            Err(RepairError::WrongSet { .. })
+        ));
         std::fs::remove_dir_all(&other.dir).unwrap();
         r.finalize().unwrap();
         // Repair without verify first auto-verifies.
-        assert_eq!(r.repair(&mut NullObserver).unwrap(), RepairResult::NotNeeded);
+        assert_eq!(
+            r.repair(&mut NullObserver).unwrap(),
+            RepairResult::NotNeeded
+        );
         // Cancellation.
         let fx2 = fixture("errs2", &[5000], 1000, 2);
         let mut r = repairer(&fx2);
         let token = r.cancel_token();
         token.store(true, Ordering::Relaxed);
-        assert!(matches!(r.verify(None, &mut NullObserver), Err(RepairError::Cancelled)));
+        assert!(matches!(
+            r.verify(None, &mut NullObserver),
+            Err(RepairError::Cancelled)
+        ));
         r.cancel();
         assert!(r.cancel_token().load(Ordering::Relaxed));
         // In-memory par2 data.
@@ -2094,18 +2737,37 @@ mod tests {
         // Error display.
         for e in [
             RepairError::NoMainPacket,
-            RepairError::IncompleteMetadata { missing_descriptions: vec![] },
+            RepairError::IncompleteMetadata {
+                missing_descriptions: vec![],
+            },
             RepairError::NotFinalized,
-            RepairError::WrongSet { expected: SetId([0; 16]), found: SetId([1; 16]) },
-            RepairError::NotEnoughRecovery { needed: 2, available: 1 },
+            RepairError::WrongSet {
+                expected: SetId([0; 16]),
+                found: SetId([1; 16]),
+            },
+            RepairError::NotEnoughRecovery {
+                needed: 2,
+                available: 1,
+            },
             RepairError::Singular,
-            RepairError::VerificationFailed { files: vec!["a".into()] },
-            RepairError::Io { context: "x".into(), source: io::Error::other("y") },
+            RepairError::VerificationFailed {
+                files: vec!["a".into()],
+            },
+            RepairError::Io {
+                context: "x".into(),
+                source: io::Error::other("y"),
+            },
             RepairError::Cancelled,
         ] {
             assert!(!e.to_string().is_empty());
         }
-        assert!(std::error::Error::source(&RepairError::Io { context: "x".into(), source: io::Error::other("y") }).is_some());
+        assert!(
+            std::error::Error::source(&RepairError::Io {
+                context: "x".into(),
+                source: io::Error::other("y")
+            })
+            .is_some()
+        );
         std::fs::remove_dir_all(&fx.dir).unwrap();
         std::fs::remove_dir_all(&fx2.dir).unwrap();
     }
@@ -2115,7 +2777,9 @@ mod tests {
         let fx = fixture("meta", &[3000, 3000], 1000, 1);
         // Build an index with the Main packet but drop one FileDesc.
         let bytes = std::fs::read(&fx.main).unwrap();
-        let raws: Vec<_> = crate::packet::PacketIter::new(&bytes[..], ScanOptions::UNVERIFIED).map(|x| x.unwrap()).collect();
+        let raws: Vec<_> = crate::packet::PacketIter::new(&bytes[..], ScanOptions::UNVERIFIED)
+            .map(|x| x.unwrap())
+            .collect();
         let mut trimmed = Vec::new();
         let mut dropped = false;
         for r in raws {
@@ -2123,14 +2787,18 @@ mod tests {
                 dropped = true;
                 continue;
             }
-            trimmed.extend_from_slice(&bytes[r.offset as usize..(r.offset + r.header.length) as usize]);
+            trimmed.extend_from_slice(
+                &bytes[r.offset as usize..(r.offset + r.header.length) as usize],
+            );
         }
         let p = fx.dir.join("trimmed.par2");
         std::fs::write(&p, &trimmed).unwrap();
         let mut r = Par2Repairer::new(&fx.dir, RepairOptions::default());
         r.load_par2_file(&p).unwrap();
         match r.finalize() {
-            Err(RepairError::IncompleteMetadata { missing_descriptions }) => assert_eq!(missing_descriptions.len(), 1),
+            Err(RepairError::IncompleteMetadata {
+                missing_descriptions,
+            }) => assert_eq!(missing_descriptions.len(), 1),
             other => panic!("{other:?}"),
         }
         std::fs::remove_dir_all(&fx.dir).unwrap();
@@ -2142,18 +2810,27 @@ mod tests {
         // Strip the IFSC packet of file0 from the index and volumes.
         let id0 = {
             let set = crate::packet::load_par2_file(&fx.main, ScanOptions::FULL).unwrap();
-            set.file_descs.values().find(|d| d.name == b"file0.bin").unwrap().file_id
+            set.file_descs
+                .values()
+                .find(|d| d.name == b"file0.bin")
+                .unwrap()
+                .file_id
         };
         for entry in std::fs::read_dir(&fx.dir).unwrap() {
             let p = entry.unwrap().path();
             if p.extension().is_some_and(|e| e == "par2") {
                 let bytes = std::fs::read(&p).unwrap();
-                let raws: Vec<_> = crate::packet::PacketIter::new(&bytes[..], ScanOptions::UNVERIFIED).map(|x| x.unwrap()).collect();
+                let raws: Vec<_> =
+                    crate::packet::PacketIter::new(&bytes[..], ScanOptions::UNVERIFIED)
+                        .map(|x| x.unwrap())
+                        .collect();
                 let mut out = Vec::new();
                 for r in raws {
                     let s = r.offset as usize;
                     let e = s + r.header.length as usize;
-                    if r.header.kind() == crate::packet::PacketType::Ifsc && bytes[s + 64..s + 80] == id0.0 {
+                    if r.header.kind() == crate::packet::PacketType::Ifsc
+                        && bytes[s + 64..s + 80] == id0.0
+                    {
                         continue;
                     }
                     out.extend_from_slice(&bytes[s..e]);
@@ -2176,7 +2853,13 @@ mod tests {
         let v = r.verify(None, &mut NullObserver).unwrap();
         assert_eq!(v.missing_blocks, 3);
         assert!(v.repair_possible);
-        assert!(matches!(r.repair(&mut NullObserver).unwrap(), RepairResult::Repaired { blocks_recovered: 3, .. }));
+        assert!(matches!(
+            r.repair(&mut NullObserver).unwrap(),
+            RepairResult::Repaired {
+                blocks_recovered: 3,
+                ..
+            }
+        ));
         check_all(&fx);
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
@@ -2188,12 +2871,25 @@ mod tests {
         let p = fx.dir.join("file0.bin");
         let d = std::fs::read(&p).unwrap();
         std::fs::write(&p, &d[..20_000]).unwrap();
-        let mut r = Par2Repairer::new(&fx.dir, RepairOptions { num_threads: 3, mem_limit_bytes: 0, ..RepairOptions::default() });
+        let mut r = Par2Repairer::new(
+            &fx.dir,
+            RepairOptions {
+                num_threads: 3,
+                mem_limit_bytes: 0,
+                ..RepairOptions::default()
+            },
+        );
         r.load_par2_set(&fx.main).unwrap();
         r.finalize().unwrap();
         let v = r.verify(None, &mut NullObserver).unwrap();
         assert_eq!(v.missing_blocks, 60);
-        assert!(matches!(r.repair(&mut NullObserver).unwrap(), RepairResult::Repaired { blocks_recovered: 60, .. }));
+        assert!(matches!(
+            r.repair(&mut NullObserver).unwrap(),
+            RepairResult::Repaired {
+                blocks_recovered: 60,
+                ..
+            }
+        ));
         check_all(&fx);
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }

@@ -2,16 +2,32 @@
 //! indexer summary built on top of it.
 
 use par_rs::create::{SetOptions, VolumeScheme, build_set};
-use par_rs::inspect::{CreatorTool, PacketKind, ParFormat, VerifyMode, inspect_par2, inspect_par2_with, parse_par2_filename};
+use par_rs::inspect::{
+    CreatorTool, PacketKind, ParFormat, VerifyMode, inspect_par2, inspect_par2_with,
+    parse_par2_filename,
+};
 use par_rs::par2::{display_name, file_descriptions, inventory, is_base_par2};
 use par_rs::{Isa, Kernel};
 
 fn data(n: usize, seed: u32) -> Vec<u8> {
-    (0..n as u32).map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed.wrapping_mul(1013)) >> 13) as u8).collect()
+    (0..n as u32)
+        .map(|i| {
+            (i.wrapping_mul(2654435761)
+                .wrapping_add(seed.wrapping_mul(1013))
+                >> 13) as u8
+        })
+        .collect()
 }
 
 fn opts(ss: usize, rec: u32) -> SetOptions {
-    SetOptions { slice_size: ss, recovery_blocks: rec, volumes: VolumeScheme::Uniform(3), creator: "par-rs test 0.2.0 (aarch64)".into(), kernel: Kernel::with_isa(Isa::Scalar).unwrap_or_else(Kernel::detect), ..SetOptions::default() }
+    SetOptions {
+        slice_size: ss,
+        recovery_blocks: rec,
+        volumes: VolumeScheme::Uniform(3),
+        creator: "par-rs test 0.2.0 (aarch64)".into(),
+        kernel: Kernel::with_isa(Isa::Scalar).unwrap_or_else(Kernel::detect),
+        ..SetOptions::default()
+    }
 }
 
 #[test]
@@ -19,7 +35,12 @@ fn full_set_inspection_and_inventory() {
     let a = data(10_000, 1);
     let b = data(4_000, 2);
     let c = data(0, 3);
-    let set = build_set("rel", &[("alpha.rar", &a), ("bëta.rar", &b), ("empty.txt", &c)], &opts(1024, 7)).unwrap();
+    let set = build_set(
+        "rel",
+        &[("alpha.rar", &a), ("bëta.rar", &b), ("empty.txt", &c)],
+        &opts(1024, 7),
+    )
+    .unwrap();
     let r = inspect_par2(&set.index, true);
     assert_eq!(r.format, Some(ParFormat::Par2));
     assert_eq!(r.main.len(), 1);
@@ -44,7 +65,12 @@ fn full_set_inspection_and_inventory() {
     assert!(inv.complete);
     assert!(!inv.truncated);
     assert_eq!(inv.files.len(), 3);
-    assert!(inv.files.windows(2).all(|w| u128::from_le_bytes(w[0].file_id) < u128::from_le_bytes(w[1].file_id)), "libpar2 order");
+    assert!(
+        inv.files
+            .windows(2)
+            .all(|w| u128::from_le_bytes(w[0].file_id) < u128::from_le_bytes(w[1].file_id)),
+        "libpar2 order"
+    );
     let beta = inv.files.iter().find(|f| f.name == "bëta.rar").unwrap();
     assert_eq!(beta.size, 4000);
     assert_eq!(beta.crc32, Some(par_rs::crc32(&b)));
@@ -71,7 +97,10 @@ fn full_set_inspection_and_inventory() {
     assert_eq!(v0.bad_md5, 0);
     assert!(!v0.main.is_empty());
     let name = parse_par2_filename(&set.volumes[1].0).unwrap();
-    assert_eq!((name.first_block, name.block_count, name.is_index), (Some(3), Some(3), false));
+    assert_eq!(
+        (name.first_block, name.block_count, name.is_index),
+        (Some(3), Some(3), false)
+    );
     assert!(!is_base_par2(&set.volumes[1].0));
     assert!(is_base_par2("rel.par2"));
 }
@@ -90,8 +119,15 @@ fn prefix_sweep_is_panic_free_and_monotonic() {
         assert!(inv.sealed.len() >= prev_sealed, "sealed monotonic at {cut}");
         for f in &inv.files {
             // Identity never changes; fields filled in by later packets (IFSC CRC) may still be absent.
-            let real = full.files.iter().find(|x| x.file_id == f.file_id).expect("prefix reports only real files");
-            assert_eq!((&f.name, f.size, f.md5, f.md5_16k, f.set_id), (&real.name, real.size, real.md5, real.md5_16k, real.set_id));
+            let real = full
+                .files
+                .iter()
+                .find(|x| x.file_id == f.file_id)
+                .expect("prefix reports only real files");
+            assert_eq!(
+                (&f.name, f.size, f.md5, f.md5_16k, f.set_id),
+                (&real.name, real.size, real.md5, real.md5_16k, real.set_id)
+            );
             assert!(f.crc32.is_none() || f.crc32 == real.crc32);
             assert!(!f.bound || real.bound);
         }
@@ -133,7 +169,11 @@ fn garbage_shifts_and_bit_flips() {
     assert!(r.resyncs >= 1);
     assert_eq!(inventory(&shifted).files.len(), 1);
     let unverified = inspect_par2_with(&shifted, VerifyMode::None);
-    assert_eq!(unverified.files.len(), 1, "torn header must not swallow the real packet");
+    assert_eq!(
+        unverified.files.len(),
+        1,
+        "torn header must not swallow the real packet"
+    );
 
     // Every single-bit flip: never panics; a flipped body shows up as a bad MD5 or a changed
     // field, a flipped header as truncation / resync — but never as a bogus extra file.

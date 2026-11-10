@@ -193,7 +193,9 @@ impl PacketHeader {
 
     /// Whether a packet starting at `offset` fits inside a source of `source_len` bytes.
     pub fn fits(&self, offset: u64, source_len: u64) -> bool {
-        offset.checked_add(self.length).is_some_and(|end| end <= source_len)
+        offset
+            .checked_add(self.length)
+            .is_some_and(|end| end <= source_len)
     }
 
     /// Packet kind.
@@ -240,7 +242,9 @@ impl PacketSource for [u8] {
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let start = usize::try_from(offset).map_err(|_| io::ErrorKind::UnexpectedEof)?;
-        let end = start.checked_add(buf.len()).ok_or(io::ErrorKind::UnexpectedEof)?;
+        let end = start
+            .checked_add(buf.len())
+            .ok_or(io::ErrorKind::UnexpectedEof)?;
         let src = self.get(start..end).ok_or(io::ErrorKind::UnexpectedEof)?;
         buf.copy_from_slice(src);
         Ok(())
@@ -357,17 +361,33 @@ pub struct ScanOptions {
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        Self { verify_md5: true, verify_recovery_md5: true, resync: true }
+        Self {
+            verify_md5: true,
+            verify_recovery_md5: true,
+            resync: true,
+        }
     }
 }
 
 impl ScanOptions {
     /// Verify everything (repair loading).
-    pub const FULL: ScanOptions = ScanOptions { verify_md5: true, verify_recovery_md5: true, resync: true };
+    pub const FULL: ScanOptions = ScanOptions {
+        verify_md5: true,
+        verify_recovery_md5: true,
+        resync: true,
+    };
     /// Verify metadata packets only; recovery payloads are indexed but not hashed.
-    pub const METADATA: ScanOptions = ScanOptions { verify_md5: true, verify_recovery_md5: false, resync: true };
+    pub const METADATA: ScanOptions = ScanOptions {
+        verify_md5: true,
+        verify_recovery_md5: false,
+        resync: true,
+    };
     /// No hashing at all (fast fingerprinting of trusted data).
-    pub const UNVERIFIED: ScanOptions = ScanOptions { verify_md5: false, verify_recovery_md5: false, resync: true };
+    pub const UNVERIFIED: ScanOptions = ScanOptions {
+        verify_md5: false,
+        verify_recovery_md5: false,
+        resync: true,
+    };
 }
 
 /// A located packet whose header validated.
@@ -415,7 +435,15 @@ pub struct PacketIter<'a, S: PacketSource + ?Sized> {
 impl<'a, S: PacketSource + ?Sized> PacketIter<'a, S> {
     /// Start scanning `src` at offset 0.
     pub fn new(src: &'a S, opts: ScanOptions) -> Self {
-        Self { src, len: src.source_len(), pos: 0, opts, stats: ScanStats::default(), done: false, window: Vec::new() }
+        Self {
+            src,
+            len: src.source_len(),
+            pos: 0,
+            opts,
+            stats: ScanStats::default(),
+            done: false,
+            window: Vec::new(),
+        }
     }
 
     /// Scan statistics so far.
@@ -509,7 +537,11 @@ impl<'a, S: PacketSource + ?Sized> PacketIter<'a, S> {
                     continue;
                 }
             }
-            let raw = RawPacket { offset: self.pos, header, md5_verified: verified };
+            let raw = RawPacket {
+                offset: self.pos,
+                header,
+                md5_verified: verified,
+            };
             self.pos += header.length;
             self.stats.packets += 1;
             return Ok(Some(raw));
@@ -533,7 +565,11 @@ impl<'a, S: PacketSource + ?Sized> Iterator for PacketIter<'a, S> {
 }
 
 /// Verify the MD5 of a packet located at `offset` (hashes bytes `32..length`, streaming).
-pub fn verify_packet_md5<S: PacketSource + ?Sized>(src: &S, offset: u64, header: &PacketHeader) -> io::Result<bool> {
+pub fn verify_packet_md5<S: PacketSource + ?Sized>(
+    src: &S,
+    offset: u64,
+    header: &PacketHeader,
+) -> io::Result<bool> {
     let mut ctx = Md5::new();
     let mut remaining = header.length - 32;
     let mut pos = offset + 32;
@@ -588,8 +624,12 @@ impl fmt::Display for PacketError {
             PacketError::BadRecoverableCount { count, total } => {
                 write!(f, "recoverable file count {count} exceeds {total} file ids")
             }
-            PacketError::BadFileName => f.write_str("file description has an empty or oversized name"),
-            PacketError::InconsistentHashes => f.write_str("16k hash differs from full hash for a file <= 16 KiB"),
+            PacketError::BadFileName => {
+                f.write_str("file description has an empty or oversized name")
+            }
+            PacketError::InconsistentHashes => {
+                f.write_str("16k hash differs from full hash for a file <= 16 KiB")
+            }
             PacketError::BadIfscLayout => f.write_str("IFSC body length is not 16 + 20n"),
             PacketError::EmptyRecoverySlice => f.write_str("recovery slice packet has no payload"),
         }
@@ -627,9 +667,17 @@ impl MainPacket {
             return Err(PacketError::BadSliceSize(slice_size));
         }
         let recoverable_count = u32::from_le_bytes(body[8..12].try_into().unwrap());
-        let ids: Vec<FileId> = body[12..].as_chunks::<16>().0.iter().map(|c| FileId(*c)).collect();
+        let ids: Vec<FileId> = body[12..]
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|c| FileId(*c))
+            .collect();
         if recoverable_count as usize > ids.len() {
-            return Err(PacketError::BadRecoverableCount { count: recoverable_count, total: ids.len() });
+            return Err(PacketError::BadRecoverableCount {
+                count: recoverable_count,
+                total: ids.len(),
+            });
         }
         let (rec, non) = ids.split_at(recoverable_count as usize);
         Ok(Self {
@@ -643,7 +691,9 @@ impl MainPacket {
 
     /// All file IDs, recoverable first.
     pub fn all_file_ids(&self) -> impl Iterator<Item = &FileId> {
-        self.recoverable_file_ids.iter().chain(self.non_recoverable_file_ids.iter())
+        self.recoverable_file_ids
+            .iter()
+            .chain(self.non_recoverable_file_ids.iter())
     }
 
     /// Total number of files.
@@ -658,7 +708,11 @@ impl MainPacket {
 
     /// Serialise the body (without header).
     pub fn encode_body(&self) -> Vec<u8> {
-        encode_main_body(self.slice_size, &self.recoverable_file_ids, &self.non_recoverable_file_ids)
+        encode_main_body(
+            self.slice_size,
+            &self.recoverable_file_ids,
+            &self.non_recoverable_file_ids,
+        )
     }
 }
 
@@ -687,7 +741,10 @@ impl FileDescPacket {
         if name_padded.len() > MAX_FILENAME_LEN {
             return Err(PacketError::BadFileName);
         }
-        let end = name_padded.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
+        let end = name_padded
+            .iter()
+            .rposition(|&b| b != 0)
+            .map_or(0, |p| p + 1);
         let name = name_padded[..end].to_vec();
         if name.is_empty() {
             return Err(PacketError::BadFileName);
@@ -698,7 +755,13 @@ impl FileDescPacket {
         if file_length <= crate::hasher::HASH_16K_LEN && hash_16k != hash_full {
             return Err(PacketError::InconsistentHashes);
         }
-        Ok(Self { file_id: FileId(body[0..16].try_into().unwrap()), hash_full, hash_16k, file_length, name })
+        Ok(Self {
+            file_id: FileId(body[0..16].try_into().unwrap()),
+            hash_full,
+            hash_16k,
+            file_length,
+            name,
+        })
     }
 
     /// File ID recomputed from the packet contents.
@@ -723,7 +786,13 @@ impl FileDescPacket {
 
     /// Serialise the body.
     pub fn encode_body(&self) -> Vec<u8> {
-        encode_file_desc_body(&self.file_id, &self.hash_full, &self.hash_16k, self.file_length, &self.name)
+        encode_file_desc_body(
+            &self.file_id,
+            &self.hash_full,
+            &self.hash_16k,
+            self.file_length,
+            &self.name,
+        )
     }
 }
 
@@ -763,7 +832,10 @@ impl IfscPacket {
                 crc32: u32::from_le_bytes(e[16..20].try_into().unwrap()),
             })
             .collect();
-        Ok(Self { file_id: FileId(body[0..16].try_into().unwrap()), slices })
+        Ok(Self {
+            file_id: FileId(body[0..16].try_into().unwrap()),
+            slices,
+        })
     }
 
     /// Number of slices.
@@ -788,7 +860,9 @@ impl CreatorPacket {
     /// Parse a body.
     pub fn parse(body: &[u8]) -> Self {
         let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
-        Self { raw: body[..end].to_vec() }
+        Self {
+            raw: body[..end].to_vec(),
+        }
     }
 
     /// Client string (lossy UTF-8).
@@ -818,7 +892,11 @@ pub struct RecoverySliceRef {
 
 impl RecoverySliceRef {
     /// Build from a framed recovery packet; reads only the 4-byte exponent.
-    pub fn from_raw<S: PacketSource + ?Sized>(src: &S, raw: &RawPacket, source_id: usize) -> io::Result<Result<Self, PacketError>> {
+    pub fn from_raw<S: PacketSource + ?Sized>(
+        src: &S,
+        raw: &RawPacket,
+        source_id: usize,
+    ) -> io::Result<Result<Self, PacketError>> {
         if raw.header.body_len() < 4 {
             return Ok(Err(PacketError::Truncated));
         }
@@ -858,9 +936,17 @@ impl RecoverySliceRef {
     }
 
     /// Read the payload (or a sub-range `[start, start + buf.len())` of it).
-    pub fn read_data<S: PacketSource + ?Sized>(&self, src: &S, start: u64, buf: &mut [u8]) -> io::Result<()> {
+    pub fn read_data<S: PacketSource + ?Sized>(
+        &self,
+        src: &S,
+        start: u64,
+        buf: &mut [u8],
+    ) -> io::Result<()> {
         if start + buf.len() as u64 > self.slice_size {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read beyond recovery slice"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read beyond recovery slice",
+            ));
         }
         src.read_at(self.data_offset + start, buf)
     }
@@ -894,13 +980,19 @@ impl Packet {
 }
 
 /// Parse a framed packet. Recovery slices read only their exponent.
-pub fn parse_packet<S: PacketSource + ?Sized>(src: &S, raw: &RawPacket, source_id: usize) -> io::Result<Result<Packet, PacketError>> {
+pub fn parse_packet<S: PacketSource + ?Sized>(
+    src: &S,
+    raw: &RawPacket,
+    source_id: usize,
+) -> io::Result<Result<Packet, PacketError>> {
     let kind = raw.header.kind();
     if kind == PacketType::RecoverySlice {
         return Ok(RecoverySliceRef::from_raw(src, raw, source_id)?.map(Packet::RecoverySlice));
     }
     if kind == PacketType::Unknown {
-        return Ok(Ok(Packet::Unknown { packet_type: raw.header.packet_type }));
+        return Ok(Ok(Packet::Unknown {
+            packet_type: raw.header.packet_type,
+        }));
     }
     let body_len = raw.header.body_len();
     if body_len > (64 << 20) {
@@ -1000,7 +1092,11 @@ fn pad4(v: &mut Vec<u8>) {
 }
 
 /// Serialise a Main packet body. File IDs are sorted as the specification requires.
-pub fn encode_main_body(slice_size: u64, recoverable: &[FileId], non_recoverable: &[FileId]) -> Vec<u8> {
+pub fn encode_main_body(
+    slice_size: u64,
+    recoverable: &[FileId],
+    non_recoverable: &[FileId],
+) -> Vec<u8> {
     let mut rec = recoverable.to_vec();
     rec.sort_unstable();
     let mut non = non_recoverable.to_vec();
@@ -1015,7 +1111,13 @@ pub fn encode_main_body(slice_size: u64, recoverable: &[FileId], non_recoverable
 }
 
 /// Serialise a FileDesc body.
-pub fn encode_file_desc_body(file_id: &FileId, hash_full: &[u8; 16], hash_16k: &[u8; 16], file_length: u64, name: &[u8]) -> Vec<u8> {
+pub fn encode_file_desc_body(
+    file_id: &FileId,
+    hash_full: &[u8; 16],
+    hash_16k: &[u8; 16],
+    file_length: u64,
+    name: &[u8],
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(56 + name.len() + 3);
     body.extend_from_slice(&file_id.0);
     body.extend_from_slice(hash_full);
@@ -1049,13 +1151,21 @@ pub fn encode_creator_body(client: &[u8]) -> Vec<u8> {
 
 /// Build a complete packet (header + body) with the correct MD5.
 pub fn encode_packet(set_id: &SetId, packet_type: &[u8; 16], body: &[u8]) -> Vec<u8> {
-    debug_assert!(body.len().is_multiple_of(4), "packet bodies must be 4-byte aligned");
+    debug_assert!(
+        body.len().is_multiple_of(4),
+        "packet bodies must be 4-byte aligned"
+    );
     let length = (HEADER_LEN + body.len()) as u64;
     let mut ctx = Md5::new();
     ctx.update(set_id.0);
     ctx.update(packet_type);
     ctx.update(body);
-    let header = PacketHeader { length, packet_md5: ctx.finalize().into(), set_id: *set_id, packet_type: *packet_type };
+    let header = PacketHeader {
+        length,
+        packet_md5: ctx.finalize().into(),
+        set_id: *set_id,
+        packet_type: *packet_type,
+    };
     let mut out = Vec::with_capacity(length as usize);
     out.extend_from_slice(&header.to_bytes());
     out.extend_from_slice(body);
@@ -1064,7 +1174,11 @@ pub fn encode_packet(set_id: &SetId, packet_type: &[u8; 16], body: &[u8]) -> Vec
 
 /// Build the 68-byte prefix (header + exponent) of a recovery slice packet whose payload is
 /// `data`. The MD5 covers set id, type, exponent and payload.
-pub fn encode_recovery_packet_prefix(set_id: &SetId, exponent: u32, data: &[u8]) -> [u8; HEADER_LEN + 4] {
+pub fn encode_recovery_packet_prefix(
+    set_id: &SetId,
+    exponent: u32,
+    data: &[u8],
+) -> [u8; HEADER_LEN + 4] {
     let mut ctx = Md5::new();
     ctx.update(set_id.0);
     ctx.update(TYPE_RECVSLIC);
@@ -1097,7 +1211,12 @@ impl RecoveryPacketHasher {
         ctx.update(set_id.0);
         ctx.update(TYPE_RECVSLIC);
         ctx.update(exponent.to_le_bytes());
-        Self { ctx, set_id, exponent, len: 0 }
+        Self {
+            ctx,
+            set_id,
+            exponent,
+            len: 0,
+        }
     }
 
     /// Feed payload bytes.
@@ -1201,7 +1320,10 @@ impl PacketSet {
 
     /// Empty set bound to `set_id`.
     pub fn for_set(set_id: SetId) -> Self {
-        Self { set_id: Some(set_id), ..Self::default() }
+        Self {
+            set_id: Some(set_id),
+            ..Self::default()
+        }
     }
 
     /// Slice size, if a Main packet is present.
@@ -1211,7 +1333,10 @@ impl PacketSet {
 
     /// Creator string, or `""`.
     pub fn creator_string(&self) -> String {
-        self.creator.as_ref().map(|c| c.client()).unwrap_or_default()
+        self.creator
+            .as_ref()
+            .map(|c| c.client())
+            .unwrap_or_default()
     }
 
     /// Add a parsed packet whose header carried `set_id`.
@@ -1269,10 +1394,11 @@ impl PacketSet {
             }
             Packet::RecoverySlice(r) => {
                 if let Some(ss) = self.slice_size()
-                    && r.slice_size != ss {
-                        self.stats.wrong_slice_size += 1;
-                        return AddOutcome::WrongSliceSize;
-                    }
+                    && r.slice_size != ss
+                {
+                    self.stats.wrong_slice_size += 1;
+                    return AddOutcome::WrongSliceSize;
+                }
                 match self.recovery.entry(r.exponent) {
                     std::collections::btree_map::Entry::Occupied(_) => AddOutcome::Duplicate,
                     std::collections::btree_map::Entry::Vacant(v) => {
@@ -1293,7 +1419,12 @@ impl PacketSet {
 
     /// Scan `src` and add every packet of this set. `source_id` is recorded in recovery
     /// slice references. Returns the statistics of this source only.
-    pub fn load_source<S: PacketSource + ?Sized>(&mut self, src: &S, source_id: usize, opts: ScanOptions) -> io::Result<LoadStats> {
+    pub fn load_source<S: PacketSource + ?Sized>(
+        &mut self,
+        src: &S,
+        source_id: usize,
+        opts: ScanOptions,
+    ) -> io::Result<LoadStats> {
         let mut local = LoadStats::default();
         let mut iter = PacketIter::new(src, opts);
         // When the set is not bound yet, a Main packet anywhere in the source should
@@ -1308,9 +1439,10 @@ impl PacketSet {
         }
         local.scan = iter.stats();
         if self.set_id.is_none()
-            && let Some((sid, _)) = pending.iter().find(|(_, p)| matches!(p, Packet::Main(_))) {
-                self.set_id = Some(*sid);
-            }
+            && let Some((sid, _)) = pending.iter().find(|(_, p)| matches!(p, Packet::Main(_)))
+        {
+            self.set_id = Some(*sid);
+        }
         for (sid, p) in pending {
             match self.add(sid, p) {
                 AddOutcome::Added => local.added += 1,
@@ -1330,7 +1462,12 @@ impl PacketSet {
     }
 
     /// Load a `.par2` file from disk.
-    pub fn load_file(&mut self, path: &Path, source_id: usize, opts: ScanOptions) -> io::Result<LoadStats> {
+    pub fn load_file(
+        &mut self,
+        path: &Path,
+        source_id: usize,
+        opts: ScanOptions,
+    ) -> io::Result<LoadStats> {
         let src = FileSource::open(path)?;
         self.load_source(&src, source_id, opts)
     }
@@ -1340,19 +1477,32 @@ impl PacketSet {
     /// order (ascending 128-bit file id).
     pub fn file_id_by_name(&self, name: &[u8]) -> Option<FileId> {
         let local = |fd: &FileDescPacket| fd.local_name();
-        if let Some((id, _)) = self.file_descs.iter().find(|(_, fd)| fd.name.as_slice() == name || local(fd).as_bytes() == name) {
+        if let Some((id, _)) = self
+            .file_descs
+            .iter()
+            .find(|(_, fd)| fd.name.as_slice() == name || local(fd).as_bytes() == name)
+        {
             return Some(*id);
         }
         let lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
         self.file_descs
             .iter()
-            .find(|(_, fd)| fd.name.iter().map(|b| b.to_ascii_lowercase()).eq(lower.iter().copied()) || local(fd).to_ascii_lowercase().as_bytes() == lower.as_slice())
+            .find(|(_, fd)| {
+                fd.name
+                    .iter()
+                    .map(|b| b.to_ascii_lowercase())
+                    .eq(lower.iter().copied())
+                    || local(fd).to_ascii_lowercase().as_bytes() == lower.as_slice()
+            })
             .map(|(id, _)| *id)
     }
 
     /// File id of the first description (in `libpar2` order) with this 16k hash.
     pub fn file_id_by_hash16k(&self, hash_16k: &[u8; 16]) -> Option<FileId> {
-        self.file_descs.iter().find(|(_, fd)| fd.hash_16k == *hash_16k).map(|(id, _)| *id)
+        self.file_descs
+            .iter()
+            .find(|(_, fd)| fd.hash_16k == *hash_16k)
+            .map(|(id, _)| *id)
     }
 
     /// File IDs in Main-packet order (recoverable first), or in `libpar2` map order when no
@@ -1368,7 +1518,10 @@ impl PacketSet {
     /// FileDesc for every recoverable file.
     pub fn is_complete(&self) -> bool {
         match &self.main {
-            Some(m) => m.recoverable_file_ids.iter().all(|id| self.file_descs.contains_key(id)),
+            Some(m) => m
+                .recoverable_file_ids
+                .iter()
+                .all(|id| self.file_descs.contains_key(id)),
             None => false,
         }
     }
@@ -1392,10 +1545,11 @@ impl PacketSet {
     /// Merge another set of the same id (used when loading volumes incrementally).
     pub fn merge(&mut self, other: PacketSet) {
         if let (Some(a), Some(b)) = (self.set_id, other.set_id)
-            && a != b {
-                self.stats.foreign += other.stats.added;
-                return;
-            }
+            && a != b
+        {
+            self.stats.foreign += other.stats.added;
+            return;
+        }
         if self.set_id.is_none() {
             self.set_id = other.set_id;
         }
@@ -1440,7 +1594,12 @@ impl Par2Collection {
     }
 
     /// Scan `src` and distribute packets into their sets.
-    pub fn load_source<S: PacketSource + ?Sized>(&mut self, src: &S, source_id: usize, opts: ScanOptions) -> io::Result<LoadStats> {
+    pub fn load_source<S: PacketSource + ?Sized>(
+        &mut self,
+        src: &S,
+        source_id: usize,
+        opts: ScanOptions,
+    ) -> io::Result<LoadStats> {
         let mut local = LoadStats::default();
         let mut iter = PacketIter::new(src, opts);
         for raw in iter.by_ref() {
@@ -1449,7 +1608,10 @@ impl Par2Collection {
                 Ok(Packet::Unknown { .. }) => local.unknown += 1,
                 Ok(p) => {
                     let sid = raw.header.set_id;
-                    let set = self.sets.entry(sid).or_insert_with(|| PacketSet::for_set(sid));
+                    let set = self
+                        .sets
+                        .entry(sid)
+                        .or_insert_with(|| PacketSet::for_set(sid));
                     match set.add(sid, p) {
                         AddOutcome::Added => local.added += 1,
                         AddOutcome::Duplicate => local.duplicates += 1,
@@ -1466,7 +1628,12 @@ impl Par2Collection {
     }
 
     /// Load a file from disk.
-    pub fn load_file(&mut self, path: &Path, source_id: usize, opts: ScanOptions) -> io::Result<LoadStats> {
+    pub fn load_file(
+        &mut self,
+        path: &Path,
+        source_id: usize,
+        opts: ScanOptions,
+    ) -> io::Result<LoadStats> {
         let src = FileSource::open(path)?;
         self.load_source(&src, source_id, opts)
     }
@@ -1474,7 +1641,10 @@ impl Par2Collection {
     /// The set with a Main packet and the most packets, if any (useful when a directory
     /// contains stray packets of another set).
     pub fn primary_set(&self) -> Option<&PacketSet> {
-        self.sets.values().filter(|s| s.main.is_some()).max_by_key(|s| s.stats.added)
+        self.sets
+            .values()
+            .filter(|s| s.main.is_some())
+            .max_by_key(|s| s.stats.added)
     }
 }
 
@@ -1497,16 +1667,31 @@ pub fn load_par2_bytes(data: &[u8], opts: ScanOptions) -> io::Result<PacketSet> 
 /// Files of another set are skipped. Returns the set and the files that contributed packets,
 /// `main_path` first; the recovery slice references carry each file's index in that list as
 /// their `source_id`.
-pub fn load_par2_collection(main_path: &Path, opts: ScanOptions) -> io::Result<(PacketSet, Vec<std::path::PathBuf>)> {
+pub fn load_par2_collection(
+    main_path: &Path,
+    opts: ScanOptions,
+) -> io::Result<(PacketSet, Vec<std::path::PathBuf>)> {
     let mut set = PacketSet::new();
     set.load_file(main_path, 0, opts)?;
     let mut loaded = vec![main_path.to_path_buf()];
-    let dir = main_path.parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
-    let main_name = main_path.file_name().map(crate::filenames::os_str_bytes).unwrap_or_default();
-    let mut siblings: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.file_name() != main_path.file_name() && !p.is_dir()).collect();
+    let dir = main_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    let main_name = main_path
+        .file_name()
+        .map(crate::filenames::os_str_bytes)
+        .unwrap_or_default();
+    let mut siblings: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name() != main_path.file_name() && !p.is_dir())
+        .collect();
     siblings.sort();
     for p in siblings {
-        let name = p.file_name().map(crate::filenames::os_str_bytes).unwrap_or_default();
+        let name = p
+            .file_name()
+            .map(crate::filenames::os_str_bytes)
+            .unwrap_or_default();
         if !crate::filenames::same_par_collection(&name, &main_name, true) {
             continue;
         }
@@ -1527,14 +1712,21 @@ pub(crate) mod tests {
     use super::*;
 
     /// Build a small but complete in-memory PAR2 set: returns (bytes, set id, slice size).
-    pub(crate) fn build_test_set(files: &[(&[u8], &[u8])], slice_size: u64, recovery_exponents: &[u32]) -> (Vec<u8>, SetId) {
+    pub(crate) fn build_test_set(
+        files: &[(&[u8], &[u8])],
+        slice_size: u64,
+        recovery_exponents: &[u32],
+    ) -> (Vec<u8>, SetId) {
         let mut descs = Vec::new();
         let mut ifscs = Vec::new();
         for (name, data) in files {
             let h = crate::hasher::md5(data);
             let h16 = crate::hasher::md5_16k(data);
             let id = compute_file_id(&h16, data.len() as u64, name);
-            descs.push((id, encode_file_desc_body(&id, &h, &h16, data.len() as u64, name)));
+            descs.push((
+                id,
+                encode_file_desc_body(&id, &h, &h16, data.len() as u64, name),
+            ));
             let mut slices = Vec::new();
             for chunk in data.chunks(slice_size as usize) {
                 let mut padded = chunk.to_vec();
@@ -1555,9 +1747,15 @@ pub(crate) mod tests {
         for b in &ifscs {
             out.extend(encode_packet(&set_id, &TYPE_IFSC, b));
         }
-        out.extend(encode_packet(&set_id, &TYPE_CREATOR, &encode_creator_body(b"par-rs test")));
+        out.extend(encode_packet(
+            &set_id,
+            &TYPE_CREATOR,
+            &encode_creator_body(b"par-rs test"),
+        ));
         for &e in recovery_exponents {
-            let data: Vec<u8> = (0..slice_size as usize).map(|i| (i as u32 * (e + 1)) as u8).collect();
+            let data: Vec<u8> = (0..slice_size as usize)
+                .map(|i| (i as u32 * (e + 1)) as u8)
+                .collect();
             out.extend_from_slice(&encode_recovery_packet_prefix(&set_id, e, &data));
             out.extend_from_slice(&data);
         }
@@ -1566,14 +1764,25 @@ pub(crate) mod tests {
 
     fn files() -> Vec<(Vec<u8>, Vec<u8>)> {
         vec![
-            (b"alpha.bin".to_vec(), (0..5000u32).map(|i| (i * 7) as u8).collect()),
-            (b"beta.bin".to_vec(), (0..1000u32).map(|i| (i * 13) as u8).collect()),
-            (b"sub/g\xE4mma.bin".to_vec(), (0..20_000u32).map(|i| (i ^ 0x55) as u8).collect()),
+            (
+                b"alpha.bin".to_vec(),
+                (0..5000u32).map(|i| (i * 7) as u8).collect(),
+            ),
+            (
+                b"beta.bin".to_vec(),
+                (0..1000u32).map(|i| (i * 13) as u8).collect(),
+            ),
+            (
+                b"sub/g\xE4mma.bin".to_vec(),
+                (0..20_000u32).map(|i| (i ^ 0x55) as u8).collect(),
+            ),
         ]
     }
 
     fn file_refs(f: &[(Vec<u8>, Vec<u8>)]) -> Vec<(&[u8], &[u8])> {
-        f.iter().map(|(n, d)| (n.as_slice(), d.as_slice())).collect()
+        f.iter()
+            .map(|(n, d)| (n.as_slice(), d.as_slice()))
+            .collect()
     }
 
     #[test]
@@ -1587,15 +1796,26 @@ pub(crate) mod tests {
         a[15] = 0x01;
         assert!(FileId(a) > FileId(b));
         assert_eq!(FileId(a).cmp(&FileId(a)), std::cmp::Ordering::Equal);
-        assert_eq!(FileId(a).partial_cmp(&FileId(b)), Some(std::cmp::Ordering::Greater));
+        assert_eq!(
+            FileId(a).partial_cmp(&FileId(b)),
+            Some(std::cmp::Ordering::Greater)
+        );
         assert_eq!(format!("{}", FileId([0xAB; 16])), "ab".repeat(16));
-        assert_eq!(format!("{:?}", SetId([1; 16])), format!("SetId({})", "01".repeat(16)));
+        assert_eq!(
+            format!("{:?}", SetId([1; 16])),
+            format!("SetId({})", "01".repeat(16))
+        );
         assert_eq!(format!("{}", SetId([0x0F; 16])), "0f".repeat(16));
     }
 
     #[test]
     fn header_roundtrip_and_validation() {
-        let h = PacketHeader { length: 128, packet_md5: [1; 16], set_id: SetId([2; 16]), packet_type: TYPE_MAIN };
+        let h = PacketHeader {
+            length: 128,
+            packet_md5: [1; 16],
+            set_id: SetId([2; 16]),
+            packet_type: TYPE_MAIN,
+        };
         let bytes = h.to_bytes();
         assert_eq!(PacketHeader::parse(&bytes), Some(h));
         assert_eq!(h.kind(), PacketType::Main);
@@ -1612,8 +1832,14 @@ pub(crate) mod tests {
         bad[8..16].copy_from_slice(&66u64.to_le_bytes());
         assert!(PacketHeader::parse(&bad).is_none());
         assert!(PacketHeader::parse(&bytes[..63]).is_none());
-        assert_eq!(PacketType::from_bytes(b"NewsPostUsenet\0\0"), PacketType::Unknown);
-        assert_eq!(PacketType::from_bytes(&TYPE_RECVSLIC), PacketType::RecoverySlice);
+        assert_eq!(
+            PacketType::from_bytes(b"NewsPostUsenet\0\0"),
+            PacketType::Unknown
+        );
+        assert_eq!(
+            PacketType::from_bytes(&TYPE_RECVSLIC),
+            PacketType::RecoverySlice
+        );
     }
 
     #[test]
@@ -1640,9 +1866,16 @@ pub(crate) mod tests {
         assert_eq!(ids, keys);
         for fd in set.file_descs.values() {
             assert!(fd.id_consistent());
-            assert_eq!(set.ifscs[&fd.file_id].slice_count() as u64, main.slice_count_for(fd.file_length));
+            assert_eq!(
+                set.ifscs[&fd.file_id].slice_count() as u64,
+                main.slice_count_for(fd.file_length)
+            );
         }
-        let gamma = set.file_descs.values().find(|d| d.name.starts_with(b"sub/")).unwrap();
+        let gamma = set
+            .file_descs
+            .values()
+            .find(|d| d.name.starts_with(b"sub/"))
+            .unwrap();
         assert_eq!(gamma.local_name(), "sub/gämma.bin");
         assert_eq!(gamma.name_lossy(), "sub/gämma.bin");
         for r in set.recovery.values() {
@@ -1651,7 +1884,15 @@ pub(crate) mod tests {
             assert!(r.verify(&bytes).unwrap());
             let mut buf = [0u8; 4];
             r.read_data(&bytes, 0, &mut buf).unwrap();
-            assert_eq!(buf, [0, (r.exponent + 1) as u8, (2 * (r.exponent + 1)) as u8, (3 * (r.exponent + 1)) as u8]);
+            assert_eq!(
+                buf,
+                [
+                    0,
+                    (r.exponent + 1) as u8,
+                    (2 * (r.exponent + 1)) as u8,
+                    (3 * (r.exponent + 1)) as u8
+                ]
+            );
             assert!(r.read_data(&bytes, 1021, &mut buf).is_err());
             assert_eq!(r.header_length(), 1024 + 68);
         }
@@ -1686,7 +1927,9 @@ pub(crate) mod tests {
         let f = files();
         let (bytes, _) = build_test_set(&file_refs(&f), 512, &[3]);
         // Collect packet offsets to corrupt a middle packet.
-        let raws: Vec<RawPacket> = PacketIter::new(&bytes[..], ScanOptions::UNVERIFIED).map(|r| r.unwrap()).collect();
+        let raws: Vec<RawPacket> = PacketIter::new(&bytes[..], ScanOptions::UNVERIFIED)
+            .map(|r| r.unwrap())
+            .collect();
         assert_eq!(raws.len(), 1 + 3 + 3 + 1 + 1);
         let mut data = vec![0u8; 4]; // stray 4-byte prefix (misaligned start)
         data.extend_from_slice(&bytes);
@@ -1709,7 +1952,14 @@ pub(crate) mod tests {
         assert!(!set.is_complete());
 
         // Without resync the scan stops at the first problem (the prefix).
-        let set = load_par2_bytes(&data, ScanOptions { resync: false, ..ScanOptions::FULL }).unwrap();
+        let set = load_par2_bytes(
+            &data,
+            ScanOptions {
+                resync: false,
+                ..ScanOptions::FULL
+            },
+        )
+        .unwrap();
         assert!(set.main.is_none());
 
         // Truncated trailing packet is ignored, earlier packets survive.
@@ -1783,17 +2033,35 @@ pub(crate) mod tests {
     #[test]
     fn payload_validation_errors() {
         let sid = SetId([0; 16]);
-        assert_eq!(MainPacket::parse(sid, &[0; 11]), Err(PacketError::Truncated));
-        assert_eq!(MainPacket::parse(sid, &[0; 13]), Err(PacketError::BadMainLayout));
+        assert_eq!(
+            MainPacket::parse(sid, &[0; 11]),
+            Err(PacketError::Truncated)
+        );
+        assert_eq!(
+            MainPacket::parse(sid, &[0; 13]),
+            Err(PacketError::BadMainLayout)
+        );
         let mut body = encode_main_body(1002, &[], &[]);
-        assert_eq!(MainPacket::parse(sid, &body), Err(PacketError::BadSliceSize(1002)));
+        assert_eq!(
+            MainPacket::parse(sid, &body),
+            Err(PacketError::BadSliceSize(1002))
+        );
         body[0..8].copy_from_slice(&(MAX_SLICE_SIZE + 4).to_le_bytes());
-        assert_eq!(MainPacket::parse(sid, &body), Err(PacketError::BadSliceSize(MAX_SLICE_SIZE + 4)));
+        assert_eq!(
+            MainPacket::parse(sid, &body),
+            Err(PacketError::BadSliceSize(MAX_SLICE_SIZE + 4))
+        );
         body[0..8].copy_from_slice(&0u64.to_le_bytes());
-        assert_eq!(MainPacket::parse(sid, &body), Err(PacketError::BadSliceSize(0)));
+        assert_eq!(
+            MainPacket::parse(sid, &body),
+            Err(PacketError::BadSliceSize(0))
+        );
         body[0..8].copy_from_slice(&1024u64.to_le_bytes());
         body[8..12].copy_from_slice(&1u32.to_le_bytes());
-        assert_eq!(MainPacket::parse(sid, &body), Err(PacketError::BadRecoverableCount { count: 1, total: 0 }));
+        assert_eq!(
+            MainPacket::parse(sid, &body),
+            Err(PacketError::BadRecoverableCount { count: 1, total: 0 })
+        );
         body[8..12].copy_from_slice(&0u32.to_le_bytes());
         let m = MainPacket::parse(sid, &body).unwrap();
         assert_eq!(m.encode_body(), body);
@@ -1808,7 +2076,10 @@ pub(crate) mod tests {
         let body = encode_file_desc_body(&id, &h, &h, 10, b"");
         assert_eq!(FileDescPacket::parse(&body), Err(PacketError::BadFileName));
         let body = encode_file_desc_body(&id, &h, &[8u8; 16], 10, b"x");
-        assert_eq!(FileDescPacket::parse(&body), Err(PacketError::InconsistentHashes));
+        assert_eq!(
+            FileDescPacket::parse(&body),
+            Err(PacketError::InconsistentHashes)
+        );
         let body = encode_file_desc_body(&id, &h, &[8u8; 16], 16385, b"x");
         assert!(FileDescPacket::parse(&body).is_ok());
         let body = encode_file_desc_body(&id, &h, &h, 10, &vec![b'a'; MAX_FILENAME_LEN + 4]);
@@ -1822,7 +2093,10 @@ pub(crate) mod tests {
         assert!(!other.id_consistent());
 
         assert_eq!(IfscPacket::parse(&[0; 15]), Err(PacketError::Truncated));
-        assert_eq!(IfscPacket::parse(&[0; 36 + 4]), Err(PacketError::BadIfscLayout));
+        assert_eq!(
+            IfscPacket::parse(&[0; 36 + 4]),
+            Err(PacketError::BadIfscLayout)
+        );
         let p = IfscPacket::parse(&[0; 16]).unwrap();
         assert_eq!(p.slice_count(), 0);
         assert_eq!(p.encode_body(), vec![0; 16]);
@@ -1855,7 +2129,11 @@ pub(crate) mod tests {
         data.extend(encode_packet(&sid, &TYPE_IFSC, &[0; 12])); // truncated
         data.extend(encode_packet(&sid, &TYPE_RECVSLIC, &0u32.to_le_bytes())); // empty payload
         data.extend(encode_packet(&sid, b"NewsPostUsenet\0\0", &[1, 2, 3, 4]));
-        data.extend(encode_packet(&sid, &TYPE_CREATOR, &encode_creator_body(b"c")));
+        data.extend(encode_packet(
+            &sid,
+            &TYPE_CREATOR,
+            &encode_creator_body(b"c"),
+        ));
         let set = load_par2_bytes(&data, ScanOptions::FULL).unwrap();
         assert_eq!(set.stats.invalid, 3);
         assert_eq!(set.stats.unknown, 1);
@@ -1865,11 +2143,19 @@ pub(crate) mod tests {
         assert_eq!(set.total_input_slices(), None);
         assert!(set.file_ids_in_main_order().is_empty());
         // Recovery ref errors.
-        let raws: Vec<RawPacket> = PacketIter::new(&data[..], ScanOptions::FULL).map(|r| r.unwrap()).collect();
-        assert_eq!(RecoverySliceRef::from_raw(&data[..], &raws[2], 0).unwrap(), Err(PacketError::EmptyRecoverySlice));
+        let raws: Vec<RawPacket> = PacketIter::new(&data[..], ScanOptions::FULL)
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            RecoverySliceRef::from_raw(&data[..], &raws[2], 0).unwrap(),
+            Err(PacketError::EmptyRecoverySlice)
+        );
         let mut short = raws[2];
         short.header.length = 64;
-        assert_eq!(RecoverySliceRef::from_raw(&data[..], &short, 0).unwrap(), Err(PacketError::Truncated));
+        assert_eq!(
+            RecoverySliceRef::from_raw(&data[..], &short, 0).unwrap(),
+            Err(PacketError::Truncated)
+        );
         let p = parse_packet(&data[..], &raws[3], 0).unwrap().unwrap();
         assert!(matches!(p, Packet::Unknown { .. }));
         assert_eq!(p.set_id(&raws[3]), sid);
@@ -1892,16 +2178,43 @@ pub(crate) mod tests {
 
     #[test]
     fn filename_translation() {
-        assert_eq!(translate_filename_from_par2_to_local(b"plain.bin"), "plain.bin");
-        assert_eq!(translate_filename_from_par2_to_local(b"dir\\sub\\f.bin"), "dir/sub/f.bin");
-        assert_eq!(translate_filename_from_par2_to_local(b"/etc/passwd"), "%2Fetc/passwd");
-        assert_eq!(translate_filename_from_par2_to_local(b"../../x"), "%2E%2E/%2E%2E/x");
-        assert_eq!(translate_filename_from_par2_to_local(b"a/../b"), "a/%2E%2E/b");
+        assert_eq!(
+            translate_filename_from_par2_to_local(b"plain.bin"),
+            "plain.bin"
+        );
+        assert_eq!(
+            translate_filename_from_par2_to_local(b"dir\\sub\\f.bin"),
+            "dir/sub/f.bin"
+        );
+        assert_eq!(
+            translate_filename_from_par2_to_local(b"/etc/passwd"),
+            "%2Fetc/passwd"
+        );
+        assert_eq!(
+            translate_filename_from_par2_to_local(b"../../x"),
+            "%2E%2E/%2E%2E/x"
+        );
+        assert_eq!(
+            translate_filename_from_par2_to_local(b"a/../b"),
+            "a/%2E%2E/b"
+        );
         assert_eq!(translate_filename_from_par2_to_local(b"..\\x"), "%2E%2E/x");
-        assert_eq!(translate_filename_from_par2_to_local(b"a..b/..c"), "a..b/..c");
-        assert_eq!(translate_filename_from_par2_to_local(b"tab\there\x01"), "tab%09here%01");
-        assert_eq!(translate_filename_from_par2_to_local(b"caf\xE9.txt"), "café.txt");
-        assert_eq!(translate_filename_from_par2_to_local("café.txt".as_bytes()), "café.txt");
+        assert_eq!(
+            translate_filename_from_par2_to_local(b"a..b/..c"),
+            "a..b/..c"
+        );
+        assert_eq!(
+            translate_filename_from_par2_to_local(b"tab\there\x01"),
+            "tab%09here%01"
+        );
+        assert_eq!(
+            translate_filename_from_par2_to_local(b"caf\xE9.txt"),
+            "café.txt"
+        );
+        assert_eq!(
+            translate_filename_from_par2_to_local("café.txt".as_bytes()),
+            "café.txt"
+        );
         assert_eq!(translate_filename_from_par2_to_local(b""), "");
         assert_eq!(translate_filename_from_par2_to_local(b"\\"), "%2F");
         assert_eq!(bytes_to_string_latin1_fallback(b"\xFF\xFE"), "ÿþ");

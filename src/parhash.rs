@@ -7,14 +7,14 @@
 //! chains (file description digests) cannot be split, so they run one file per thread.
 
 use crate::crc::crc32;
-use crate::hasher::{FileHashes, FileHasher, READ_CHUNK};
-use crate::md5simd::{md5_many_into, LANES};
+use crate::hasher::{FileHasher, FileHashes, READ_CHUNK};
+use crate::md5simd::{LANES, md5_many_into};
 use crate::packet::read_exact_at;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// One message to hash: `len` bytes of file `file` at `offset`, zero padded to `pad_to` bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +35,9 @@ const JOB_BYTES: u64 = 32 << 20;
 /// Resolve the worker count.
 pub(crate) fn thread_count(requested: usize) -> usize {
     if requested == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     } else {
         requested
     }
@@ -50,7 +52,8 @@ fn plan_jobs(ranges: &[HashRange]) -> Vec<std::ops::Range<usize>> {
     for (i, r) in ranges.iter().enumerate() {
         bytes += r.pad_to.max(1);
         let count = i + 1 - start;
-        let full = bytes >= JOB_BYTES && (count.is_multiple_of(LANES) || r.pad_to.max(1) * LANES as u64 > JOB_BYTES);
+        let full = bytes >= JOB_BYTES
+            && (count.is_multiple_of(LANES) || r.pad_to.max(1) * LANES as u64 > JOB_BYTES);
         if full {
             jobs.push(start..i + 1);
             start = i + 1;
@@ -202,13 +205,22 @@ pub fn slice_ranges(file: usize, file_len: u64, slice_size: u64, slices: u64) ->
         .map(|b| {
             let offset = b * slice_size;
             let len = file_len.saturating_sub(offset).min(slice_size);
-            HashRange { file, offset, len, pad_to: slice_size }
+            HashRange {
+                file,
+                offset,
+                len,
+                pad_to: slice_size,
+            }
         })
         .collect()
 }
 
 /// Whole-file digests (CRC-32, MD5, 16k MD5) of several files, one file per thread.
-pub fn file_hashes_parallel(paths: &[&Path], threads: usize, cancel: Option<&AtomicBool>) -> io::Result<Vec<FileHashes>> {
+pub fn file_hashes_parallel(
+    paths: &[&Path],
+    threads: usize,
+    cancel: Option<&AtomicBool>,
+) -> io::Result<Vec<FileHashes>> {
     if paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -267,7 +279,9 @@ pub fn file_hashes_parallel(paths: &[&Path], threads: usize, cancel: Option<&Ato
         return Err(e);
     }
     let out = out.into_inner().unwrap_or_else(|p| p.into_inner());
-    out.into_iter().map(|h| h.ok_or_else(|| io::Error::new(io::ErrorKind::Interrupted, "cancelled"))).collect()
+    out.into_iter()
+        .map(|h| h.ok_or_else(|| io::Error::new(io::ErrorKind::Interrupted, "cancelled")))
+        .collect()
 }
 
 #[cfg(test)]
@@ -285,7 +299,9 @@ mod tests {
     fn slice_hashes_match_sequential_for_short_last_slice_and_missing_tail() {
         let dir = tmpdir("slices");
         let ss = 1000u64;
-        let data: Vec<u8> = (0..12_345u32).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
+        let data: Vec<u8> = (0..12_345u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
         let p = dir.join("a.bin");
         std::fs::write(&p, &data).unwrap();
         let q = dir.join("b.bin");
@@ -295,11 +311,13 @@ mod tests {
         let paths = [p.as_path(), q.as_path()];
         for threads in [1, 3] {
             let mut last = 0;
-            let got = hash_ranges_parallel(&paths, &ranges, threads, None, &mut |b| last = b).unwrap();
+            let got =
+                hash_ranges_parallel(&paths, &ranges, threads, None, &mut |b| last = b).unwrap();
             assert_eq!(got.len(), 26);
             assert_eq!(last, data.len() as u64 + 5000);
             for b in 0..13usize {
-                let mut s = data[(b * 1000).min(data.len())..((b + 1) * 1000).min(data.len())].to_vec();
+                let mut s =
+                    data[(b * 1000).min(data.len())..((b + 1) * 1000).min(data.len())].to_vec();
                 s.resize(1000, 0);
                 assert_eq!(got[b], slice_checksums(&s), "file a slice {b}");
                 let mut s = data[(b * 1000).min(5000)..((b + 1) * 1000).min(5000)].to_vec();
@@ -308,22 +326,45 @@ mod tests {
             }
         }
         // Many small ranges exercise multi-job planning.
-        let many: Vec<HashRange> = (0..3000).map(|i| HashRange { file: 0, offset: (i % 12_000) as u64, len: 300, pad_to: 300 }).collect();
+        let many: Vec<HashRange> = (0..3000)
+            .map(|i| HashRange {
+                file: 0,
+                offset: (i % 12_000) as u64,
+                len: 300,
+                pad_to: 300,
+            })
+            .collect();
         let got = hash_ranges_parallel(&paths, &many, 4, None, &mut |_| {}).unwrap();
         for (i, r) in many.iter().enumerate() {
-            assert_eq!(got[i], slice_checksums(&data[r.offset as usize..r.offset as usize + 300]));
+            assert_eq!(
+                got[i],
+                slice_checksums(&data[r.offset as usize..r.offset as usize + 300])
+            );
         }
         assert!(plan_jobs(&many).len() == 1);
-        let big: Vec<HashRange> = (0..100).map(|i| HashRange { file: 0, offset: 0, len: 0, pad_to: (JOB_BYTES / 10) * (1 + i % 2) }).collect();
+        let big: Vec<HashRange> = (0..100)
+            .map(|i| HashRange {
+                file: 0,
+                offset: 0,
+                len: 0,
+                pad_to: (JOB_BYTES / 10) * (1 + i % 2),
+            })
+            .collect();
         assert!(plan_jobs(&big).len() > 1);
 
         // Errors and cancellation surface.
         let missing = [dir.join("nope.bin")];
         let mp = [missing[0].as_path()];
-        assert!(hash_ranges_parallel(&mp, &slice_ranges(0, 10, 5, 2), 2, None, &mut |_| {}).is_err());
+        assert!(
+            hash_ranges_parallel(&mp, &slice_ranges(0, 10, 5, 2), 2, None, &mut |_| {}).is_err()
+        );
         let c = AtomicBool::new(true);
         assert!(hash_ranges_parallel(&paths, &ranges, 2, Some(&c), &mut |_| {}).is_err());
-        assert!(hash_ranges_parallel(&paths, &[], 2, None, &mut |_| {}).unwrap().is_empty());
+        assert!(
+            hash_ranges_parallel(&paths, &[], 2, None, &mut |_| {})
+                .unwrap()
+                .is_empty()
+        );
 
         let fh = file_hashes_parallel(&paths, 2, None).unwrap();
         assert_eq!(fh[0], hash_file(&p).unwrap());

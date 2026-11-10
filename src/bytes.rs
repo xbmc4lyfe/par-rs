@@ -24,7 +24,10 @@ pub(crate) fn take(data: &[u8], off: usize, len: usize) -> Option<&[u8]> {
 
 /// Strip trailing NUL padding.
 pub(crate) fn trim_nul(data: &[u8]) -> &[u8] {
-    let end = data.iter().rposition(|&b| b != 0).map_or(0, |p| p.saturating_add(1));
+    let end = data
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |p| p.saturating_add(1));
     data.get(..end).unwrap_or(data)
 }
 

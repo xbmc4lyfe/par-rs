@@ -25,12 +25,12 @@
 //! disjoint range of words of every output and iterating in L2-sized tiles so that an input
 //! tile is read once per group of up to eight outputs.
 
-use crate::gf16::{self, rs_coefficient, MulTables};
-use crate::gf16::simd::{Kernel, Plane, PlaneMut, MAX_MULTI};
+use crate::gf16::simd::{Kernel, MAX_MULTI, Plane, PlaneMut};
+use crate::gf16::{self, MulTables, rs_coefficient};
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 /// Errors of the Reed-Solomon layer.
 #[derive(Debug)]
@@ -58,7 +58,10 @@ impl fmt::Display for RsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RsError::NotEnoughRecovery { needed, available } => {
-                write!(f, "not enough recovery blocks: {needed} needed, {available} available")
+                write!(
+                    f,
+                    "not enough recovery blocks: {needed} needed, {available} available"
+                )
             }
             RsError::Singular => f.write_str("recovery matrix is singular"),
             RsError::TooManyInputs => f.write_str("too many input slices (maximum 32768)"),
@@ -103,7 +106,12 @@ impl fmt::Debug for Matrix {
         for r in 0..self.rows {
             write!(f, "[")?;
             for c in 0..self.cols {
-                write!(f, "{:#06x}{}", self.get(r, c), if c + 1 < self.cols { ", " } else { "" })?;
+                write!(
+                    f,
+                    "{:#06x}{}",
+                    self.get(r, c),
+                    if c + 1 < self.cols { ", " } else { "" }
+                )?;
             }
             write!(f, "]{}", if r + 1 < self.rows { ", " } else { "" })?;
         }
@@ -114,7 +122,11 @@ impl fmt::Debug for Matrix {
 impl Matrix {
     /// Zero matrix.
     pub fn zeros(rows: usize, cols: usize) -> Self {
-        Self { rows, cols, data: vec![0u8; rows * cols * 2] }
+        Self {
+            rows,
+            cols,
+            data: vec![0u8; rows * cols * 2],
+        }
     }
 
     /// Identity matrix.
@@ -277,21 +289,42 @@ pub struct RecoveryPlan {
 ///   [`crate::gf16::input_constant_logs`]).
 /// * `present[i]` tells whether input slice `i` is available.
 /// * `available_exponents` lists the recovery slices on hand (any order).
-pub fn plan_recovery(input_logbases: &[u16], present: &[bool], available_exponents: &[u32], kernel: &Kernel) -> Result<RecoveryPlan, RsError> {
-    assert_eq!(input_logbases.len(), present.len(), "one presence flag per input");
+pub fn plan_recovery(
+    input_logbases: &[u16],
+    present: &[bool],
+    available_exponents: &[u32],
+    kernel: &Kernel,
+) -> Result<RecoveryPlan, RsError> {
+    assert_eq!(
+        input_logbases.len(),
+        present.len(),
+        "one presence flag per input"
+    );
     if input_logbases.len() > 32768 {
         return Err(RsError::TooManyInputs);
     }
-    let missing: Vec<usize> = present.iter().enumerate().filter(|&(_, &p)| !p).map(|(i, _)| i).collect();
+    let missing: Vec<usize> = present
+        .iter()
+        .enumerate()
+        .filter(|&(_, &p)| !p)
+        .map(|(i, _)| i)
+        .collect();
     let k = missing.len();
     let mut exps: Vec<u32> = available_exponents.to_vec();
     exps.sort_unstable();
     exps.dedup();
     if exps.len() < k {
-        return Err(RsError::NotEnoughRecovery { needed: k, available: exps.len() });
+        return Err(RsError::NotEnoughRecovery {
+            needed: k,
+            available: exps.len(),
+        });
     }
     if k == 0 {
-        return Ok(RecoveryPlan { missing, used_exponents: Vec::new(), inverse: Matrix::zeros(0, 0) });
+        return Ok(RecoveryPlan {
+            missing,
+            used_exponents: Vec::new(),
+            inverse: Matrix::zeros(0, 0),
+        });
     }
     let mut used: Vec<u32> = exps[..k].to_vec();
     let mut next_unused = k;
@@ -303,7 +336,11 @@ pub fn plan_recovery(input_logbases: &[u16], present: &[bool], available_exponen
             }
         }
         if let Some(inverse) = a.inverse(kernel) {
-            return Ok(RecoveryPlan { missing, used_exponents: used, inverse });
+            return Ok(RecoveryPlan {
+                missing,
+                used_exponents: used,
+                inverse,
+            });
         }
         // Singular: swap in another recovery slice and retry.
         if next_unused >= exps.len() {
@@ -385,14 +422,23 @@ pub const MIN_MEM_LIMIT: u64 = 16 << 20;
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { num_threads: 0, mem_limit_bytes: 256 << 20, input_batch: 16, tile_words: 8192, output_group: 8, reader_threads: 0 }
+        Self {
+            num_threads: 0,
+            mem_limit_bytes: 256 << 20,
+            input_batch: 16,
+            tile_words: 8192,
+            output_group: 8,
+            reader_threads: 0,
+        }
     }
 }
 
 impl EngineConfig {
     fn threads(&self) -> usize {
         if self.num_threads == 0 {
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
         } else {
             self.num_threads
         }
@@ -469,7 +515,10 @@ unsafe impl Sync for OutView {}
 impl OutView {
     fn new(bufs: &mut [Vec<u8>], words: usize) -> Self {
         debug_assert!(bufs.iter().all(|b| b.len() >= 2 * words));
-        Self { ptrs: bufs.iter_mut().map(|b| b.as_mut_ptr()).collect(), words }
+        Self {
+            ptrs: bufs.iter_mut().map(|b| b.as_mut_ptr()).collect(),
+            words,
+        }
     }
 
     /// Planes of output `o` over words `[t0, t1)`.
@@ -481,7 +530,12 @@ impl OutView {
         debug_assert!(t0 <= t1 && t1 <= self.words);
         // SAFETY: `o < ptrs.len()`, `t1 <= words`, the buffer holds `2 * words` bytes, and the
         // caller guarantees exclusivity of the tile.
-        unsafe { PlaneMut { lo: std::slice::from_raw_parts_mut(p.add(t0), t1 - t0), hi: std::slice::from_raw_parts_mut(p.add(self.words + t0), t1 - t0) } }
+        unsafe {
+            PlaneMut {
+                lo: std::slice::from_raw_parts_mut(p.add(t0), t1 - t0),
+                hi: std::slice::from_raw_parts_mut(p.add(self.words + t0), t1 - t0),
+            }
+        }
     }
 }
 
@@ -496,7 +550,15 @@ fn tile_bounds(t: usize, tile: usize, words: usize) -> Option<(usize, usize)> {
 ///
 /// `scratch` receives the de-interleaved input tiles (one split buffer of `2 * (t1 - t0)` bytes
 /// per input).
-fn process_tile(kernel: &Kernel, shared: &Shared, batch: &Batch, outs: &OutView, t0: usize, t1: usize, scratch: &mut Vec<Vec<u8>>) {
+fn process_tile(
+    kernel: &Kernel,
+    shared: &Shared,
+    batch: &Batch,
+    outs: &OutView,
+    t0: usize,
+    t1: usize,
+    scratch: &mut Vec<Vec<u8>>,
+) {
     let n_out = outs.ptrs.len();
     let tw = t1 - t0;
     if tw == 0 || n_out == 0 {
@@ -516,7 +578,9 @@ fn process_tile(kernel: &Kernel, shared: &Shared, batch: &Batch, outs: &OutView,
     while g < n_out {
         let g_end = (g + shared.group).min(n_out);
         // SAFETY: this tile was claimed exclusively by the calling worker (see `Engine::run`).
-        let mut tiles: Vec<PlaneMut<'_>> = (g..g_end).map(|o| unsafe { outs.tile(o, t0, t1) }).collect();
+        let mut tiles: Vec<PlaneMut<'_>> = (g..g_end)
+            .map(|o| unsafe { outs.tile(o, t0, t1) })
+            .collect();
         for (k, (input_idx, _)) in batch.items.iter().enumerate() {
             let spec = &shared.inputs[*input_idx];
             let src = Plane::from_halves(&scratch[k]);
@@ -573,14 +637,23 @@ impl<'a> Engine<'a> {
     }
 
     /// Run the computation.
-    pub fn run(&self, reader: &dyn InputReader, sink: &mut dyn OutputSink, cancel: Option<&AtomicBool>, progress: &mut ProgressFn<'_>) -> Result<(), RsError> {
+    pub fn run(
+        &self,
+        reader: &dyn InputReader,
+        sink: &mut dyn OutputSink,
+        cancel: Option<&AtomicBool>,
+        progress: &mut ProgressFn<'_>,
+    ) -> Result<(), RsError> {
         let n_out = self.output_exponents.len();
         if n_out == 0 {
             return Err(RsError::NoOutputs);
         }
         let n_final = match self.post_transform {
             Some(m) => {
-                assert!(m.cols() == n_out && m.rows() >= 1 && m.rows() <= n_out, "post transform must be r×k with 1 <= r <= k");
+                assert!(
+                    m.cols() == n_out && m.rows() >= 1 && m.rows() <= n_out,
+                    "post transform must be r×k with 1 <= r <= k"
+                );
                 m.rows()
             }
             None => n_out,
@@ -641,35 +714,50 @@ impl<'a> Engine<'a> {
                     for _ in 0..readers {
                         let tx = batch_tx.clone();
                         let (spare, next_batch) = (&spare, &next_batch);
-                        s.spawn(move || loop {
-                            if reader_cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                                return;
-                            }
-                            let start = next_batch.fetch_add(1, Ordering::Relaxed).saturating_mul(batch_size);
-                            if start >= inputs.len() {
-                                return;
-                            }
-                            let end = (start + batch_size).min(inputs.len());
-                            let mut batch = spare.lock().unwrap_or_else(|p| p.into_inner()).pop().unwrap_or(Batch { items: Vec::with_capacity(batch_size), words });
-                            let mut pool: Vec<Vec<u8>> = batch.items.drain(..).map(|(_, b)| b).collect();
-                            batch.words = words;
-                            for (idx, spec) in inputs.iter().enumerate().take(end).skip(start) {
-                                let mut buf = pool.pop().unwrap_or_default();
-                                buf.resize(len, 0);
-                                if let Err(e) = reader.read_input(spec.source, off, &mut buf[..len]) {
-                                    let _ = tx.send(Err(e));
+                        s.spawn(move || {
+                            loop {
+                                if reader_cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                                     return;
                                 }
-                                batch.items.push((idx, buf));
-                            }
-                            if tx.send(Ok(batch)).is_err() {
-                                return;
+                                let start = next_batch
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    .saturating_mul(batch_size);
+                                if start >= inputs.len() {
+                                    return;
+                                }
+                                let end = (start + batch_size).min(inputs.len());
+                                let mut batch = spare
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .pop()
+                                    .unwrap_or(Batch {
+                                        items: Vec::with_capacity(batch_size),
+                                        words,
+                                    });
+                                let mut pool: Vec<Vec<u8>> =
+                                    batch.items.drain(..).map(|(_, b)| b).collect();
+                                batch.words = words;
+                                for (idx, spec) in inputs.iter().enumerate().take(end).skip(start) {
+                                    let mut buf = pool.pop().unwrap_or_default();
+                                    buf.resize(len, 0);
+                                    if let Err(e) =
+                                        reader.read_input(spec.source, off, &mut buf[..len])
+                                    {
+                                        let _ = tx.send(Err(e));
+                                        return;
+                                    }
+                                    batch.items.push((idx, buf));
+                                }
+                                if tx.send(Ok(batch)).is_err() {
+                                    return;
+                                }
                             }
                         });
                     }
                     drop(batch_tx);
                     // Workers: each receives every job on its own channel and claims tiles.
-                    let mut worker_tx: Vec<mpsc::SyncSender<Arc<Job>>> = Vec::with_capacity(workers);
+                    let mut worker_tx: Vec<mpsc::SyncSender<Arc<Job>>> =
+                        Vec::with_capacity(workers);
                     let mut done_rx: Vec<mpsc::Receiver<()>> = Vec::with_capacity(workers);
                     for _ in 0..workers {
                         let (tx, rx) = mpsc::sync_channel::<Arc<Job>>(2);
@@ -683,8 +771,18 @@ impl<'a> Engine<'a> {
                             while let Ok(job) = rx.recv() {
                                 loop {
                                     let t = job.next_tile.fetch_add(1, Ordering::Relaxed);
-                                    let Some((t0, t1)) = tile_bounds(t, tile, words) else { break };
-                                    process_tile(&kernel, &shared, &job.batch, outview, t0, t1, &mut scratch);
+                                    let Some((t0, t1)) = tile_bounds(t, tile, words) else {
+                                        break;
+                                    };
+                                    process_tile(
+                                        &kernel,
+                                        &shared,
+                                        &job.batch,
+                                        outview,
+                                        t0,
+                                        t1,
+                                        &mut scratch,
+                                    );
                                 }
                                 drop(job);
                                 if done.send(()).is_err() {
@@ -704,7 +802,10 @@ impl<'a> Engine<'a> {
                             }
                         };
                         let count = batch.items.len();
-                        let job = Arc::new(Job { batch, next_tile: AtomicUsize::new(0) });
+                        let job = Arc::new(Job {
+                            batch,
+                            next_tile: AtomicUsize::new(0),
+                        });
                         for tx in &worker_tx {
                             if tx.send(Arc::clone(&job)).is_err() {
                                 status = Err(RsError::Cancelled);
@@ -713,12 +814,17 @@ impl<'a> Engine<'a> {
                         for d in &done_rx {
                             if d.recv().is_err() {
                                 // A worker died (panicked); stop feeding and surface an error.
-                                status = Err(RsError::Io(io::Error::other("compute worker terminated unexpectedly")));
+                                status = Err(RsError::Io(io::Error::other(
+                                    "compute worker terminated unexpectedly",
+                                )));
                                 break;
                             }
                         }
                         if let Ok(job) = Arc::try_unwrap(job) {
-                            spare.lock().unwrap_or_else(|p| p.into_inner()).push(job.batch);
+                            spare
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .push(job.batch);
                         }
                         processed += count;
                         progress(ci, total_chunks, processed, total_inputs);
@@ -751,18 +857,30 @@ impl<'a> Engine<'a> {
                             let mut coeffs = [0u16; MAX_MULTI];
                             loop {
                                 let t = next.fetch_add(1, Ordering::Relaxed);
-                                let Some((t0, t1)) = tile_bounds(t, tile, words) else { return };
+                                let Some((t0, t1)) = tile_bounds(t, tile, words) else {
+                                    return;
+                                };
                                 let mut g = 0;
                                 while g < n_final {
                                     let g_end = (g + group).min(n_final);
                                     // SAFETY: tile `t` was claimed exclusively through `next`.
-                                    let mut tiles: Vec<PlaneMut<'_>> = (g..g_end).map(|o| unsafe { tview.tile(o, t0, t1) }).collect();
+                                    let mut tiles: Vec<PlaneMut<'_>> = (g..g_end)
+                                        .map(|o| unsafe { tview.tile(o, t0, t1) })
+                                        .collect();
                                     for (j, sbuf) in syn.iter().enumerate() {
-                                        let src = Plane { lo: &sbuf[..words], hi: &sbuf[words..len] }.slice(t0, t1);
+                                        let src = Plane {
+                                            lo: &sbuf[..words],
+                                            hi: &sbuf[words..len],
+                                        }
+                                        .slice(t0, t1);
                                         for (k, o) in (g..g_end).enumerate() {
                                             coeffs[k] = m.get(o, j);
                                         }
-                                        kernel.mul_acc_multi_split(&mut tiles, src, &coeffs[..g_end - g]);
+                                        kernel.mul_acc_multi_split(
+                                            &mut tiles,
+                                            src,
+                                            &coeffs[..g_end - g],
+                                        );
                                     }
                                     g = g_end;
                                 }
@@ -798,7 +916,10 @@ pub struct MemoryInputs<'a> {
 
 impl InputReader for MemoryInputs<'_> {
     fn read_input(&self, source: usize, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        let s = self.slices.get(source).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such input"))?;
+        let s = self
+            .slices
+            .get(source)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such input"))?;
         let start = (offset as usize).min(s.len());
         let end = (start + buf.len()).min(s.len());
         let n = end - start;
@@ -817,13 +938,18 @@ pub struct MemoryOutputs {
 impl MemoryOutputs {
     /// Zeroed outputs.
     pub fn new(count: usize, slice_size: usize) -> Self {
-        Self { slices: vec![vec![0u8; slice_size]; count] }
+        Self {
+            slices: vec![vec![0u8; slice_size]; count],
+        }
     }
 }
 
 impl OutputSink for MemoryOutputs {
     fn write_output(&mut self, output: usize, offset: u64, data: &[u8]) -> io::Result<()> {
-        let o = self.slices.get_mut(output).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such output"))?;
+        let o = self
+            .slices
+            .get_mut(output)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such output"))?;
         let s = offset as usize;
         o[s..s + data.len()].copy_from_slice(data);
         Ok(())
@@ -831,11 +957,33 @@ impl OutputSink for MemoryOutputs {
 }
 
 /// Compute recovery slices for `exponents` from complete in-memory input slices.
-pub fn encode_in_memory(slice_size: usize, inputs: &[&[u8]], exponents: &[u32], config: EngineConfig, kernel: Kernel) -> Result<Vec<Vec<u8>>, RsError> {
+pub fn encode_in_memory(
+    slice_size: usize,
+    inputs: &[&[u8]],
+    exponents: &[u32],
+    config: EngineConfig,
+    kernel: Kernel,
+) -> Result<Vec<Vec<u8>>, RsError> {
     let logs = gf16::input_constant_logs(inputs.len()).map_err(|_| RsError::TooManyInputs)?;
-    let specs: Vec<InputSpec> = logs.iter().enumerate().map(|(i, &l)| InputSpec { kind: InputKind::Data { logbase: l }, source: i }).collect();
-    let engine = Engine { slice_size: slice_size as u64, inputs: &specs, output_exponents: exponents, post_transform: None, config, kernel };
-    let reader = MemoryInputs { slices: inputs.to_vec() };
+    let specs: Vec<InputSpec> = logs
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| InputSpec {
+            kind: InputKind::Data { logbase: l },
+            source: i,
+        })
+        .collect();
+    let engine = Engine {
+        slice_size: slice_size as u64,
+        inputs: &specs,
+        output_exponents: exponents,
+        post_transform: None,
+        config,
+        kernel,
+    };
+    let reader = MemoryInputs {
+        slices: inputs.to_vec(),
+    };
     let mut out = MemoryOutputs::new(exponents.len(), slice_size);
     engine.run(&reader, &mut out, None, &mut |_, _, _, _| {})?;
     Ok(out.slices)
@@ -885,13 +1033,22 @@ pub fn decode_in_memory(
     let mut specs: Vec<InputSpec> = Vec::new();
     for (i, inp) in inputs.iter().enumerate() {
         if let Some(d) = inp {
-            specs.push(InputSpec { kind: InputKind::Data { logbase: logs[i] }, source: slices.len() });
+            specs.push(InputSpec {
+                kind: InputKind::Data { logbase: logs[i] },
+                source: slices.len(),
+            });
             slices.push(d);
         }
     }
     for (j, &e) in plan.used_exponents.iter().enumerate() {
-        let (_, d) = recovery.iter().find(|(x, _)| *x == e).expect("used exponent must be available");
-        specs.push(InputSpec { kind: InputKind::Recovery { output: j }, source: slices.len() });
+        let (_, d) = recovery
+            .iter()
+            .find(|(x, _)| *x == e)
+            .expect("used exponent must be available");
+        specs.push(InputSpec {
+            kind: InputKind::Recovery { output: j },
+            source: slices.len(),
+        });
         slices.push(d);
     }
     let engine = Engine {
@@ -925,7 +1082,14 @@ mod tests {
     }
 
     fn small_config() -> EngineConfig {
-        EngineConfig { num_threads: 3, mem_limit_bytes: 0, input_batch: 3, tile_words: 64, output_group: 3, reader_threads: 2 }
+        EngineConfig {
+            num_threads: 3,
+            mem_limit_bytes: 0,
+            input_batch: 3,
+            tile_words: 64,
+            output_group: 3,
+            reader_threads: 2,
+        }
     }
 
     #[test]
@@ -960,7 +1124,11 @@ mod tests {
         let data = rnd(2 * n * n, 77);
         for r in 0..n {
             for c in 0..n {
-                big.set(r, c, u16::from_le_bytes([data[2 * (r * n + c)], data[2 * (r * n + c) + 1]]));
+                big.set(
+                    r,
+                    c,
+                    u16::from_le_bytes([data[2 * (r * n + c)], data[2 * (r * n + c) + 1]]),
+                );
             }
         }
         if let Some(inv) = big.inverse(&k) {
@@ -987,14 +1155,28 @@ mod tests {
         }
         assert_eq!(a.mul(&plan.inverse), Matrix::identity(3));
 
-        assert!(matches!(plan_recovery(&logs, &present, &[0, 1], &k), Err(RsError::NotEnoughRecovery { needed: 3, available: 2 })));
+        assert!(matches!(
+            plan_recovery(&logs, &present, &[0, 1], &k),
+            Err(RsError::NotEnoughRecovery {
+                needed: 3,
+                available: 2
+            })
+        ));
         assert!(plan_recovery(&logs, &present, &[0, 0, 0, 1, 1, 2], &k).is_ok());
         let none_missing = plan_recovery(&logs, &[true; 10], &[], &k).unwrap();
         assert!(none_missing.missing.is_empty());
         assert_eq!(none_missing.inverse.rows(), 0);
         let too_many = vec![true; 32769];
-        assert!(matches!(plan_recovery(&vec![1u16; 32769], &too_many, &[], &k), Err(RsError::TooManyInputs)));
-        for e in [RsError::Singular, RsError::NoOutputs, RsError::Cancelled, RsError::Io(io::Error::other("x"))] {
+        assert!(matches!(
+            plan_recovery(&vec![1u16; 32769], &too_many, &[], &k),
+            Err(RsError::TooManyInputs)
+        ));
+        for e in [
+            RsError::Singular,
+            RsError::NoOutputs,
+            RsError::Cancelled,
+            RsError::Io(io::Error::other("x")),
+        ] {
             assert!(!e.to_string().is_empty());
         }
         assert!(std::error::Error::source(&RsError::Io(io::Error::other("x"))).is_some());
@@ -1039,11 +1221,21 @@ mod tests {
     fn encode_matches_reference_and_par2_structure() {
         let k = Kernel::detect();
         let ss = 1000usize;
-        let data: Vec<Vec<u8>> = (0..7).map(|i| rnd(if i == 6 { 333 } else { ss }, i as u64)).collect();
+        let data: Vec<Vec<u8>> = (0..7)
+            .map(|i| rnd(if i == 6 { 333 } else { ss }, i as u64))
+            .collect();
         let inputs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
         let exps = [0u32, 1, 2, 5, 100, 65534];
         let want = encode_reference(ss, &inputs, &exps);
-        for cfg in [small_config(), EngineConfig::default(), EngineConfig { num_threads: 1, input_batch: 1, ..small_config() }] {
+        for cfg in [
+            small_config(),
+            EngineConfig::default(),
+            EngineConfig {
+                num_threads: 1,
+                input_batch: 1,
+                ..small_config()
+            },
+        ] {
             let got = encode_in_memory(ss, &inputs, &exps, cfg, k).unwrap();
             assert_eq!(got, want);
         }
@@ -1065,13 +1257,33 @@ mod tests {
         let k = Kernel::detect();
         let ss = 2048usize;
         let n = 12;
-        let data: Vec<Vec<u8>> = (0..n).map(|i| rnd(if i == n - 1 { 100 } else { ss }, 100 + i as u64)).collect();
+        let data: Vec<Vec<u8>> = (0..n)
+            .map(|i| rnd(if i == n - 1 { 100 } else { ss }, 100 + i as u64))
+            .collect();
         let inputs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
         let exps: Vec<u32> = (0..6).collect();
         let rec = encode_reference(ss, &inputs, &exps);
-        let recovery: Vec<(u32, &[u8])> = exps.iter().copied().zip(rec.iter().map(|r| r.as_slice())).collect();
-        for missing_set in [vec![0usize], vec![11], vec![3, 7], vec![0, 1, 2, 3, 4, 5], vec![2, 11, 6]] {
-            let present: Vec<Option<&[u8]>> = (0..n).map(|i| if missing_set.contains(&i) { None } else { Some(inputs[i]) }).collect();
+        let recovery: Vec<(u32, &[u8])> = exps
+            .iter()
+            .copied()
+            .zip(rec.iter().map(|r| r.as_slice()))
+            .collect();
+        for missing_set in [
+            vec![0usize],
+            vec![11],
+            vec![3, 7],
+            vec![0, 1, 2, 3, 4, 5],
+            vec![2, 11, 6],
+        ] {
+            let present: Vec<Option<&[u8]>> = (0..n)
+                .map(|i| {
+                    if missing_set.contains(&i) {
+                        None
+                    } else {
+                        Some(inputs[i])
+                    }
+                })
+                .collect();
             for cfg in [small_config(), EngineConfig::default()] {
                 let (missing, out) = decode_in_memory(ss, &present, &recovery, cfg, k).unwrap();
                 let mut sorted = missing_set.clone();
@@ -1085,16 +1297,36 @@ mod tests {
             }
         }
         // Use only a subset of recovery slices (non-contiguous exponents).
-        let partial: Vec<(u32, &[u8])> = recovery.iter().filter(|(e, _)| matches!(e, 1 | 3 | 5)).copied().collect();
-        let present: Vec<Option<&[u8]>> = (0..n).map(|i| if matches!(i, 4 | 8 | 9) { None } else { Some(inputs[i]) }).collect();
+        let partial: Vec<(u32, &[u8])> = recovery
+            .iter()
+            .filter(|(e, _)| matches!(e, 1 | 3 | 5))
+            .copied()
+            .collect();
+        let present: Vec<Option<&[u8]>> = (0..n)
+            .map(|i| {
+                if matches!(i, 4 | 8 | 9) {
+                    None
+                } else {
+                    Some(inputs[i])
+                }
+            })
+            .collect();
         let (missing, out) = decode_in_memory(ss, &present, &partial, small_config(), k).unwrap();
         assert_eq!(missing, vec![4, 8, 9]);
         for (m, d) in missing.iter().zip(&out) {
             assert_eq!(d, &data[*m]);
         }
         // Too few recovery slices.
-        let present: Vec<Option<&[u8]>> = (0..n).map(|i| if i < 7 { None } else { Some(inputs[i]) }).collect();
-        assert!(matches!(decode_in_memory(ss, &present, &recovery, small_config(), k), Err(RsError::NotEnoughRecovery { needed: 7, available: 6 })));
+        let present: Vec<Option<&[u8]>> = (0..n)
+            .map(|i| if i < 7 { None } else { Some(inputs[i]) })
+            .collect();
+        assert!(matches!(
+            decode_in_memory(ss, &present, &recovery, small_config(), k),
+            Err(RsError::NotEnoughRecovery {
+                needed: 7,
+                available: 6
+            })
+        ));
         // Nothing missing.
         let present: Vec<Option<&[u8]>> = inputs.iter().map(|i| Some(*i)).collect();
         let (m, o) = decode_in_memory(ss, &present, &recovery, small_config(), k).unwrap();
@@ -1112,20 +1344,33 @@ mod tests {
         for threads in [1usize, 2, 7] {
             for batch in [1usize, 2, 5, 9] {
                 for tile in [64usize, 100, 8192] {
-                    let cfg = EngineConfig { reader_threads: 1 + (batch % 2), num_threads: threads, mem_limit_bytes: 0, input_batch: batch, tile_words: tile, output_group: 1 + batch % 8 };
+                    let cfg = EngineConfig {
+                        reader_threads: 1 + (batch % 2),
+                        num_threads: threads,
+                        mem_limit_bytes: 0,
+                        input_batch: batch,
+                        tile_words: tile,
+                        output_group: 1 + batch % 8,
+                    };
                     let got = encode_in_memory(ss, &inputs, &exps, cfg, k).unwrap();
                     assert_eq!(got, want, "threads={threads} batch={batch} tile={tile}");
                 }
             }
         }
         // The chunk count really is > 1 under the minimum budget for a large slice.
-        let specs: Vec<InputSpec> = vec![InputSpec { kind: InputKind::Data { logbase: 1 }, source: 0 }];
+        let specs: Vec<InputSpec> = vec![InputSpec {
+            kind: InputKind::Data { logbase: 1 },
+            source: 0,
+        }];
         let e = Engine {
             slice_size: 64 << 20,
             inputs: &specs,
             output_exponents: &[0; 200],
             post_transform: None,
-            config: EngineConfig { mem_limit_bytes: 0, ..EngineConfig::default() },
+            config: EngineConfig {
+                mem_limit_bytes: 0,
+                ..EngineConfig::default()
+            },
             kernel: k,
         };
         assert!(e.chunk_bytes() < (64 << 20));
@@ -1135,16 +1380,41 @@ mod tests {
     #[test]
     fn engine_errors_and_cancellation() {
         let k = Kernel::detect();
-        let specs: Vec<InputSpec> = vec![InputSpec { kind: InputKind::Data { logbase: 1 }, source: 0 }];
-        let e = Engine { slice_size: 100, inputs: &specs, output_exponents: &[], post_transform: None, config: small_config(), kernel: k };
-        let reader = MemoryInputs { slices: vec![&[1u8; 100]] };
+        let specs: Vec<InputSpec> = vec![InputSpec {
+            kind: InputKind::Data { logbase: 1 },
+            source: 0,
+        }];
+        let e = Engine {
+            slice_size: 100,
+            inputs: &specs,
+            output_exponents: &[],
+            post_transform: None,
+            config: small_config(),
+            kernel: k,
+        };
+        let reader = MemoryInputs {
+            slices: vec![&[1u8; 100]],
+        };
         let mut out = MemoryOutputs::new(0, 100);
-        assert!(matches!(e.run(&reader, &mut out, None, &mut |_, _, _, _| {}), Err(RsError::NoOutputs)));
+        assert!(matches!(
+            e.run(&reader, &mut out, None, &mut |_, _, _, _| {}),
+            Err(RsError::NoOutputs)
+        ));
 
-        let e = Engine { slice_size: 100, inputs: &specs, output_exponents: &[0], post_transform: None, config: small_config(), kernel: k };
+        let e = Engine {
+            slice_size: 100,
+            inputs: &specs,
+            output_exponents: &[0],
+            post_transform: None,
+            config: small_config(),
+            kernel: k,
+        };
         let mut out = MemoryOutputs::new(1, 100);
         let cancel = AtomicBool::new(true);
-        assert!(matches!(e.run(&reader, &mut out, Some(&cancel), &mut |_, _, _, _| {}), Err(RsError::Cancelled)));
+        assert!(matches!(
+            e.run(&reader, &mut out, Some(&cancel), &mut |_, _, _, _| {}),
+            Err(RsError::Cancelled)
+        ));
 
         // Reader failure propagates.
         struct Failing;
@@ -1157,10 +1427,17 @@ mod tests {
         assert!(matches!(r, Err(RsError::Io(_))));
         // Missing input source.
         let bad = MemoryInputs { slices: vec![] };
-        assert!(matches!(e.run(&bad, &mut out, None, &mut |_, _, _, _| {}), Err(RsError::Io(_))));
+        assert!(matches!(
+            e.run(&bad, &mut out, None, &mut |_, _, _, _| {}),
+            Err(RsError::Io(_))
+        ));
         // Sink failure propagates.
-        let mut failing_sink = |_: usize, _: u64, _: &[u8]| -> io::Result<()> { Err(io::Error::other("full")) };
-        assert!(matches!(e.run(&reader, &mut failing_sink, None, &mut |_, _, _, _| {}), Err(RsError::Io(_))));
+        let mut failing_sink =
+            |_: usize, _: u64, _: &[u8]| -> io::Result<()> { Err(io::Error::other("full")) };
+        assert!(matches!(
+            e.run(&reader, &mut failing_sink, None, &mut |_, _, _, _| {}),
+            Err(RsError::Io(_))
+        ));
         // Zero slice size is a no-op.
         let z = Engine { slice_size: 0, ..e };
         assert!(z.run(&reader, &mut out, None, &mut |_, _, _, _| {}).is_ok());
@@ -1174,10 +1451,18 @@ mod tests {
         .unwrap();
         assert_eq!(last, (1, 1));
         // No inputs at all: outputs are zero.
-        let e0 = Engine { slice_size: 100, inputs: &[], output_exponents: &[0, 1], post_transform: None, config: small_config(), kernel: k };
+        let e0 = Engine {
+            slice_size: 100,
+            inputs: &[],
+            output_exponents: &[0, 1],
+            post_transform: None,
+            config: small_config(),
+            kernel: k,
+        };
         let mut out = MemoryOutputs::new(2, 100);
         out.slices[0][5] = 9;
-        e0.run(&reader, &mut out, None, &mut |_, _, _, _| {}).unwrap();
+        e0.run(&reader, &mut out, None, &mut |_, _, _, _| {})
+            .unwrap();
         assert!(out.slices.iter().all(|s| s.iter().all(|&b| b == 0)));
     }
 

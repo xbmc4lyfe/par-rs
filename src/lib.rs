@@ -59,7 +59,15 @@
 //! assert_eq!(report.packets.len(), 0);
 //! ```
 
-#![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic
+    )
+)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
@@ -67,89 +75,189 @@
 // specification (`gf2`, `par2`, `inspect`, `bridge`, `verify`, `repair`, `stream`) compile with
 // indexing, `unwrap`, `expect` and `panic!` denied. The older engine modules predate that rule and
 // carry a module-level allow; they are fuzz- and differential-tested instead.
+pub mod bridge;
 mod bytes;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod crc;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod create;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod damage;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod ffi;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod filenames;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod gf16;
 pub mod gf2;
-pub mod inspect;
-pub mod par2;
-pub mod bridge;
-pub mod verify;
-pub mod repair;
-pub mod stream;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod hasher;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub mod inspect;
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod md5simd;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod packet;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub mod par2;
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod parhash;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod reed_solomon;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod renamer;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub mod repair;
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod repairer;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod scanner;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub mod stream;
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod streaming;
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 pub mod twin;
+pub mod verify;
 
 // The GF(2) algebra re-exported at the root follows `gf2`'s signatures (`crc32_zeros(len)`,
 // `crc32_combine(crc1, crc2, len2: usize)`); the older register-level variants with other
 // signatures remain available under `crc::`.
-pub use crc::{Crc32, Crc32Combiner, WindowTable};
-pub use gf2::{
-    Crc32Shift, FoldError, GF2_ORDER, GF2_POLY, RollingCrc32, compute_interval_crcs, crc32, crc32_combine, crc32_combine_u64, crc32_uncombine_prefix,
-    crc32_uncombine_suffix, crc32_unzero, crc32_zero_unpad, crc32_zeros, fold_ifsc_crcs, fold_ifsc_crcs_with, fold_yenc_indexed_parts, fold_yenc_parts,
-    ifsc_interval_crcs, lcm_grid, multmodp, x2nmodp, xpow,
+pub use bridge::{
+    BridgeReport, Candidate, Par2Bridge, Resolution, ResolveMethod, rar5_volume_number,
 };
-pub use inspect::{CreatorInfo, CreatorTool, PacketKind, Par1Header, Par2FileName, Par2Inspection, Par3PacketHeader, ParFormat, VerifyMode, detect_format, inspect_par2, inspect_par2_with, parse_par2_filename};
-pub use par2::{Inventory, Par2File, display_name, file_descriptions, inventory, is_base_par2};
-pub use bridge::{BridgeReport, Candidate, Par2Bridge, ResolveMethod, Resolution, rar5_volume_number};
-pub use verify::{FileVerification, FoundSlice, RepairAssessment, SetVerifier, SliceStatus, SourceSpec, VerificationReport};
-pub use repair::{DiskFile, DiskLocation, DiskRecovery, DiskRepairPlan, DiskRepairReport, RepairPlan, repair_on_disk, repair_selected_slices, repair_slices};
-pub use stream::{FileLayout, StreamEvent, StreamStatus, StreamingSliceAssembler, SyndromeBank};
-pub use create::{build_set, create, create_in_memory, CreateError, CreateOptions, CreateReport, CreateStage, Par2Set, SetOptions, SourceFile, VolumeScheme};
+pub use crc::{Crc32, Crc32Combiner, WindowTable};
+pub use create::{
+    CreateError, CreateOptions, CreateReport, CreateStage, Par2Set, SetOptions, SourceFile,
+    VolumeScheme, build_set, create, create_in_memory,
+};
 pub use damage::{
-    blocks_touched, compute_holes, par_cannot_cover, project_par_damage, quick_verify, range_covered, smart_calc_range_crc, verify_partial_file,
-    verify_success_file_crc, ByteRange, DownloadStatus, FileDamage, QuickVerdict, RangeReader, Segment,
+    ByteRange, DownloadStatus, FileDamage, QuickVerdict, RangeReader, Segment, blocks_touched,
+    compute_holes, par_cannot_cover, project_par_damage, quick_verify, range_covered,
+    smart_calc_range_crc, verify_partial_file, verify_success_file_crc,
 };
 pub use filenames::{
-    calc_completed_volume_blocks, calc_queued_volume_blocks, find_main_pars, parse_par_filename, pick_twin_volume, same_par_collection, select_more_pars,
-    volume_blocks_bytes, ParName,
+    ParName, calc_completed_volume_blocks, calc_queued_volume_blocks, find_main_pars,
+    parse_par_filename, pick_twin_volume, same_par_collection, select_more_pars,
+    volume_blocks_bytes,
+};
+pub use gf2::{
+    Crc32Shift, FoldError, GF2_ORDER, GF2_POLY, RollingCrc32, compute_interval_crcs, crc32,
+    crc32_combine, crc32_combine_u64, crc32_uncombine_prefix, crc32_uncombine_suffix, crc32_unzero,
+    crc32_zero_unpad, crc32_zeros, fold_ifsc_crcs, fold_ifsc_crcs_with, fold_yenc_indexed_parts,
+    fold_yenc_parts, ifsc_interval_crcs, lcm_grid, multmodp, x2nmodp, xpow,
 };
 pub use gf16::simd::{Isa, Kernel};
-pub use hasher::{hash_file, hash_reader, FileHasher, FileHashes};
-pub use packet::{
-    load_par2_bytes, load_par2_file, translate_filename_from_par2_to_local, FileDescPacket, FileId, IfscPacket, MainPacket, PacketSet, Par2Collection,
-    RecoverySliceRef, ScanOptions, SetId, SliceChecksum,
+pub use hasher::{FileHasher, FileHashes, hash_file, hash_reader};
+pub use inspect::{
+    CreatorInfo, CreatorTool, PacketKind, Par1Header, Par2FileName, Par2Inspection,
+    Par3PacketHeader, ParFormat, VerifyMode, detect_format, inspect_par2, inspect_par2_with,
+    parse_par2_filename,
 };
+pub use packet::{
+    FileDescPacket, FileId, IfscPacket, MainPacket, PacketSet, Par2Collection, RecoverySliceRef,
+    ScanOptions, SetId, SliceChecksum, load_par2_bytes, load_par2_file,
+    translate_filename_from_par2_to_local,
+};
+pub use par2::{Inventory, Par2File, display_name, file_descriptions, inventory, is_base_par2};
 pub use reed_solomon::{EngineConfig, RsError};
 pub use renamer::{ParRenamer, RenamerEvent, RenamerOptions, RenamerReport};
+pub use repair::{
+    DiskFile, DiskLocation, DiskRecovery, DiskRepairPlan, DiskRepairReport, RepairPlan,
+    repair_on_disk, repair_selected_slices, repair_slices,
+};
 pub use repairer::{
-    BackupPolicy, FileStatus, Level, NullObserver, Par2Repairer, QuickInfo, QuickVerifier, RepairError, RepairObserver, RepairOptions, RepairResult,
-    SourceFileState, Stage, VerifyResult,
+    BackupPolicy, FileStatus, Level, NullObserver, Par2Repairer, QuickInfo, QuickVerifier,
+    RepairError, RepairObserver, RepairOptions, RepairResult, SourceFileState, Stage, VerifyResult,
 };
-pub use scanner::{scan_file, ChecksumIndex, ScanConfig, ScanReport};
+pub use scanner::{ChecksumIndex, ScanConfig, ScanReport, scan_file};
+pub use stream::{FileLayout, StreamEvent, StreamStatus, StreamingSliceAssembler, SyndromeBank};
 pub use streaming::{
-    ArticleOutcome, BitVec, BlockEvent, BlockState, EarlyRepairReport, LiveStatus, QueuedVolume, SessionOptions, SliceEvent, SliceState, StreamingOptions,
-    StreamingParSession, StreamingStats, StreamingStatus, UnpauseAction, VolumeStatus,
+    ArticleOutcome, BitVec, BlockEvent, BlockState, EarlyRepairReport, LiveStatus, QueuedVolume,
+    SessionOptions, SliceEvent, SliceState, StreamingOptions, StreamingParSession, StreamingStats,
+    StreamingStatus, UnpauseAction, VolumeStatus,
 };
-pub use twin::{block_size, compare_twin_par2_data, fingerprint, par2_set, FileSig, TwinRelation};
+pub use twin::{FileSig, TwinRelation, block_size, compare_twin_par2_data, fingerprint, par2_set};
+pub use verify::{
+    FileVerification, FoundSlice, RepairAssessment, SetVerifier, SliceStatus, SourceSpec,
+    VerificationReport,
+};
 
 #[cfg(test)]
 mod diagnostics {
@@ -159,8 +267,15 @@ mod diagnostics {
     fn print_detected_kernels() {
         println!("crc kernel: {:?}", crate::crc::kernel());
         for &isa in crate::gf16::simd::Isa::candidates() {
-            println!("gf16 isa {isa}: supported={} verified={}", isa.is_supported(), crate::gf16::simd::Kernel::with_isa(isa).is_some());
+            println!(
+                "gf16 isa {isa}: supported={} verified={}",
+                isa.is_supported(),
+                crate::gf16::simd::Kernel::with_isa(isa).is_some()
+            );
         }
-        println!("gf16 selected: {}", crate::gf16::simd::Kernel::detect().isa());
+        println!(
+            "gf16 selected: {}",
+            crate::gf16::simd::Kernel::detect().isa()
+        );
     }
 }

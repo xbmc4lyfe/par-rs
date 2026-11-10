@@ -3,7 +3,7 @@
 //! Usage: `cargo run --release --example bench [slice_bytes] [inputs] [outputs] [threads]`
 
 use par_rs::gf16::simd::{Kernel, Plane, PlaneMut};
-use par_rs::reed_solomon::{encode_in_memory, EngineConfig};
+use par_rs::reed_solomon::{EngineConfig, encode_in_memory};
 use std::time::Instant;
 
 fn main() {
@@ -28,7 +28,10 @@ fn main() {
     }
     let el = t.elapsed().as_secs_f64();
     let bytes = (reps * 4 * 2 * n) as f64;
-    println!("kernel mul_acc_multi_split x4: {:.2} GB/s of output bytes (single thread)", bytes / el / 1e9);
+    println!(
+        "kernel mul_acc_multi_split x4: {:.2} GB/s of output bytes (single thread)",
+        bytes / el / 1e9
+    );
 
     // CRC32 / MD5 throughput.
     let t = Instant::now();
@@ -37,7 +40,10 @@ fn main() {
         c ^= par_rs::crc::crc32(&src);
     }
     let el = t.elapsed().as_secs_f64();
-    println!("crc32: {:.2} GB/s ({c:08x})", (reps * src.len()) as f64 / el / 1e9);
+    println!(
+        "crc32: {:.2} GB/s ({c:08x})",
+        (reps * src.len()) as f64 / el / 1e9
+    );
     let t = Instant::now();
     let mut h = par_rs::hasher::FileHasher::new();
     for _ in 0..reps {
@@ -45,10 +51,20 @@ fn main() {
     }
     let el = t.elapsed().as_secs_f64();
     let r = h.finish();
-    println!("fused crc32+md5: {:.2} GB/s ({:02x}..)", (reps * src.len()) as f64 / el / 1e9, r.md5_full[0]);
+    println!(
+        "fused crc32+md5: {:.2} GB/s ({:02x}..)",
+        (reps * src.len()) as f64 / el / 1e9,
+        r.md5_full[0]
+    );
 
     // Scalar MD5 vs multi-lane MD5 over independent 1 MiB messages.
-    let msgs: Vec<Vec<u8>> = (0..48u32).map(|i| (0..(1usize << 20)).map(|j| ((j as u32).wrapping_mul(2654435761).wrapping_add(i) >> 11) as u8).collect()).collect();
+    let msgs: Vec<Vec<u8>> = (0..48u32)
+        .map(|i| {
+            (0..(1usize << 20))
+                .map(|j| ((j as u32).wrapping_mul(2654435761).wrapping_add(i) >> 11) as u8)
+                .collect()
+        })
+        .collect();
     let refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
     let t = Instant::now();
     let mut x = 0u8;
@@ -56,17 +72,30 @@ fn main() {
         x ^= par_rs::hasher::md5(m)[0];
     }
     let el = t.elapsed().as_secs_f64();
-    println!("md5 scalar: {:.2} GB/s ({x:02x})", (refs.len() << 20) as f64 / el / 1e9);
+    println!(
+        "md5 scalar: {:.2} GB/s ({x:02x})",
+        (refs.len() << 20) as f64 / el / 1e9
+    );
     let t = Instant::now();
     let d = par_rs::md5simd::md5_many(&refs);
     let el = t.elapsed().as_secs_f64();
-    println!("md5 multi-lane ({} lanes): {:.2} GB/s ({:02x})", par_rs::md5simd::LANES, (refs.len() << 20) as f64 / el / 1e9, d.iter().fold(0u8, |a, v| a ^ v[0]));
+    println!(
+        "md5 multi-lane ({} lanes): {:.2} GB/s ({:02x})",
+        par_rs::md5simd::LANES,
+        (refs.len() << 20) as f64 / el / 1e9,
+        d.iter().fold(0u8, |a, v| a ^ v[0])
+    );
 
     // Engine encode.
-    let data: Vec<Vec<u8>> = (0..inputs).map(|i| (0..slice).map(|j| ((j * 7 + i * 13) % 253) as u8).collect()).collect();
+    let data: Vec<Vec<u8>> = (0..inputs)
+        .map(|i| (0..slice).map(|j| ((j * 7 + i * 13) % 253) as u8).collect())
+        .collect();
     let refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
     let exps: Vec<u32> = (0..outputs as u32).collect();
-    let mut cfg = EngineConfig { num_threads: threads, ..EngineConfig::default() };
+    let mut cfg = EngineConfig {
+        num_threads: threads,
+        ..EngineConfig::default()
+    };
     if let Some(v) = args.get(5).and_then(|s| s.parse().ok()) {
         cfg.tile_words = v;
     }

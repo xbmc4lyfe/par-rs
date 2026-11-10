@@ -6,7 +6,7 @@
 //! fingerprint is a 64-bit FNV-1a hash over the sorted, de-duplicated `"<md5>:<length>\n"`
 //! lines of the file descriptions, formatted as `"{hash:016x}-{count}"`.
 
-use crate::packet::{load_par2_bytes, FileDescPacket, PacketSet, ScanOptions};
+use crate::packet::{FileDescPacket, PacketSet, ScanOptions, load_par2_bytes};
 use std::collections::BTreeSet;
 
 /// Identity of one described file.
@@ -23,7 +23,11 @@ pub struct FileSig {
 impl FileSig {
     /// From a parsed file description.
     pub fn from_desc(fd: &FileDescPacket) -> Self {
-        Self { name: fd.name.clone(), md5: fd.hash_full, length: fd.file_length }
+        Self {
+            name: fd.name.clone(),
+            md5: fd.hash_full,
+            length: fd.file_length,
+        }
     }
 
     /// Local (sanitised) name.
@@ -97,7 +101,10 @@ pub fn block_size_of_set(set: &PacketSet) -> u64 {
 /// FNV-1a 64-bit fingerprint of a set of signatures: `"{hash:016x}-{count}"`, or `""` for an
 /// empty set. Lines are `"<md5_lower_hex>:<length>\n"`, sorted and de-duplicated.
 pub fn fingerprint(sigs: &[FileSig]) -> String {
-    let lines: BTreeSet<String> = sigs.iter().map(|s| format!("{}:{}\n", crate::packet::hex(&s.md5), s.length)).collect();
+    let lines: BTreeSet<String> = sigs
+        .iter()
+        .map(|s| format!("{}:{}\n", crate::packet::hex(&s.md5), s.length))
+        .collect();
     if lines.is_empty() {
         return String::new();
     }
@@ -135,14 +142,26 @@ impl TwinRelation {
 /// `own_names[i]` and `own_md5s[i]` describe the same file. Returns
 /// [`TwinRelation::Twin`] (0), [`TwinRelation::DescribesOtherFiles`] (1) or
 /// [`TwinRelation::NamesFilesOtherwise`] (2).
-pub fn compare_twin_par2_data(own_names: &[&[u8]], own_md5s: &[[u8; 16]], own_print: &str, twin_data: &[u8]) -> TwinRelation {
+pub fn compare_twin_par2_data(
+    own_names: &[&[u8]],
+    own_md5s: &[[u8; 16]],
+    own_print: &str,
+    twin_data: &[u8],
+) -> TwinRelation {
     let (twin_sigs, _) = par2_set(twin_data);
     let twin_print = fingerprint(&twin_sigs);
     if twin_print != own_print {
         return TwinRelation::DescribesOtherFiles;
     }
-    let own: BTreeSet<(&[u8], [u8; 16])> = own_names.iter().copied().zip(own_md5s.iter().copied()).collect();
-    let twin: BTreeSet<(&[u8], [u8; 16])> = twin_sigs.iter().map(|s| (s.name.as_slice(), s.md5)).collect();
+    let own: BTreeSet<(&[u8], [u8; 16])> = own_names
+        .iter()
+        .copied()
+        .zip(own_md5s.iter().copied())
+        .collect();
+    let twin: BTreeSet<(&[u8], [u8; 16])> = twin_sigs
+        .iter()
+        .map(|s| (s.name.as_slice(), s.md5))
+        .collect();
     if own == twin {
         TwinRelation::Twin
     } else {
@@ -167,9 +186,12 @@ pub fn name_mapping(own: &[FileSig], twin: &[FileSig]) -> Vec<(Vec<u8>, Vec<u8>)
     let mut out = Vec::new();
     for t in twin {
         if let Some(cands) = by_md5.get(&t.md5)
-            && cands.len() == 1 && cands[0].length == t.length && cands[0].name != t.name {
-                out.push((t.name.clone(), cands[0].name.clone()));
-            }
+            && cands.len() == 1
+            && cands[0].length == t.length
+            && cands[0].name != t.name
+        {
+            out.push((t.name.clone(), cands[0].name.clone()));
+        }
     }
     out
 }
@@ -181,13 +203,21 @@ mod tests {
 
     fn data() -> Vec<(Vec<u8>, Vec<u8>)> {
         vec![
-            (b"one.bin".to_vec(), (0..3000u32).map(|i| (i * 3) as u8).collect()),
-            (b"two.bin".to_vec(), (0..700u32).map(|i| (i * 11) as u8).collect()),
+            (
+                b"one.bin".to_vec(),
+                (0..3000u32).map(|i| (i * 3) as u8).collect(),
+            ),
+            (
+                b"two.bin".to_vec(),
+                (0..700u32).map(|i| (i * 11) as u8).collect(),
+            ),
         ]
     }
 
     fn refs(f: &[(Vec<u8>, Vec<u8>)]) -> Vec<(&[u8], &[u8])> {
-        f.iter().map(|(n, d)| (n.as_slice(), d.as_slice())).collect()
+        f.iter()
+            .map(|(n, d)| (n.as_slice(), d.as_slice()))
+            .collect()
     }
 
     #[test]
@@ -220,7 +250,9 @@ mod tests {
         let f = data();
         let (bytes, _) = build_test_set(&refs(&f), 1024, &[]);
         // Remove the Main packet (first packet).
-        let raws: Vec<_> = crate::packet::PacketIter::new(&bytes[..], ScanOptions::UNVERIFIED).map(|r| r.unwrap()).collect();
+        let raws: Vec<_> = crate::packet::PacketIter::new(&bytes[..], ScanOptions::UNVERIFIED)
+            .map(|r| r.unwrap())
+            .collect();
         let main_len = raws[0].header.length as usize;
         let no_main = &bytes[main_len..];
         let (sigs, has_main) = par2_set(no_main);
@@ -247,9 +279,21 @@ mod tests {
 
     #[test]
     fn fingerprint_is_order_independent_and_dedups() {
-        let a = FileSig { name: b"a".to_vec(), md5: [1; 16], length: 10 };
-        let b = FileSig { name: b"b".to_vec(), md5: [2; 16], length: 20 };
-        let a2 = FileSig { name: b"renamed".to_vec(), md5: [1; 16], length: 10 };
+        let a = FileSig {
+            name: b"a".to_vec(),
+            md5: [1; 16],
+            length: 10,
+        };
+        let b = FileSig {
+            name: b"b".to_vec(),
+            md5: [2; 16],
+            length: 20,
+        };
+        let a2 = FileSig {
+            name: b"renamed".to_vec(),
+            md5: [1; 16],
+            length: 10,
+        };
         let p1 = fingerprint(&[a.clone(), b.clone()]);
         let p2 = fingerprint(&[b.clone(), a.clone()]);
         let p3 = fingerprint(&[a.clone(), b.clone(), a2.clone()]);
@@ -260,7 +304,11 @@ mod tests {
         assert_ne!(p1, fingerprint(std::slice::from_ref(&a)));
         assert_eq!(fingerprint(&[]), "");
         // Known FNV-1a value for a single line.
-        let single = fingerprint(&[FileSig { name: vec![], md5: [0; 16], length: 0 }]);
+        let single = fingerprint(&[FileSig {
+            name: vec![],
+            md5: [0; 16],
+            length: 0,
+        }]);
         let line = format!("{}:0\n", "00".repeat(16));
         let mut h: u64 = 0xcbf29ce484222325;
         for b in line.bytes() {
@@ -281,14 +329,23 @@ mod tests {
 
         // Exact twin (different slice size / recovery does not matter).
         let (twin_bytes, _) = build_test_set(&refs(&f), 512, &[1, 2]);
-        assert_eq!(compare_twin_par2_data(&names, &md5s, &own_print, &twin_bytes), TwinRelation::Twin);
+        assert_eq!(
+            compare_twin_par2_data(&names, &md5s, &own_print, &twin_bytes),
+            TwinRelation::Twin
+        );
         assert_eq!(compare_twin_sets(&own, &twin_bytes), TwinRelation::Twin);
         assert_eq!(TwinRelation::Twin.code(), 0);
 
         // Same content, different names.
-        let renamed: Vec<(Vec<u8>, Vec<u8>)> = f.iter().map(|(n, d)| ([b"x_".as_slice(), n].concat(), d.clone())).collect();
+        let renamed: Vec<(Vec<u8>, Vec<u8>)> = f
+            .iter()
+            .map(|(n, d)| ([b"x_".as_slice(), n].concat(), d.clone()))
+            .collect();
         let (alt_bytes, _) = build_test_set(&refs(&renamed), 1024, &[]);
-        assert_eq!(compare_twin_par2_data(&names, &md5s, &own_print, &alt_bytes), TwinRelation::NamesFilesOtherwise);
+        assert_eq!(
+            compare_twin_par2_data(&names, &md5s, &own_print, &alt_bytes),
+            TwinRelation::NamesFilesOtherwise
+        );
         assert_eq!(TwinRelation::NamesFilesOtherwise.code(), 2);
         let (alt_sigs, _) = par2_set(&alt_bytes);
         let mapping = name_mapping(&own, &alt_sigs);
@@ -299,13 +356,29 @@ mod tests {
         let mut other = f.clone();
         other[0].1[0] ^= 1;
         let (other_bytes, _) = build_test_set(&refs(&other), 1024, &[]);
-        assert_eq!(compare_twin_par2_data(&names, &md5s, &own_print, &other_bytes), TwinRelation::DescribesOtherFiles);
+        assert_eq!(
+            compare_twin_par2_data(&names, &md5s, &own_print, &other_bytes),
+            TwinRelation::DescribesOtherFiles
+        );
         assert_eq!(TwinRelation::DescribesOtherFiles.code(), 1);
-        assert_eq!(compare_twin_par2_data(&names, &md5s, &own_print, b"junk"), TwinRelation::DescribesOtherFiles);
+        assert_eq!(
+            compare_twin_par2_data(&names, &md5s, &own_print, b"junk"),
+            TwinRelation::DescribesOtherFiles
+        );
 
         // Mapping ignores ambiguous MD5s and identical names.
-        let dup = vec![own[0].clone(), FileSig { name: b"dup".to_vec(), ..own[0].clone() }];
-        assert!(name_mapping(&dup, &alt_sigs).iter().all(|(_, to)| to != &own[0].name));
+        let dup = vec![
+            own[0].clone(),
+            FileSig {
+                name: b"dup".to_vec(),
+                ..own[0].clone()
+            },
+        ];
+        assert!(
+            name_mapping(&dup, &alt_sigs)
+                .iter()
+                .all(|(_, to)| to != &own[0].name)
+        );
         assert!(name_mapping(&own, &own).is_empty());
     }
 }

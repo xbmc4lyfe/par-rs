@@ -160,7 +160,10 @@ impl std::error::Error for TooManyInputSlices {}
 /// Whether `logbase` is a valid PAR2 input-constant exponent (coprime with 65535).
 #[inline]
 pub const fn is_valid_logbase(logbase: u32) -> bool {
-    !logbase.is_multiple_of(3) && !logbase.is_multiple_of(5) && !logbase.is_multiple_of(17) && !logbase.is_multiple_of(257)
+    !logbase.is_multiple_of(3)
+        && !logbase.is_multiple_of(5)
+        && !logbase.is_multiple_of(17)
+        && !logbase.is_multiple_of(257)
 }
 
 /// The logarithms (base `alpha`) of the first `count` input-slice constants.
@@ -267,9 +270,18 @@ pub fn mul_acc_scalar(dst: &mut [u8], src: &[u8], tables: &MulTables) {
 }
 
 /// Scalar `dst ^= coeff * src` on split (de-interleaved) planes.
-pub fn mul_acc_split_scalar(dst_lo: &mut [u8], dst_hi: &mut [u8], src_lo: &[u8], src_hi: &[u8], tables: &MulTables) {
+pub fn mul_acc_split_scalar(
+    dst_lo: &mut [u8],
+    dst_hi: &mut [u8],
+    src_lo: &[u8],
+    src_hi: &[u8],
+    tables: &MulTables,
+) {
     let n = dst_lo.len();
-    assert!(dst_hi.len() == n && src_lo.len() == n && src_hi.len() == n, "mul_acc_split: length mismatch");
+    assert!(
+        dst_hi.len() == n && src_lo.len() == n && src_hi.len() == n,
+        "mul_acc_split: length mismatch"
+    );
     for i in 0..n {
         let p = tables.mul_bytes(src_lo[i], src_hi[i]);
         dst_lo[i] ^= p as u8;
@@ -320,7 +332,12 @@ impl ShuffleTables {
 
     /// Reference evaluation: `coeff * w` through the nibble tables.
     pub fn mul(&self, w: u16) -> u16 {
-        let n = [(w & 0xF) as usize, ((w >> 4) & 0xF) as usize, ((w >> 8) & 0xF) as usize, (w >> 12) as usize];
+        let n = [
+            (w & 0xF) as usize,
+            ((w >> 4) & 0xF) as usize,
+            ((w >> 8) & 0xF) as usize,
+            (w >> 12) as usize,
+        ];
         let mut lo = 0u8;
         let mut hi = 0u8;
         for (k, &nk) in n.iter().enumerate() {
@@ -374,7 +391,10 @@ mod tests {
     fn par2_input_constants() {
         // From the PAR2 specification: 2, 4, 16, 128, 256, 2048, 8192, 16384, 4107, 32856, 17132 ...
         let c = input_constants(11).unwrap();
-        assert_eq!(c, vec![2, 4, 16, 128, 256, 2048, 8192, 16384, 4107, 32856, 17132]);
+        assert_eq!(
+            c,
+            vec![2, 4, 16, 128, 256, 2048, 8192, 16384, 4107, 32856, 17132]
+        );
         let logs = input_constant_logs(5).unwrap();
         assert_eq!(logs, vec![1, 2, 4, 7, 8]);
         let all = input_constants(32768).unwrap();
@@ -423,7 +443,8 @@ mod tests {
         // Split layout equivalence.
         let n = 500;
         let (slo, shi): (Vec<u8>, Vec<u8>) = (0..n).map(|i| (src[2 * i], src[2 * i + 1])).unzip();
-        let (mut dlo, mut dhi): (Vec<u8>, Vec<u8>) = (0..n).map(|i| (orig[2 * i], orig[2 * i + 1])).unzip();
+        let (mut dlo, mut dhi): (Vec<u8>, Vec<u8>) =
+            (0..n).map(|i| (orig[2 * i], orig[2 * i + 1])).unzip();
         mul_acc_split_scalar(&mut dlo, &mut dhi, &slo, &shi, &mt);
         for i in 0..n {
             assert_eq!(dlo[i], dst[2 * i]);

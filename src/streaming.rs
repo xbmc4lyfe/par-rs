@@ -50,13 +50,16 @@
 //!    article writers (full queue → inline fold).
 
 use crate::crc::{crc32_combine, crc32_zeros};
-use crate::damage::{normalize_ranges, range_covered, ByteRange};
+use crate::damage::{ByteRange, normalize_ranges, range_covered};
+use crate::gf16::simd::{Kernel, MAX_MULTI, Plane, PlaneMut};
 use crate::gf16::{input_constant_logs, rs_coefficient};
-use crate::gf16::simd::{Kernel, Plane, PlaneMut, MAX_MULTI};
 use crate::hasher::slice_checksums;
-use crate::packet::{read_exact_at, FileSource};
-use crate::repairer::{io_ctx, write_all_at, BlockLocation, FileStatus, Level, Par2Repairer, RepairError, RepairObserver};
-use crate::scanner::{entries_for_file, BlockRef, ChecksumEntry};
+use crate::packet::{FileSource, read_exact_at};
+use crate::repairer::{
+    BlockLocation, FileStatus, Level, Par2Repairer, RepairError, RepairObserver, io_ctx,
+    write_all_at,
+};
+use crate::scanner::{BlockRef, ChecksumEntry, entries_for_file};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -80,7 +83,12 @@ pub struct StreamingOptions {
 
 impl Default for StreamingOptions {
     fn default() -> Self {
-        Self { exponents: None, expected_recovery_blocks: 0, max_memory_bytes: 512 << 20, threads: 0 }
+        Self {
+            exponents: None,
+            expected_recovery_blocks: 0,
+            max_memory_bytes: 512 << 20,
+            threads: 0,
+        }
     }
 }
 
@@ -164,7 +172,14 @@ pub(crate) struct SyndromeState {
 impl SyndromeState {
     /// Fold `data` (natural layout, zero padded to the slice size) of global block `g` into
     /// the syndromes `range`.
-    fn accumulate_into(&mut self, kernel: &crate::gf16::simd::Kernel, g: usize, data: &[u8], range: std::ops::Range<usize>, ss: usize) {
+    fn accumulate_into(
+        &mut self,
+        kernel: &crate::gf16::simd::Kernel,
+        g: usize,
+        data: &[u8],
+        range: std::ops::Range<usize>,
+        ss: usize,
+    ) {
         if range.is_empty() {
             return;
         }
@@ -183,7 +198,13 @@ impl SyndromeState {
         let syn = &mut self.syndromes[range.clone()];
         let exps = &exps[range];
         let k = syn.len();
-        let threads = if self.threads == 0 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) } else { self.threads };
+        let threads = if self.threads == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        } else {
+            self.threads
+        };
         let threads = threads.clamp(1, k.div_ceil(MAX_MULTI).max(1));
         let per = k.div_ceil(threads);
         let src_plane = Plane::from_halves(&src);
@@ -191,11 +212,15 @@ impl SyndromeState {
             for (syn_chunk, exp_chunk) in syn.chunks_mut(per).zip(exps.chunks(per)) {
                 s.spawn(move || {
                     let mut coeffs = [0u16; MAX_MULTI];
-                    for (group, egroup) in syn_chunk.chunks_mut(MAX_MULTI).zip(exp_chunk.chunks(MAX_MULTI)) {
+                    for (group, egroup) in syn_chunk
+                        .chunks_mut(MAX_MULTI)
+                        .zip(exp_chunk.chunks(MAX_MULTI))
+                    {
                         for (c, &e) in coeffs.iter_mut().zip(egroup) {
                             *c = rs_coefficient(logbase, e);
                         }
-                        let mut planes: Vec<PlaneMut> = group.iter_mut().map(|b| PlaneMut::from_halves(b)).collect();
+                        let mut planes: Vec<PlaneMut> =
+                            group.iter_mut().map(|b| PlaneMut::from_halves(b)).collect();
                         kernel.mul_acc_multi_split(&mut planes, src_plane, &coeffs[..egroup.len()]);
                     }
                 });
@@ -208,7 +233,10 @@ impl SyndromeState {
 impl Par2Repairer {
     /// Turn on streaming mode (after [`finalize`](Self::finalize)). Allocates one
     /// `slice_size` buffer per tracked exponent.
-    pub fn enable_streaming(&mut self, opts: &StreamingOptions) -> Result<StreamingStatus, RepairError> {
+    pub fn enable_streaming(
+        &mut self,
+        opts: &StreamingOptions,
+    ) -> Result<StreamingStatus, RepairError> {
         if !self.finalized {
             return Err(RepairError::NotFinalized);
         }
@@ -216,12 +244,18 @@ impl Par2Repairer {
         let total = self.locations.len();
         let mut exps: Vec<u32> = match &opts.exponents {
             Some(e) => e.clone(),
-            None if !self.packets.recovery.is_empty() => self.packets.recovery.keys().copied().collect(),
+            None if !self.packets.recovery.is_empty() => {
+                self.packets.recovery.keys().copied().collect()
+            }
             None => (0..opts.expected_recovery_blocks).collect(),
         };
         exps.sort_unstable();
         exps.dedup();
-        let cap = if ss == 0 { 0 } else { (opts.max_memory_bytes / ss as u64) as usize };
+        let cap = if ss == 0 {
+            0
+        } else {
+            (opts.max_memory_bytes / ss as u64) as usize
+        };
         exps.truncate(cap.min(exps.len()));
         let logs = input_constant_logs(total).map_err(|_| RepairError::Singular)?;
         let mut st = SyndromeState {
@@ -237,7 +271,9 @@ impl Par2Repairer {
             stats: StreamingStats::default(),
         };
         // Blocks already located (e.g. by a verify() before enabling) are folded now.
-        let located: Vec<usize> = (0..total).filter(|&g| self.locations[g].is_some()).collect();
+        let located: Vec<usize> = (0..total)
+            .filter(|&g| self.locations[g].is_some())
+            .collect();
         for g in located {
             let data = self.read_located_block(g)?;
             st.accumulate_into(&self.options.kernel, g, &data, 0..st.syndromes.len(), ss);
@@ -263,9 +299,15 @@ impl Par2Repairer {
         let st = self.streaming.as_ref()?;
         let total = self.locations.len() as u64;
         let verified = self.locations.iter().filter(|l| l.is_some()).count() as u64;
-        let damaged = (0..self.locations.len()).filter(|&g| self.locations[g].is_none() && st.damaged[g]).count() as u64;
+        let damaged = (0..self.locations.len())
+            .filter(|&g| self.locations[g].is_none() && st.damaged[g])
+            .count() as u64;
         let pending = total - verified - damaged;
-        let usable = st.exponents.iter().filter(|e| self.packets.recovery.contains_key(e)).count();
+        let usable = st
+            .exponents
+            .iter()
+            .filter(|e| self.packets.recovery.contains_key(e))
+            .count();
         let missing = damaged + pending;
         Some(StreamingStatus {
             tracked_exponents: st.exponents.len(),
@@ -305,8 +347,16 @@ impl Par2Repairer {
         let Some(st) = self.streaming.as_mut() else {
             return Err(RepairError::NotFinalized);
         };
-        let cap = if ss == 0 { 0 } else { (st.max_memory / ss as u64) as usize };
-        let mut new: Vec<u32> = more.iter().copied().filter(|e| !st.exponents.contains(e)).collect();
+        let cap = if ss == 0 {
+            0
+        } else {
+            (st.max_memory / ss as u64) as usize
+        };
+        let mut new: Vec<u32> = more
+            .iter()
+            .copied()
+            .filter(|e| !st.exponents.contains(e))
+            .collect();
         new.sort_unstable();
         new.dedup();
         let room = cap.saturating_sub(st.exponents.len());
@@ -320,7 +370,9 @@ impl Par2Repairer {
             st.syndromes.push(vec![0u8; ss]);
         }
         let range = first_new..st.exponents.len();
-        let accumulated: Vec<usize> = (0..st.accumulated.len()).filter(|&g| st.accumulated[g]).collect();
+        let accumulated: Vec<usize> = (0..st.accumulated.len())
+            .filter(|&g| st.accumulated[g])
+            .collect();
         for g in accumulated {
             let data = self.read_located_block(g)?;
             let st = self.streaming.as_mut().expect("streaming");
@@ -332,23 +384,46 @@ impl Par2Repairer {
     /// Report an article written to the target file of `file_index` at `offset`
     /// (`success == false` for a failed article). Blocks that became complete are read from
     /// the target file, verified and folded. Returns the blocks whose state changed.
-    pub fn streaming_segment_written(&mut self, file_index: usize, offset: u64, len: u64, success: bool) -> Result<Vec<BlockEvent>, RepairError> {
+    pub fn streaming_segment_written(
+        &mut self,
+        file_index: usize,
+        offset: u64,
+        len: u64,
+        success: bool,
+    ) -> Result<Vec<BlockEvent>, RepairError> {
         self.streaming_segment(file_index, offset, len, success, None)
     }
 
     /// Report a decoded article held in memory (also assumed to be written to the target file
     /// at the same offset). Blocks completed purely from staged data are verified without
     /// touching the disk.
-    pub fn streaming_segment_data(&mut self, file_index: usize, offset: u64, data: &[u8]) -> Result<Vec<BlockEvent>, RepairError> {
+    pub fn streaming_segment_data(
+        &mut self,
+        file_index: usize,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Vec<BlockEvent>, RepairError> {
         self.streaming_segment(file_index, offset, data.len() as u64, true, Some(data))
     }
 
     /// Report that a failed article's byte range will not arrive.
-    pub fn streaming_segment_failed(&mut self, file_index: usize, offset: u64, len: u64) -> Result<Vec<BlockEvent>, RepairError> {
+    pub fn streaming_segment_failed(
+        &mut self,
+        file_index: usize,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<BlockEvent>, RepairError> {
         self.streaming_segment(file_index, offset, len, false, None)
     }
 
-    fn streaming_segment(&mut self, file_index: usize, offset: u64, len: u64, success: bool, data: Option<&[u8]>) -> Result<Vec<BlockEvent>, RepairError> {
+    fn streaming_segment(
+        &mut self,
+        file_index: usize,
+        offset: u64,
+        len: u64,
+        success: bool,
+        data: Option<&[u8]>,
+    ) -> Result<Vec<BlockEvent>, RepairError> {
         if self.streaming.is_none() {
             return Err(RepairError::NotFinalized);
         }
@@ -374,7 +449,11 @@ impl Par2Repairer {
                 if self.locations[g].is_none() && !st.damaged[g] {
                     st.damaged[g] = true;
                     st.staged.remove(&g);
-                    events.push(BlockEvent { file_index, block_index: b as u32, state: BlockState::Damaged });
+                    events.push(BlockEvent {
+                        file_index,
+                        block_index: b as u32,
+                        state: BlockState::Damaged,
+                    });
                 }
             }
             return Ok(events);
@@ -401,10 +480,16 @@ impl Par2Repairer {
                     if s >= e {
                         continue;
                     }
-                    let staged = st.staged.entry(g).or_insert_with(|| Staged { buf: vec![0u8; (bend - bstart) as usize], ranges: Vec::new() });
+                    let staged = st.staged.entry(g).or_insert_with(|| Staged {
+                        buf: vec![0u8; (bend - bstart) as usize],
+                        ranges: Vec::new(),
+                    });
                     let rel = (s - bstart) as usize;
-                    staged.buf[rel..rel + (e - s) as usize].copy_from_slice(&d[(s - offset) as usize..(e - offset) as usize]);
-                    staged.ranges.push(ByteRange::new((s - bstart) as i64, (e - s) as i64));
+                    staged.buf[rel..rel + (e - s) as usize]
+                        .copy_from_slice(&d[(s - offset) as usize..(e - offset) as usize]);
+                    staged
+                        .ranges
+                        .push(ByteRange::new((s - bstart) as i64, (e - s) as i64));
                 }
             }
         }
@@ -433,26 +518,56 @@ impl Par2Repairer {
             let block: Vec<u8> = {
                 let st = self.streaming.as_mut().expect("streaming");
                 match st.staged.remove(&g) {
-                    Some(staged) if range_covered(&normalize_ranges(&staged.ranges), 0, (bend - bstart) as i64) => staged.buf,
+                    Some(staged)
+                        if range_covered(
+                            &normalize_ranges(&staged.ranges),
+                            0,
+                            (bend - bstart) as i64,
+                        ) =>
+                    {
+                        staged.buf
+                    }
                     _ => {
-                        let f = File::open(&target).map_err(io_ctx(format!("opening {}", target.display())))?;
+                        let f = File::open(&target)
+                            .map_err(io_ctx(format!("opening {}", target.display())))?;
                         let mut buf = vec![0u8; (bend - bstart) as usize];
-                        read_exact_at(&f, bstart, &mut buf).map_err(io_ctx(format!("reading {}", target.display())))?;
+                        read_exact_at(&f, bstart, &mut buf)
+                            .map_err(io_ctx(format!("reading {}", target.display())))?;
                         buf
                     }
                 }
             };
             let ok = self.streaming_verify_and_fold(file_index, b as u32, &block, &target)?;
-            events.push(BlockEvent { file_index, block_index: b as u32, state: if ok { BlockState::Verified } else { BlockState::Damaged } });
+            events.push(BlockEvent {
+                file_index,
+                block_index: b as u32,
+                state: if ok {
+                    BlockState::Verified
+                } else {
+                    BlockState::Damaged
+                },
+            });
         }
-        if !verifiable && range_covered(&self.streaming.as_ref().expect("streaming").coverage[file_index], 0, file_len as i64) {
+        if !verifiable
+            && range_covered(
+                &self.streaming.as_ref().expect("streaming").coverage[file_index],
+                0,
+                file_len as i64,
+            )
+        {
             events.extend(self.streaming_file_complete(file_index)?);
         }
         Ok(events)
     }
 
     /// Verify a complete block against its checksums; fold it when correct.
-    fn streaming_verify_and_fold(&mut self, file_index: usize, b: u32, block: &[u8], target: &std::path::Path) -> Result<bool, RepairError> {
+    fn streaming_verify_and_fold(
+        &mut self,
+        file_index: usize,
+        b: u32,
+        block: &[u8],
+        target: &std::path::Path,
+    ) -> Result<bool, RepairError> {
         let ss = self.block_size() as usize;
         let g = self.files[file_index].first_block + b as usize;
         let entry = self.checksums[file_index].as_ref().map(|cs| cs[b as usize]);
@@ -477,7 +592,16 @@ impl Par2Repairer {
         st.accumulated[g] = true;
         st.stats.blocks_folded += 1;
         let di = self.disk_file_index_pub(target);
-        self.set_location_pub(BlockRef { file_index: file_index as u32, block_index: b }, BlockLocation { file: di, offset: b as u64 * ss as u64 });
+        self.set_location_pub(
+            BlockRef {
+                file_index: file_index as u32,
+                block_index: b,
+            },
+            BlockLocation {
+                file: di,
+                offset: b as u64 * ss as u64,
+            },
+        );
         let f = &mut self.files[file_index];
         if f.available_blocks == f.block_count {
             f.status = FileStatus::Complete;
@@ -489,7 +613,10 @@ impl Par2Repairer {
 
     /// Declare a file fully written. Needed for files without IFSC packets (verified by whole
     /// file MD5 only); harmless otherwise. Returns the blocks whose state changed.
-    pub fn streaming_file_complete(&mut self, file_index: usize) -> Result<Vec<BlockEvent>, RepairError> {
+    pub fn streaming_file_complete(
+        &mut self,
+        file_index: usize,
+    ) -> Result<Vec<BlockEvent>, RepairError> {
         if self.streaming.is_none() {
             return Err(RepairError::NotFinalized);
         }
@@ -501,8 +628,10 @@ impl Par2Repairer {
             return Ok(events);
         }
         let target = f.target_path.clone();
-        let (first, count, expected_len, expected_md5) = (f.first_block, f.block_count, f.file_length, f.hash_full);
-        let h = crate::hasher::hash_file(&target).map_err(io_ctx(format!("hashing {}", target.display())))?;
+        let (first, count, expected_len, expected_md5) =
+            (f.first_block, f.block_count, f.file_length, f.hash_full);
+        let h = crate::hasher::hash_file(&target)
+            .map_err(io_ctx(format!("hashing {}", target.display())))?;
         let ok = h.len == expected_len && h.md5_full == expected_md5;
         if count == 0 {
             if ok {
@@ -514,7 +643,8 @@ impl Par2Repairer {
         let ss = self.block_size();
         if ok {
             let di = self.disk_file_index_pub(&target);
-            let fh = File::open(&target).map_err(io_ctx(format!("opening {}", target.display())))?;
+            let fh =
+                File::open(&target).map_err(io_ctx(format!("opening {}", target.display())))?;
             for b in 0..count {
                 let g = first + b as usize;
                 if self.locations[g].is_some() {
@@ -523,15 +653,29 @@ impl Par2Repairer {
                 let off = b as u64 * ss;
                 let len = (expected_len - off).min(ss) as usize;
                 let mut buf = vec![0u8; len];
-                read_exact_at(&fh, off, &mut buf).map_err(io_ctx(format!("reading {}", target.display())))?;
+                read_exact_at(&fh, off, &mut buf)
+                    .map_err(io_ctx(format!("reading {}", target.display())))?;
                 let st = self.streaming.as_mut().expect("streaming");
                 let n = st.syndromes.len();
                 st.accumulate_into(&self.options.kernel, g, &buf, 0..n, ss as usize);
                 st.accumulated[g] = true;
                 st.damaged[g] = false;
                 st.stats.blocks_folded += 1;
-                self.set_location_pub(BlockRef { file_index: file_index as u32, block_index: b }, BlockLocation { file: di, offset: off });
-                events.push(BlockEvent { file_index, block_index: b, state: BlockState::Verified });
+                self.set_location_pub(
+                    BlockRef {
+                        file_index: file_index as u32,
+                        block_index: b,
+                    },
+                    BlockLocation {
+                        file: di,
+                        offset: off,
+                    },
+                );
+                events.push(BlockEvent {
+                    file_index,
+                    block_index: b,
+                    state: BlockState::Verified,
+                });
             }
             let f = &mut self.files[file_index];
             f.status = FileStatus::Complete;
@@ -543,7 +687,11 @@ impl Par2Repairer {
                 let g = first + b as usize;
                 if self.locations[g].is_none() && !st.damaged[g] {
                     st.damaged[g] = true;
-                    events.push(BlockEvent { file_index, block_index: b, state: BlockState::Damaged });
+                    events.push(BlockEvent {
+                        file_index,
+                        block_index: b,
+                        state: BlockState::Damaged,
+                    });
                 }
             }
             self.files[file_index].status = FileStatus::Damaged;
@@ -552,16 +700,27 @@ impl Par2Repairer {
     }
 
     /// Fold every located but not yet accumulated block (used before a streaming repair).
-    pub(crate) fn streaming_backfill(&mut self, observer: &mut dyn RepairObserver) -> Result<(), RepairError> {
+    pub(crate) fn streaming_backfill(
+        &mut self,
+        observer: &mut dyn RepairObserver,
+    ) -> Result<(), RepairError> {
         let ss = self.block_size() as usize;
         let Some(st) = self.streaming.as_ref() else {
             return Ok(());
         };
-        let todo: Vec<usize> = (0..self.locations.len()).filter(|&g| self.locations[g].is_some() && !st.accumulated[g]).collect();
+        let todo: Vec<usize> = (0..self.locations.len())
+            .filter(|&g| self.locations[g].is_some() && !st.accumulated[g])
+            .collect();
         if todo.is_empty() {
             return Ok(());
         }
-        observer.message(Level::Detail, &format!("Folding {} late block(s) into the streamed syndromes", todo.len()));
+        observer.message(
+            Level::Detail,
+            &format!(
+                "Folding {} late block(s) into the streamed syndromes",
+                todo.len()
+            ),
+        );
         for g in todo {
             let data = self.read_located_block(g)?;
             let st = self.streaming.as_mut().expect("streaming");
@@ -576,7 +735,10 @@ impl Par2Repairer {
 
     /// In streaming mode, probe the not-yet-verified blocks of a target file at their natural
     /// offsets (the downloader writes articles in place, so a sliding scan is unnecessary).
-    pub(crate) fn streaming_probe_remaining(&mut self, file_index: usize) -> Result<(), RepairError> {
+    pub(crate) fn streaming_probe_remaining(
+        &mut self,
+        file_index: usize,
+    ) -> Result<(), RepairError> {
         let ss = self.block_size();
         let f = &self.files[file_index];
         let target = f.target_path.clone();
@@ -621,7 +783,8 @@ impl Par2Repairer {
         let avail = len.saturating_sub(loc.offset).min(ss as u64) as usize;
         let mut buf = vec![0u8; ss];
         if avail > 0 {
-            read_exact_at(&f, loc.offset, &mut buf[..avail]).map_err(io_ctx(format!("reading {}", path.display())))?;
+            read_exact_at(&f, loc.offset, &mut buf[..avail])
+                .map_err(io_ctx(format!("reading {}", path.display())))?;
         }
         Ok(buf)
     }
@@ -634,14 +797,16 @@ impl Par2Repairer {
     /// Number of recovery blocks still needed to repair right now in streaming mode (pending
     /// blocks count as missing), or the plain estimate otherwise.
     pub fn blocks_needed_now(&self) -> u64 {
-        self.streaming_status().map(|s| s.blocks_needed_now).unwrap_or_else(|| self.blocks_needed())
+        self.streaming_status()
+            .map(|s| s.blocks_needed_now)
+            .unwrap_or_else(|| self.blocks_needed())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::create::{create, CreateOptions, SourceFile, VolumeScheme};
+    use crate::create::{CreateOptions, SourceFile, VolumeScheme, create};
     use crate::repairer::{NullObserver, RepairOptions, RepairResult};
     use std::path::{Path, PathBuf};
 
@@ -676,13 +841,22 @@ mod tests {
             sources.push(SourceFile::new(dir.join(&name)));
             files.push((name, data));
         }
-        let opts = CreateOptions { slice_size: slice, recovery_blocks: recovery, volumes: VolumeScheme::Exponential, ..CreateOptions::default() };
+        let opts = CreateOptions {
+            slice_size: slice,
+            recovery_blocks: recovery,
+            volumes: VolumeScheme::Exponential,
+            ..CreateOptions::default()
+        };
         create(&sources, &dir, "set", &opts, None, &mut |_, _, _| {}).unwrap();
         // Remove the data files: the "download" recreates them.
         for (n, _) in &files {
             std::fs::remove_file(dir.join(n)).unwrap();
         }
-        Fx { main: dir.join("set.par2"), dir, files }
+        Fx {
+            main: dir.join("set.par2"),
+            dir,
+            files,
+        }
     }
 
     fn check_all(fx: &Fx) {
@@ -692,7 +866,12 @@ mod tests {
     }
 
     fn write_at(path: &Path, off: u64, data: &[u8]) {
-        let f = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(path).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
@@ -708,7 +887,10 @@ mod tests {
     }
 
     fn file_index(r: &Par2Repairer, name: &str) -> usize {
-        r.source_files().iter().position(|f| f.target_filename == name).unwrap()
+        r.source_files()
+            .iter()
+            .position(|f| f.target_filename == name)
+            .unwrap()
     }
 
     /// Simulated article order: a deterministic shuffle of segment indices.
@@ -750,7 +932,10 @@ mod tests {
         for (name, data) in &fx.files {
             let fi = file_index(&r, name);
             let path = fx.dir.join(name);
-            std::fs::File::create(&path).unwrap().set_len(data.len() as u64).unwrap();
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(data.len() as u64)
+                .unwrap();
             let n = data.len().div_ceil(article);
             for si in shuffled(n, 99) {
                 let off = si * article;
@@ -759,10 +944,16 @@ mod tests {
                 let fail = name == "part0.rar" && si % 11 == 3;
                 if fail {
                     failed_total += 1;
-                    events.extend(r.streaming_segment_failed(fi, off as u64, (end - off) as u64).unwrap());
+                    events.extend(
+                        r.streaming_segment_failed(fi, off as u64, (end - off) as u64)
+                            .unwrap(),
+                    );
                 } else {
                     write_at(&path, off as u64, &data[off..end]);
-                    events.extend(r.streaming_segment_written(fi, off as u64, (end - off) as u64, true).unwrap());
+                    events.extend(
+                        r.streaming_segment_written(fi, off as u64, (end - off) as u64, true)
+                            .unwrap(),
+                    );
                 }
             }
         }
@@ -774,28 +965,50 @@ mod tests {
         assert!(st.repair_possible_now);
         assert_eq!(st.blocks_needed_now, 0);
         assert_eq!(r.blocks_needed_now(), 0);
-        let verified_events = events.iter().filter(|e| e.state == BlockState::Verified).count() as u64;
+        let verified_events = events
+            .iter()
+            .filter(|e| e.state == BlockState::Verified)
+            .count() as u64;
         assert_eq!(verified_events, st.verified_blocks);
-        assert_eq!(r.block_state(file_index(&r, "part1.rar"), 0), Some(BlockState::Verified));
+        assert_eq!(
+            r.block_state(file_index(&r, "part1.rar"), 0),
+            Some(BlockState::Verified)
+        );
         assert_eq!(r.block_state(0, 9999), None);
         let stats = r.streaming_stats().unwrap();
         assert_eq!(stats.blocks_folded, st.verified_blocks);
         assert_eq!(stats.blocks_rejected, 0);
         // part1 and part2 are complete already; part0 is damaged.
-        assert_eq!(r.source_files()[file_index(&r, "part1.rar")].status, FileStatus::Complete);
-        assert_ne!(r.source_files()[file_index(&r, "part0.rar")].status, FileStatus::Complete);
+        assert_eq!(
+            r.source_files()[file_index(&r, "part1.rar")].status,
+            FileStatus::Complete
+        );
+        assert_ne!(
+            r.source_files()[file_index(&r, "part0.rar")].status,
+            FileStatus::Complete
+        );
 
         // verify() must not rescan: only probes remaining blocks, which are the failed ones.
         let mut obs = Msgs::default();
         let v = r.verify(None, &mut obs).unwrap();
         assert_eq!(v.missing_blocks, st.damaged_blocks);
         assert!(v.repair_possible);
-        assert_eq!(r.source_files()[file_index(&r, "part0.rar")].status, FileStatus::Damaged);
+        assert_eq!(
+            r.source_files()[file_index(&r, "part0.rar")].status,
+            FileStatus::Damaged
+        );
         // The probe re-read only the unverified blocks; nothing new was folded.
-        assert_eq!(r.streaming_stats().unwrap().blocks_folded, st.verified_blocks);
+        assert_eq!(
+            r.streaming_stats().unwrap().blocks_folded,
+            st.verified_blocks
+        );
         let res = r.repair(&mut obs).unwrap();
         assert!(matches!(res, RepairResult::Repaired { .. }));
-        assert!(obs.0.iter().any(|m| m.contains("using streamed syndromes")), "{:?}", obs.0);
+        assert!(
+            obs.0.iter().any(|m| m.contains("using streamed syndromes")),
+            "{:?}",
+            obs.0
+        );
         check_all(&fx);
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
@@ -806,13 +1019,20 @@ mod tests {
         let mut r = Par2Repairer::new(&fx.dir, RepairOptions::default());
         r.load_par2_set(&fx.main).unwrap();
         r.finalize().unwrap();
-        r.enable_streaming(&StreamingOptions { threads: 2, ..StreamingOptions::default() }).unwrap();
+        r.enable_streaming(&StreamingOptions {
+            threads: 2,
+            ..StreamingOptions::default()
+        })
+        .unwrap();
         let article = 500usize;
         let mut rejected = 0;
         for (name, data) in &fx.files {
             let fi = file_index(&r, name);
             let path = fx.dir.join(name);
-            std::fs::File::create(&path).unwrap().set_len(data.len() as u64).unwrap();
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(data.len() as u64)
+                .unwrap();
             let n = data.len().div_ceil(article);
             for si in shuffled(n, 7) {
                 let off = si * article;
@@ -829,7 +1049,10 @@ mod tests {
             }
         }
         assert!(rejected >= 1);
-        assert_eq!(r.streaming_stats().unwrap().blocks_rejected as usize, rejected);
+        assert_eq!(
+            r.streaming_stats().unwrap().blocks_rejected as usize,
+            rejected
+        );
         let st = r.streaming_status().unwrap();
         assert_eq!(st.pending_blocks, 0);
         assert_eq!(st.damaged_blocks as usize, rejected);
@@ -838,18 +1061,39 @@ mod tests {
         let d1 = &fx.files[1].1;
         let (off, end) = (4 * article, (5 * article).min(d1.len()));
         write_at(&fx.dir.join("part1.rar"), off as u64, &d1[off..end]);
-        let ev = r.streaming_segment_data(fi1, off as u64, &d1[off..end]).unwrap();
+        let ev = r
+            .streaming_segment_data(fi1, off as u64, &d1[off..end])
+            .unwrap();
         assert!(ev.iter().all(|e| e.state == BlockState::Verified));
         let st = r.streaming_status().unwrap();
         assert_eq!(st.damaged_blocks, 0);
         assert_eq!(st.verified_blocks, st.total_blocks);
-        assert!(r.source_files().iter().all(|f| f.status == FileStatus::Complete));
-        assert_eq!(r.repair(&mut NullObserver).unwrap(), RepairResult::NotNeeded);
+        assert!(
+            r.source_files()
+                .iter()
+                .all(|f| f.status == FileStatus::Complete)
+        );
+        assert_eq!(
+            r.repair(&mut NullObserver).unwrap(),
+            RepairResult::NotNeeded
+        );
         check_all(&fx);
         // Out-of-range / empty segments are ignored.
-        assert!(r.streaming_segment_written(fi1, 10_000_000, 10, true).unwrap().is_empty());
-        assert!(r.streaming_segment_written(fi1, 0, 0, true).unwrap().is_empty());
-        assert!(r.streaming_segment_written(99, 0, 10, true).unwrap().is_empty());
+        assert!(
+            r.streaming_segment_written(fi1, 10_000_000, 10, true)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            r.streaming_segment_written(fi1, 0, 0, true)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            r.streaming_segment_written(99, 0, 10, true)
+                .unwrap()
+                .is_empty()
+        );
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
 
@@ -865,7 +1109,8 @@ mod tests {
             let fi = file_index(&r, name);
             let path = fx.dir.join(name);
             std::fs::write(&path, data).unwrap();
-            r.streaming_segment_written(fi, 0, data.len() as u64, true).unwrap();
+            r.streaming_segment_written(fi, 0, data.len() as u64, true)
+                .unwrap();
         }
         // Damage one block of part0 after the fact: report its article as failed.
         let fi0 = file_index(&r, "part0.rar");
@@ -884,7 +1129,16 @@ mod tests {
         let _ = fi0;
         let mut obs = Msgs::default();
         let res = r.repair(&mut obs).unwrap();
-        assert!(matches!(res, RepairResult::Repaired { blocks_recovered: 6, .. }), "{res:?}");
+        assert!(
+            matches!(
+                res,
+                RepairResult::Repaired {
+                    blocks_recovered: 6,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
         check_all(&fx); // part2 reconstructed without ever being downloaded
         assert!(obs.0.iter().any(|m| m.contains("streamed")));
         std::fs::remove_dir_all(&fx.dir).unwrap();
@@ -898,21 +1152,32 @@ mod tests {
         r.load_par2_file(&fx.main).unwrap();
         r.finalize().unwrap();
         // Expect 6 recovery blocks (from .vol names), but cap memory to 4 syndromes.
-        let st = r.enable_streaming(&StreamingOptions { expected_recovery_blocks: 6, max_memory_bytes: 4 * 1000, ..Default::default() }).unwrap();
+        let st = r
+            .enable_streaming(&StreamingOptions {
+                expected_recovery_blocks: 6,
+                max_memory_bytes: 4 * 1000,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(st.tracked_exponents, 4);
         assert_eq!(st.usable_recovery, 0);
         // Download everything except 3 blocks of part0 (articles 1000 bytes, aligned).
         for (name, data) in &fx.files {
             let fi = file_index(&r, name);
             let path = fx.dir.join(name);
-            std::fs::File::create(&path).unwrap().set_len(data.len() as u64).unwrap();
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(data.len() as u64)
+                .unwrap();
             for (si, chunk) in data.chunks(1000).enumerate() {
                 if name == "part0.rar" && matches!(si, 2 | 9 | 15) {
-                    r.streaming_segment_failed(fi, (si * 1000) as u64, 1000).unwrap();
+                    r.streaming_segment_failed(fi, (si * 1000) as u64, 1000)
+                        .unwrap();
                     continue;
                 }
                 write_at(&path, (si * 1000) as u64, chunk);
-                r.streaming_segment_written(fi, (si * 1000) as u64, chunk.len() as u64, true).unwrap();
+                r.streaming_segment_written(fi, (si * 1000) as u64, chunk.len() as u64, true)
+                    .unwrap();
             }
         }
         let st = r.streaming_status().unwrap();
@@ -920,7 +1185,11 @@ mod tests {
         assert!(!st.repair_possible_now); // no recovery packets loaded yet
         assert_eq!(st.blocks_needed_now, 3);
         // Volumes arrive now (as in a download queue with par2 files last).
-        for v in ["set.vol00+01.par2", "set.vol01+02.par2", "set.vol03+03.par2"] {
+        for v in [
+            "set.vol00+01.par2",
+            "set.vol01+02.par2",
+            "set.vol03+03.par2",
+        ] {
             r.load_par2_file(&fx.dir.join(v)).unwrap();
         }
         let st = r.streaming_status().unwrap();
@@ -932,14 +1201,25 @@ mod tests {
         assert_eq!(r2.streaming_track_exponents(&[4, 5]).unwrap(), 4); // cap reached → unchanged
         r2.disable_streaming();
         assert!(!r2.streaming_enabled());
-        let st = r2.enable_streaming(&StreamingOptions { max_memory_bytes: 1 << 20, ..Default::default() }).unwrap();
+        let st = r2
+            .enable_streaming(&StreamingOptions {
+                max_memory_bytes: 1 << 20,
+                ..Default::default()
+            })
+            .unwrap();
         // Re-enabling folds the already located blocks immediately.
         assert_eq!(st.tracked_exponents, 6);
         assert_eq!(st.verified_blocks, 27);
         assert_eq!(r2.streaming_track_exponents(&[7, 8]).unwrap(), 8); // untracked exponents: syndromes computed by backfill
         assert_eq!(r2.streaming_track_exponents(&[7]).unwrap(), 8);
         let res = r2.repair(&mut NullObserver).unwrap();
-        assert!(matches!(res, RepairResult::Repaired { blocks_recovered: 3, .. }));
+        assert!(matches!(
+            res,
+            RepairResult::Repaired {
+                blocks_recovered: 3,
+                ..
+            }
+        ));
         check_all(&fx);
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
@@ -949,19 +1229,31 @@ mod tests {
         let fx = fixture("noifsc", &[3000, 2000], 1000, 4);
         // Strip part0's IFSC from every par2 file.
         let id0 = {
-            let set = crate::packet::load_par2_file(&fx.main, crate::packet::ScanOptions::FULL).unwrap();
-            set.file_descs.values().find(|d| d.name == b"part0.rar").unwrap().file_id
+            let set =
+                crate::packet::load_par2_file(&fx.main, crate::packet::ScanOptions::FULL).unwrap();
+            set.file_descs
+                .values()
+                .find(|d| d.name == b"part0.rar")
+                .unwrap()
+                .file_id
         };
         for entry in std::fs::read_dir(&fx.dir).unwrap() {
             let p = entry.unwrap().path();
             if p.extension().is_some_and(|e| e == "par2") {
                 let bytes = std::fs::read(&p).unwrap();
-                let raws: Vec<_> = crate::packet::PacketIter::new(&bytes[..], crate::packet::ScanOptions::UNVERIFIED).map(|x| x.unwrap()).collect();
+                let raws: Vec<_> = crate::packet::PacketIter::new(
+                    &bytes[..],
+                    crate::packet::ScanOptions::UNVERIFIED,
+                )
+                .map(|x| x.unwrap())
+                .collect();
                 let mut out = Vec::new();
                 for raw in raws {
                     let s = raw.offset as usize;
                     let e = s + raw.header.length as usize;
-                    if raw.header.kind() == crate::packet::PacketType::Ifsc && bytes[s + 64..s + 80] == id0.0 {
+                    if raw.header.kind() == crate::packet::PacketType::Ifsc
+                        && bytes[s + 64..s + 80] == id0.0
+                    {
                         continue;
                     }
                     out.extend_from_slice(&bytes[s..e]);
@@ -970,10 +1262,22 @@ mod tests {
             }
         }
         let mut r = Par2Repairer::new(&fx.dir, RepairOptions::default());
-        assert!(matches!(r.enable_streaming(&StreamingOptions::default()), Err(RepairError::NotFinalized)));
-        assert!(matches!(r.streaming_segment_written(0, 0, 1, true), Err(RepairError::NotFinalized)));
-        assert!(matches!(r.streaming_file_complete(0), Err(RepairError::NotFinalized)));
-        assert!(matches!(r.streaming_track_exponents(&[1]), Err(RepairError::NotFinalized)));
+        assert!(matches!(
+            r.enable_streaming(&StreamingOptions::default()),
+            Err(RepairError::NotFinalized)
+        ));
+        assert!(matches!(
+            r.streaming_segment_written(0, 0, 1, true),
+            Err(RepairError::NotFinalized)
+        ));
+        assert!(matches!(
+            r.streaming_file_complete(0),
+            Err(RepairError::NotFinalized)
+        ));
+        assert!(matches!(
+            r.streaming_track_exponents(&[1]),
+            Err(RepairError::NotFinalized)
+        ));
         assert!(r.streaming_status().is_none());
         assert!(r.block_state(0, 0).is_none());
         r.load_par2_set(&fx.main).unwrap();
@@ -984,23 +1288,32 @@ mod tests {
         let d0 = &fx.files[0].1;
         let d1 = &fx.files[1].1;
         std::fs::write(fx.dir.join("part1.rar"), d1).unwrap();
-        r.streaming_segment_written(fi1, 0, d1.len() as u64, true).unwrap();
+        r.streaming_segment_written(fi1, 0, d1.len() as u64, true)
+            .unwrap();
         // part0 without IFSC: segments alone cannot verify blocks; the whole file does.
         let p0 = fx.dir.join("part0.rar");
-        std::fs::File::create(&p0).unwrap().set_len(d0.len() as u64).unwrap();
+        std::fs::File::create(&p0)
+            .unwrap()
+            .set_len(d0.len() as u64)
+            .unwrap();
         write_at(&p0, 0, &d0[..1500]);
         let ev = r.streaming_segment_written(fi0, 0, 1500, true).unwrap();
         assert!(ev.is_empty());
         assert_eq!(r.block_state(fi0, 0), Some(BlockState::Pending));
         write_at(&p0, 1500, &d0[1500..]);
-        let ev = r.streaming_segment_written(fi0, 1500, (d0.len() - 1500) as u64, true).unwrap();
+        let ev = r
+            .streaming_segment_written(fi0, 1500, (d0.len() - 1500) as u64, true)
+            .unwrap();
         assert_eq!(ev.len(), 3);
         assert!(ev.iter().all(|e| e.state == BlockState::Verified));
         assert_eq!(r.streaming_status().unwrap().pending_blocks, 0);
         assert!(r.streaming_file_complete(fi0).unwrap().is_empty()); // already complete
         assert!(r.streaming_file_complete(fi1).unwrap().is_empty()); // verifiable file: no-op
         assert!(r.streaming_file_complete(42).unwrap().is_empty());
-        assert_eq!(r.repair(&mut NullObserver).unwrap(), RepairResult::NotNeeded);
+        assert_eq!(
+            r.repair(&mut NullObserver).unwrap(),
+            RepairResult::NotNeeded
+        );
 
         // Damaged unverifiable file: declared complete with wrong content → all blocks damaged.
         let mut r = Par2Repairer::new(&fx.dir, RepairOptions::default());
@@ -1015,12 +1328,19 @@ mod tests {
         assert_eq!(ev.len(), 3);
         assert!(ev.iter().all(|e| e.state == BlockState::Damaged));
         let fi1 = file_index(&r, "part1.rar");
-        r.streaming_segment_written(fi1, 0, d1.len() as u64, true).unwrap();
+        r.streaming_segment_written(fi1, 0, d1.len() as u64, true)
+            .unwrap();
         let st = r.streaming_status().unwrap();
         assert_eq!(st.damaged_blocks, 3);
         assert!(st.repair_possible_now);
         r.verify(None, &mut NullObserver).unwrap();
-        assert!(matches!(r.repair(&mut NullObserver).unwrap(), RepairResult::Repaired { blocks_recovered: 3, .. }));
+        assert!(matches!(
+            r.repair(&mut NullObserver).unwrap(),
+            RepairResult::Repaired {
+                blocks_recovered: 3,
+                ..
+            }
+        ));
         check_all(&fx);
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
@@ -1051,7 +1371,13 @@ mod tests {
         // The probe verified and folded the 18 good unreported blocks directly.
         assert_eq!(r.streaming_stats().unwrap().blocks_folded, 38);
         let mut obs = Msgs::default();
-        assert!(matches!(r.repair(&mut obs).unwrap(), RepairResult::Repaired { blocks_recovered: 2, .. }));
+        assert!(matches!(
+            r.repair(&mut obs).unwrap(),
+            RepairResult::Repaired {
+                blocks_recovered: 2,
+                ..
+            }
+        ));
         assert_eq!(r.streaming_stats().unwrap().blocks_folded, 38);
         check_all(&fx);
 
@@ -1065,9 +1391,19 @@ mod tests {
         // Target never arrives; a renamed complete copy exists elsewhere in the directory.
         std::fs::write(fx2.dir.join("renamed.bin"), d).unwrap();
         r.verify(None, &mut NullObserver).unwrap();
-        assert_eq!(r.add_extra_files_from_dir(&fx2.dir, &mut NullObserver).unwrap(), 20);
+        assert_eq!(
+            r.add_extra_files_from_dir(&fx2.dir, &mut NullObserver)
+                .unwrap(),
+            20
+        );
         let mut obs = Msgs::default();
-        assert!(matches!(r.repair(&mut obs).unwrap(), RepairResult::Repaired { blocks_recovered: 0, .. }));
+        assert!(matches!(
+            r.repair(&mut obs).unwrap(),
+            RepairResult::Repaired {
+                blocks_recovered: 0,
+                ..
+            }
+        ));
         check_all(&fx2);
         // Now damage: delete one block's worth and let the repairer fold late blocks.
         let mut dmg = d.clone();
@@ -1079,7 +1415,13 @@ mod tests {
         r.verify(None, &mut NullObserver).unwrap(); // locates 19 blocks before streaming is on
         r.enable_streaming(&StreamingOptions::default()).unwrap(); // folds them
         assert_eq!(r.streaming_stats().unwrap().blocks_folded, 19);
-        assert!(matches!(r.repair(&mut NullObserver).unwrap(), RepairResult::Repaired { blocks_recovered: 1, .. }));
+        assert!(matches!(
+            r.repair(&mut NullObserver).unwrap(),
+            RepairResult::Repaired {
+                blocks_recovered: 1,
+                ..
+            }
+        ));
         check_all(&fx2);
         std::fs::remove_dir_all(&fx2.dir).unwrap();
         std::fs::remove_dir_all(&fx.dir).unwrap();
@@ -1094,10 +1436,12 @@ mod tests {
 
 use crate::filenames::select_more_pars;
 use crate::packet::{FileId, PacketSet, ScanOptions, SetId};
-use crate::reed_solomon::{plan_recovery, Engine, EngineConfig, InputKind, InputSpec, Matrix, OutputSink};
+use crate::reed_solomon::{
+    Engine, EngineConfig, InputKind, InputSpec, Matrix, OutputSink, plan_recovery,
+};
 use crate::repairer::{RepairReader, SliceSrc};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 
 /// State of one PAR2 slice during a live download.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1270,12 +1614,17 @@ pub struct BitVec {
 impl BitVec {
     /// Bitset with `n` cleared bits.
     pub fn new(n: usize) -> Self {
-        Self { words: vec![0; n.div_ceil(64)], ones: 0 }
+        Self {
+            words: vec![0; n.div_ceil(64)],
+            ones: 0,
+        }
     }
     /// Bit `i`.
     #[inline]
     pub fn get(&self, i: usize) -> bool {
-        self.words.get(i / 64).is_some_and(|w| (w >> (i % 64)) & 1 == 1)
+        self.words
+            .get(i / 64)
+            .is_some_and(|w| (w >> (i % 64)) & 1 == 1)
     }
     /// Set bit `i`; returns whether it was previously clear.
     #[inline]
@@ -1398,11 +1747,22 @@ impl StreamingParSession {
     /// Create a session from the metadata packets of a set (Main + FileDesc + IFSC; recovery
     /// packets, if any are loaded already, seed the syndrome exponents). Target files live in
     /// `base_dir`.
-    pub fn new(set: &PacketSet, base_dir: &Path, opts: SessionOptions) -> Result<Self, RepairError> {
+    pub fn new(
+        set: &PacketSet,
+        base_dir: &Path,
+        opts: SessionOptions,
+    ) -> Result<Self, RepairError> {
         let main = set.main.as_ref().ok_or(RepairError::NoMainPacket)?;
-        let missing: Vec<FileId> = main.recoverable_file_ids.iter().filter(|id| !set.file_descs.contains_key(id)).copied().collect();
+        let missing: Vec<FileId> = main
+            .recoverable_file_ids
+            .iter()
+            .filter(|id| !set.file_descs.contains_key(id))
+            .copied()
+            .collect();
         if !missing.is_empty() {
-            return Err(RepairError::IncompleteMetadata { missing_descriptions: missing });
+            return Err(RepairError::IncompleteMetadata {
+                missing_descriptions: missing,
+            });
         }
         let ss = main.slice_size as usize;
         let mut files = Vec::new();
@@ -1411,7 +1771,11 @@ impl StreamingParSession {
         for (fi, id) in main.recoverable_file_ids.iter().enumerate() {
             let fd = &set.file_descs[id];
             let count = main.slice_count_for(fd.file_length) as usize;
-            let checksums = set.ifscs.get(id).filter(|p| p.slices.len() == count && count > 0).map(|p| entries_for_file(fi as u32, &p.slices));
+            let checksums = set
+                .ifscs
+                .get(id)
+                .filter(|p| p.slices.len() == count && count > 0)
+                .map(|p| entries_for_file(fi as u32, &p.slices));
             files.push(LiveFile {
                 file_id: *id,
                 target_path: base_dir.join(fd.local_name()),
@@ -1433,15 +1797,31 @@ impl StreamingParSession {
         // canonical sequence 0, 1, 2, ...
         let mut exps: Vec<u32> = set.recovery.keys().copied().collect();
         let mut e = 0u32;
-        while exps.len() < opts.preallocated_syndrome_slots.min(opts.max_syndrome_slots) {
+        while exps.len()
+            < opts
+                .preallocated_syndrome_slots
+                .min(opts.max_syndrome_slots)
+        {
             if !exps.contains(&e) {
                 exps.push(e);
             }
             e += 1;
         }
-        exps.truncate(opts.preallocated_syndrome_slots.min(opts.max_syndrome_slots));
-        let slots: Vec<Arc<Mutex<SyndromeSlot>>> =
-            exps.iter().map(|&exponent| Arc::new(Mutex::new(SyndromeSlot { exponent, data: vec![0u8; ss], folded_mask: BitVec::new(total), recovery_added: false }))).collect();
+        exps.truncate(
+            opts.preallocated_syndrome_slots
+                .min(opts.max_syndrome_slots),
+        );
+        let slots: Vec<Arc<Mutex<SyndromeSlot>>> = exps
+            .iter()
+            .map(|&exponent| {
+                Arc::new(Mutex::new(SyndromeSlot {
+                    exponent,
+                    data: vec![0u8; ss],
+                    folded_mask: BitVec::new(total),
+                    recovery_added: false,
+                }))
+            })
+            .collect();
         let slots: SlotList = Arc::new(RwLock::new(slots));
         let pool = (opts.fold_threads > 0).then(|| {
             let pending = Arc::new((Mutex::new(0usize), Condvar::new()));
@@ -1492,7 +1872,9 @@ impl StreamingParSession {
             inline_folds: AtomicUsize::new(0),
             opts,
         };
-        Ok(Self { inner: Arc::new(inner) })
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
     /// Set id.
@@ -1506,7 +1888,11 @@ impl StreamingParSession {
     }
 
     fn file(&self, id: &FileId) -> Result<usize, RepairError> {
-        self.inner.file_index.get(id).copied().ok_or(RepairError::UnknownFile(*id))
+        self.inner
+            .file_index
+            .get(id)
+            .copied()
+            .ok_or(RepairError::UnknownFile(*id))
     }
 
     fn set_state(t: &mut Tracker, g: usize, new: SliceState) -> bool {
@@ -1528,28 +1914,60 @@ impl StreamingParSession {
     /// in `libpar2` order for ties.
     pub fn file_id_by_name(&self, name: &[u8]) -> Option<FileId> {
         let files = &self.inner.files;
-        if let Some(f) = files.iter().find(|f| f.raw_name.as_slice() == name || f.local_name.as_bytes() == name) {
+        if let Some(f) = files
+            .iter()
+            .find(|f| f.raw_name.as_slice() == name || f.local_name.as_bytes() == name)
+        {
             return Some(f.file_id);
         }
         let lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
-        files.iter().find(|f| f.raw_name.iter().map(|b| b.to_ascii_lowercase()).eq(lower.iter().copied()) || f.local_name.to_ascii_lowercase().as_bytes() == lower.as_slice()).map(|f| f.file_id)
+        files
+            .iter()
+            .find(|f| {
+                f.raw_name
+                    .iter()
+                    .map(|b| b.to_ascii_lowercase())
+                    .eq(lower.iter().copied())
+                    || f.local_name.to_ascii_lowercase().as_bytes() == lower.as_slice()
+            })
+            .map(|f| f.file_id)
     }
 
     /// File id of the first file (in `libpar2` order) whose 16k hash matches: the key a
     /// downloader has after article 1 of an obfuscated file.
     pub fn file_id_by_hash16k(&self, hash_16k: &[u8; 16]) -> Option<FileId> {
-        self.inner.files.iter().find(|f| f.hash_16k == *hash_16k).map(|f| f.file_id)
+        self.inner
+            .files
+            .iter()
+            .find(|f| f.hash_16k == *hash_16k)
+            .map(|f| f.file_id)
     }
 
     /// [`on_article_finished`](Self::on_article_finished) keyed by file name.
-    pub fn on_article_finished_by_name(&self, name: &[u8], offset: u64, size: u64, crc32: u32, bytes: Option<&[u8]>) -> Result<ArticleOutcome, RepairError> {
-        let id = self.file_id_by_name(name).ok_or(RepairError::UnknownFile(FileId([0; 16])))?;
+    pub fn on_article_finished_by_name(
+        &self,
+        name: &[u8],
+        offset: u64,
+        size: u64,
+        crc32: u32,
+        bytes: Option<&[u8]>,
+    ) -> Result<ArticleOutcome, RepairError> {
+        let id = self
+            .file_id_by_name(name)
+            .ok_or(RepairError::UnknownFile(FileId([0; 16])))?;
         self.on_article_finished(&id, offset, size, crc32, bytes)
     }
 
     /// [`on_article_failed_permanently`](Self::on_article_failed_permanently) keyed by file name.
-    pub fn on_article_failed_permanently_by_name(&self, name: &[u8], offset: u64, size: u64) -> Result<(Vec<SliceEvent>, Option<UnpauseAction>), RepairError> {
-        let id = self.file_id_by_name(name).ok_or(RepairError::UnknownFile(FileId([0; 16])))?;
+    pub fn on_article_failed_permanently_by_name(
+        &self,
+        name: &[u8],
+        offset: u64,
+        size: u64,
+    ) -> Result<(Vec<SliceEvent>, Option<UnpauseAction>), RepairError> {
+        let id = self
+            .file_id_by_name(name)
+            .ok_or(RepairError::UnknownFile(FileId([0; 16])))?;
         self.on_article_failed_permanently(&id, offset, size)
     }
 
@@ -1565,7 +1983,11 @@ impl StreamingParSession {
     }
 
     /// Current state of a slice.
-    pub fn slice_state(&self, file_id: &FileId, slice_idx: usize) -> Result<SliceState, RepairError> {
+    pub fn slice_state(
+        &self,
+        file_id: &FileId,
+        slice_idx: usize,
+    ) -> Result<SliceState, RepairError> {
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
         if slice_idx >= f.slice_count {
@@ -1594,7 +2016,11 @@ impl StreamingParSession {
         if d == 0 && u == 0 {
             VolumeStatus::CompleteAndVerified
         } else {
-            VolumeStatus::Incomplete { verified: v, damaged: d, unarrived: u }
+            VolumeStatus::Incomplete {
+                verified: v,
+                damaged: d,
+                unarrived: u,
+            }
         }
     }
 
@@ -1605,8 +2031,18 @@ impl StreamingParSession {
         let in_flight: i64 = t.unpaused_in_flight.values().map(|&b| b as i64).sum();
         let damaged = t.counts[3] as i64;
         let unarrived = t.counts[0] + t.counts[1];
-        let slots = self.inner.slots.read().unwrap_or_else(|e| e.into_inner()).len();
-        let pending = self.inner.pool.as_ref().map(|p| *p.pending.0.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or(0);
+        let slots = self
+            .inner
+            .slots
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        let pending = self
+            .inner
+            .pool
+            .as_ref()
+            .map(|p| *p.pending.0.lock().unwrap_or_else(|e| e.into_inner()))
+            .unwrap_or(0);
         LiveStatus {
             unarrived: t.counts[0],
             partially_arrived: t.counts[1],
@@ -1631,7 +2067,12 @@ impl StreamingParSession {
         if needed <= 0 {
             return None;
         }
-        let mut paused: Vec<(i32, u64)> = t.queued_volumes.iter().filter(|v| v.paused).map(|v| (v.blocks.max(0), v.id)).collect();
+        let mut paused: Vec<(i32, u64)> = t
+            .queued_volumes
+            .iter()
+            .filter(|v| v.paused)
+            .map(|v| (v.blocks.max(0), v.id))
+            .collect();
         paused.sort_unstable();
         let counts: Vec<i32> = paused.iter().map(|(b, _)| *b).collect();
         let (selected, _available) = select_more_pars(&counts, needed.min(i32::MAX as i64) as i32);
@@ -1646,12 +2087,21 @@ impl StreamingParSession {
                 v.paused = false;
             }
         }
-        Some(UnpauseAction { volume_ids_to_unpause: ids, blocks_requested: blocks, shortfall: (needed - blocks).max(0) })
+        Some(UnpauseAction {
+            volume_ids_to_unpause: ids,
+            blocks_requested: blocks,
+            shortfall: (needed - blocks).max(0),
+        })
     }
 
     /// An article failed on every server and fallback round: its slices are damaged now.
     /// Returns an unpause instruction when more recovery blocks must be fetched.
-    pub fn on_article_failed_permanently(&self, file_id: &FileId, offset: u64, size: u64) -> Result<(Vec<SliceEvent>, Option<UnpauseAction>), RepairError> {
+    pub fn on_article_failed_permanently(
+        &self,
+        file_id: &FileId,
+        offset: u64,
+        size: u64,
+    ) -> Result<(Vec<SliceEvent>, Option<UnpauseAction>), RepairError> {
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
@@ -1671,7 +2121,11 @@ impl StreamingParSession {
                 t.staging_bytes -= st.buf.len() as u64;
             }
             if Self::set_state(&mut t, g, SliceState::Damaged) {
-                events.push(SliceEvent { file_id: *file_id, slice_idx: b, state: SliceState::Damaged });
+                events.push(SliceEvent {
+                    file_id: *file_id,
+                    slice_idx: b,
+                    state: SliceState::Damaged,
+                });
             }
         }
         let action = Self::schedule_unpause(&mut t);
@@ -1682,7 +2136,14 @@ impl StreamingParSession {
     /// `crc32` is the decoded article CRC (yEnc); `bytes` the decoded data when still in RAM
     /// (`ArticleCache`). Completed slices are verified on the calling thread without holding
     /// any lock and folded into the syndromes.
-    pub fn on_article_finished(&self, file_id: &FileId, offset: u64, size: u64, crc32: u32, bytes: Option<&[u8]>) -> Result<ArticleOutcome, RepairError> {
+    pub fn on_article_finished(
+        &self,
+        file_id: &FileId,
+        offset: u64,
+        size: u64,
+        crc32: u32,
+        bytes: Option<&[u8]>,
+    ) -> Result<ArticleOutcome, RepairError> {
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
@@ -1724,9 +2185,13 @@ impl StreamingParSession {
                         if !have {
                             t.staging_bytes += slen as u64;
                         }
-                        let st = t.staging.entry(g).or_insert_with(|| LiveStaged { buf: vec![0u8; slen], ranges: Vec::new() });
+                        let st = t.staging.entry(g).or_insert_with(|| LiveStaged {
+                            buf: vec![0u8; slen],
+                            ranges: Vec::new(),
+                        });
                         let rel = (s - sstart) as usize;
-                        st.buf[rel..rel + (e - s) as usize].copy_from_slice(&d[(s - offset) as usize..(e - offset) as usize]);
+                        st.buf[rel..rel + (e - s) as usize]
+                            .copy_from_slice(&d[(s - offset) as usize..(e - offset) as usize]);
                         st.ranges.push(ByteRange::new(rel as i64, (e - s) as i64));
                     }
                 }
@@ -1756,11 +2221,19 @@ impl StreamingParSession {
                                 ok = false;
                                 break;
                             }
-                            acc = if i == 0 { *c } else { crc32_combine(acc, *c, *l) };
+                            acc = if i == 0 {
+                                *c
+                            } else {
+                                crc32_combine(acc, *c, *l)
+                            };
                             pos += l;
                         }
                         if ok && pos == slen as u64 {
-                            quick = Some(if (slen as u64) < ss { crc32_zeros(acc, ss - slen as u64) } else { acc });
+                            quick = Some(if (slen as u64) < ss {
+                                crc32_zeros(acc, ss - slen as u64)
+                            } else {
+                                acc
+                            });
                         }
                     }
                     completed.push((g, staged, quick));
@@ -1787,12 +2260,20 @@ impl StreamingParSession {
                     Self::set_state(&mut t, g, SliceState::VerifiedGood);
                     drop(t);
                     self.fold(g, data);
-                    out.events.push(SliceEvent { file_id: *file_id, slice_idx: b, state: SliceState::VerifiedGood });
+                    out.events.push(SliceEvent {
+                        file_id: *file_id,
+                        slice_idx: b,
+                        state: SliceState::VerifiedGood,
+                    });
                 }
                 None => {
                     Self::set_state(&mut t, g, SliceState::Damaged);
                     damaged_any = true;
-                    out.events.push(SliceEvent { file_id: *file_id, slice_idx: b, state: SliceState::Damaged });
+                    out.events.push(SliceEvent {
+                        file_id: *file_id,
+                        slice_idx: b,
+                        state: SliceState::Damaged,
+                    });
                 }
             }
         }
@@ -1806,7 +2287,13 @@ impl StreamingParSession {
     /// Verify slice `b` of file `fi`: `staged` bytes if available, otherwise read from the
     /// target file. `quick` is the pre-combined article CRC (ParQuick). Returns the slice data
     /// (unpadded) when valid. Runs lock-free.
-    fn verify_slice_bytes(&self, fi: usize, b: usize, staged: Option<Vec<u8>>, quick: Option<u32>) -> Result<Option<Vec<u8>>, RepairError> {
+    fn verify_slice_bytes(
+        &self,
+        fi: usize,
+        b: usize,
+        staged: Option<Vec<u8>>,
+        quick: Option<u32>,
+    ) -> Result<Option<Vec<u8>>, RepairError> {
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
         let Some(cs) = f.checksums.as_ref() else {
@@ -1815,17 +2302,20 @@ impl StreamingParSession {
         };
         let entry = cs[b];
         if let Some(q) = quick
-            && q != entry.crc32 {
-                return Ok(None);
-            }
+            && q != entry.crc32
+        {
+            return Ok(None);
+        }
         let data = match staged {
             Some(d) => d,
             None => {
                 let off = b as u64 * ss;
                 let len = (f.length - off).min(ss) as usize;
-                let fh = File::open(&f.target_path).map_err(io_ctx(format!("opening {}", f.target_path.display())))?;
+                let fh = File::open(&f.target_path)
+                    .map_err(io_ctx(format!("opening {}", f.target_path.display())))?;
                 let mut buf = vec![0u8; len];
-                read_exact_at(&fh, off, &mut buf).map_err(io_ctx(format!("reading {}", f.target_path.display())))?;
+                read_exact_at(&fh, off, &mut buf)
+                    .map_err(io_ctx(format!("reading {}", f.target_path.display())))?;
                 buf
             }
         };
@@ -1853,12 +2343,19 @@ impl StreamingParSession {
         {
             let (lo, hi) = split.split_at_mut(words);
             let n = data.len().min(ss) / 2;
-            self.inner.opts.kernel.deinterleave(&data[..2 * n], &mut lo[..n], &mut hi[..n]);
+            self.inner
+                .opts
+                .kernel
+                .deinterleave(&data[..2 * n], &mut lo[..n], &mut hi[..n]);
             if data.len().min(ss) % 2 == 1 {
                 lo[n] = data[2 * n];
             }
         }
-        let job = Arc::new(FoldJob { slice: g, logbase: self.inner.logs[g], split: Arc::new(split) });
+        let job = Arc::new(FoldJob {
+            slice: g,
+            logbase: self.inner.logs[g],
+            split: Arc::new(split),
+        });
         self.inner.folds.fetch_add(1, Ordering::Relaxed);
         match &self.inner.pool {
             None => fold_lane(&self.inner.opts.kernel, &self.inner.slots, &job, 0, 1),
@@ -1896,7 +2393,10 @@ impl StreamingParSession {
 
     /// Slices folded so far and folds performed inline because a folder queue was full.
     pub fn fold_stats(&self) -> (u64, usize) {
-        (self.inner.folds.load(Ordering::Relaxed), self.inner.inline_folds.load(Ordering::Relaxed))
+        (
+            self.inner.folds.load(Ordering::Relaxed),
+            self.inner.inline_folds.load(Ordering::Relaxed),
+        )
     }
 
     /// Bring every slot's `folded_mask` up to date with the verified slices by re-reading the
@@ -1906,12 +2406,28 @@ impl StreamingParSession {
         self.flush();
         let verified: Vec<usize> = {
             let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
-            (0..t.states.len()).filter(|&g| t.states[g] == SliceState::VerifiedGood).collect()
+            (0..t.states.len())
+                .filter(|&g| t.states[g] == SliceState::VerifiedGood)
+                .collect()
         };
-        let slots: Vec<Arc<Mutex<SyndromeSlot>>> = self.inner.slots.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let slots: Vec<Arc<Mutex<SyndromeSlot>>> = self
+            .inner
+            .slots
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let ss = self.inner.slice_size;
         for g in verified {
-            let needs: Vec<Arc<Mutex<SyndromeSlot>>> = slots.iter().filter(|s| !s.lock().unwrap_or_else(|e| e.into_inner()).folded_mask.get(g)).cloned().collect();
+            let needs: Vec<Arc<Mutex<SyndromeSlot>>> = slots
+                .iter()
+                .filter(|s| {
+                    !s.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .folded_mask
+                        .get(g)
+                })
+                .cloned()
+                .collect();
             if needs.is_empty() {
                 continue;
             }
@@ -1920,7 +2436,10 @@ impl StreamingParSession {
             {
                 let (lo, hi) = split.split_at_mut(ss / 2);
                 let n = data.len() / 2;
-                self.inner.opts.kernel.deinterleave(&data[..2 * n], &mut lo[..n], &mut hi[..n]);
+                self.inner
+                    .opts
+                    .kernel
+                    .deinterleave(&data[..2 * n], &mut lo[..n], &mut hi[..n]);
                 if data.len() % 2 == 1 {
                     lo[n] = data[2 * n];
                 }
@@ -1939,14 +2458,21 @@ impl StreamingParSession {
     }
 
     fn read_slice_from_disk(&self, g: usize) -> Result<Vec<u8>, RepairError> {
-        let fi = self.inner.files.iter().position(|f| g >= f.first_slice && g < f.first_slice + f.slice_count).expect("slice belongs to a file");
+        let fi = self
+            .inner
+            .files
+            .iter()
+            .position(|f| g >= f.first_slice && g < f.first_slice + f.slice_count)
+            .expect("slice belongs to a file");
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
         let off = (g - f.first_slice) as u64 * ss;
         let len = (f.length - off).min(ss) as usize;
-        let fh = File::open(&f.target_path).map_err(io_ctx(format!("opening {}", f.target_path.display())))?;
+        let fh = File::open(&f.target_path)
+            .map_err(io_ctx(format!("opening {}", f.target_path.display())))?;
         let mut buf = vec![0u8; len];
-        read_exact_at(&fh, off, &mut buf).map_err(io_ctx(format!("reading {}", f.target_path.display())))?;
+        read_exact_at(&fh, off, &mut buf)
+            .map_err(io_ctx(format!("reading {}", f.target_path.display())))?;
         Ok(buf)
     }
 
@@ -1954,9 +2480,14 @@ impl StreamingParSession {
     /// recovery slice into the syndrome of its exponent (allocating a slot and back-filling it
     /// from disk when the exponent was not pre-allocated). `queued_id` clears the in-flight
     /// accounting of the scheduler. Returns the number of recovery slices absorbed.
-    pub fn on_recovery_volume_arrived(&self, path: &Path, queued_id: Option<u64>) -> Result<usize, RepairError> {
+    pub fn on_recovery_volume_arrived(
+        &self,
+        path: &Path,
+        queued_id: Option<u64>,
+    ) -> Result<usize, RepairError> {
         let mut set = PacketSet::for_set(self.inner.set_id);
-        set.load_file(path, 0, ScanOptions::FULL).map_err(io_ctx(format!("loading {}", path.display())))?;
+        set.load_file(path, 0, ScanOptions::FULL)
+            .map_err(io_ctx(format!("loading {}", path.display())))?;
         let src = FileSource::open(path).map_err(io_ctx(format!("opening {}", path.display())))?;
         let ss = self.inner.slice_size;
         let mut absorbed = 0usize;
@@ -1972,7 +2503,8 @@ impl StreamingParSession {
                 }
             }
             let mut data = vec![0u8; ss];
-            r.read_data(&src, 0, &mut data).map_err(io_ctx("reading recovery slice"))?;
+            r.read_data(&src, 0, &mut data)
+                .map_err(io_ctx("reading recovery slice"))?;
             // Split layout for XOR into the slot.
             let mut split = vec![0u8; ss];
             {
@@ -1981,7 +2513,9 @@ impl StreamingParSession {
             }
             let slot = {
                 let list = self.inner.slots.read().unwrap_or_else(|e| e.into_inner());
-                list.iter().find(|s| s.lock().unwrap_or_else(|e| e.into_inner()).exponent == *e).cloned()
+                list.iter()
+                    .find(|s| s.lock().unwrap_or_else(|e| e.into_inner()).exponent == *e)
+                    .cloned()
             };
             let slot = match slot {
                 Some(s) => s,
@@ -1991,7 +2525,12 @@ impl StreamingParSession {
                         continue;
                     }
                     let total = self.inner.logs.len();
-                    let s = Arc::new(Mutex::new(SyndromeSlot { exponent: *e, data: vec![0u8; ss], folded_mask: BitVec::new(total), recovery_added: false }));
+                    let s = Arc::new(Mutex::new(SyndromeSlot {
+                        exponent: *e,
+                        data: vec![0u8; ss],
+                        folded_mask: BitVec::new(total),
+                        recovery_added: false,
+                    }));
                     list.push(Arc::clone(&s));
                     need_backfill = true;
                     s
@@ -2034,11 +2573,21 @@ impl StreamingParSession {
     /// (from a duplicate posting or twin set); they are combined in RAM with the on-disk bytes
     /// of every touched slice and verified against IFSC. Matching slices are written to
     /// `disk_file`, marked verified and folded. Returns the healed slice indices.
-    pub fn try_splice_live_slice(&self, file_id: &FileId, hole_range: ByteRange, candidate_bytes: &[u8], disk_file: &Path) -> Result<Vec<usize>, RepairError> {
+    pub fn try_splice_live_slice(
+        &self,
+        file_id: &FileId,
+        hole_range: ByteRange,
+        candidate_bytes: &[u8],
+        disk_file: &Path,
+    ) -> Result<Vec<usize>, RepairError> {
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
-        if hole_range.is_empty() || (candidate_bytes.len() as i64) < hole_range.size || hole_range.offset < 0 || f.slice_count == 0 {
+        if hole_range.is_empty()
+            || (candidate_bytes.len() as i64) < hole_range.size
+            || hole_range.offset < 0
+            || f.slice_count == 0
+        {
             return Ok(Vec::new());
         }
         let hs = hole_range.offset as u64;
@@ -2047,7 +2596,13 @@ impl StreamingParSession {
             return Ok(Vec::new());
         }
         let (b0, b1) = ((hs / ss) as usize, ((he - 1) / ss) as usize);
-        let fh = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(disk_file).map_err(io_ctx(format!("opening {}", disk_file.display())))?;
+        let fh = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(disk_file)
+            .map_err(io_ctx(format!("opening {}", disk_file.display())))?;
         let disk_len = fh.metadata().map(|m| m.len()).unwrap_or(0);
         let mut healed = Vec::new();
         for b in b0..=b1.min(f.slice_count - 1) {
@@ -2064,15 +2619,18 @@ impl StreamingParSession {
             let mut buf = vec![0u8; slen];
             let avail = disk_len.saturating_sub(sstart).min(slen as u64) as usize;
             if avail > 0 {
-                read_exact_at(&fh, sstart, &mut buf[..avail]).map_err(io_ctx(format!("reading {}", disk_file.display())))?;
+                read_exact_at(&fh, sstart, &mut buf[..avail])
+                    .map_err(io_ctx(format!("reading {}", disk_file.display())))?;
             }
             let s = hs.max(sstart);
             let e = he.min(send);
-            buf[(s - sstart) as usize..(e - sstart) as usize].copy_from_slice(&candidate_bytes[(s - hs) as usize..(e - hs) as usize]);
+            buf[(s - sstart) as usize..(e - sstart) as usize]
+                .copy_from_slice(&candidate_bytes[(s - hs) as usize..(e - hs) as usize]);
             let Some(data) = self.verify_slice_bytes_direct(fi, b, buf)? else {
                 continue;
             };
-            write_all_at(&fh, sstart, &data).map_err(io_ctx(format!("writing {}", disk_file.display())))?;
+            write_all_at(&fh, sstart, &data)
+                .map_err(io_ctx(format!("writing {}", disk_file.display())))?;
             let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
             if t.states[g] == SliceState::VerifiedGood {
                 continue;
@@ -2091,7 +2649,12 @@ impl StreamingParSession {
         Ok(healed)
     }
 
-    fn verify_slice_bytes_direct(&self, fi: usize, b: usize, data: Vec<u8>) -> Result<Option<Vec<u8>>, RepairError> {
+    fn verify_slice_bytes_direct(
+        &self,
+        fi: usize,
+        b: usize,
+        data: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, RepairError> {
         self.verify_slice_bytes(fi, b, Some(data), None)
     }
 
@@ -2099,7 +2662,10 @@ impl StreamingParSession {
     /// as an erasure, invert the `K×K` recovery matrix and compute **only** the rows for the
     /// non-verified slices of `target_file_ids`, patching them into the target files on disk.
     /// Each target's whole-file MD5 is checked afterwards.
-    pub fn repair_available_targets_now(&self, target_file_ids: &[FileId]) -> Result<EarlyRepairReport, RepairError> {
+    pub fn repair_available_targets_now(
+        &self,
+        target_file_ids: &[FileId],
+    ) -> Result<EarlyRepairReport, RepairError> {
         for id in target_file_ids {
             self.file(id)?;
         }
@@ -2107,13 +2673,24 @@ impl StreamingParSession {
         let ss = self.inner.slice_size;
         let (missing, present, ready_exps): (Vec<usize>, Vec<bool>, Vec<u32>) = {
             let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
-            let present: Vec<bool> = t.states.iter().map(|s| *s == SliceState::VerifiedGood).collect();
+            let present: Vec<bool> = t
+                .states
+                .iter()
+                .map(|s| *s == SliceState::VerifiedGood)
+                .collect();
             let missing: Vec<usize> = (0..present.len()).filter(|&g| !present[g]).collect();
-            (missing, present, t.ready_exponents.iter().copied().collect())
+            (
+                missing,
+                present,
+                t.ready_exponents.iter().copied().collect(),
+            )
         };
         let k = missing.len();
         if k > ready_exps.len() {
-            return Err(RepairError::NotEnoughRecovery { needed: k as u64, available: ready_exps.len() as u64 });
+            return Err(RepairError::NotEnoughRecovery {
+                needed: k as u64,
+                available: ready_exps.len() as u64,
+            });
         }
         // Rows to compute: non-verified slices of the target files.
         let mut rows: Vec<usize> = Vec::new();
@@ -2123,7 +2700,12 @@ impl StreamingParSession {
         }
         rows.sort_unstable();
         rows.dedup();
-        let mut report = EarlyRepairReport { erasures: k, recovery_used: 0, repaired_slices: Vec::new(), files: Vec::new() };
+        let mut report = EarlyRepairReport {
+            erasures: k,
+            recovery_used: 0,
+            repaired_slices: Vec::new(),
+            files: Vec::new(),
+        };
         if rows.is_empty() || k == 0 {
             for id in target_file_ids {
                 let (st, ok) = self.check_target(id)?;
@@ -2131,44 +2713,92 @@ impl StreamingParSession {
             }
             return Ok(report);
         }
-        let plan = plan_recovery(&self.inner.logs, &present, &ready_exps, &self.inner.opts.kernel).map_err(|e| match e {
-            crate::reed_solomon::RsError::NotEnoughRecovery { needed, available } => RepairError::NotEnoughRecovery { needed: needed as u64, available: available as u64 },
+        let plan = plan_recovery(
+            &self.inner.logs,
+            &present,
+            &ready_exps,
+            &self.inner.opts.kernel,
+        )
+        .map_err(|e| match e {
+            crate::reed_solomon::RsError::NotEnoughRecovery { needed, available } => {
+                RepairError::NotEnoughRecovery {
+                    needed: needed as u64,
+                    available: available as u64,
+                }
+            }
             _ => RepairError::Singular,
         })?;
         report.recovery_used = plan.used_exponents.len();
         // Sub-matrix: the rows of A⁻¹ for the requested slices.
         let mut sub = Matrix::zeros(rows.len(), k);
         for (ri, &g) in rows.iter().enumerate() {
-            let m = plan.missing.iter().position(|&x| x == g).expect("row is missing");
+            let m = plan
+                .missing
+                .iter()
+                .position(|&x| x == g)
+                .expect("row is missing");
             for j in 0..k {
                 sub.set(ri, j, plan.inverse.get(m, j));
             }
         }
         // Take the used syndromes out of their slots for the duration of the solve.
         self.flush();
-        let slots: Vec<Arc<Mutex<SyndromeSlot>>> = self.inner.slots.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let slots: Vec<Arc<Mutex<SyndromeSlot>>> = self
+            .inner
+            .slots
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut taken: Vec<(Arc<Mutex<SyndromeSlot>>, Vec<u8>)> = Vec::with_capacity(k);
         for &e in &plan.used_exponents {
-            let slot = slots.iter().find(|s| s.lock().unwrap_or_else(|e| e.into_inner()).exponent == e).expect("ready exponent has a slot").clone();
+            let slot = slots
+                .iter()
+                .find(|s| s.lock().unwrap_or_else(|e| e.into_inner()).exponent == e)
+                .expect("ready exponent has a slot")
+                .clone();
             let data = std::mem::take(&mut slot.lock().unwrap_or_else(|e| e.into_inner()).data);
             taken.push((slot, data));
         }
         let mem: Vec<Vec<u8>> = taken.iter().map(|(_, d)| d.clone()).collect();
-        let specs: Vec<InputSpec> = (0..k).map(|j| InputSpec { kind: InputKind::Recovery { output: j }, source: j }).collect();
-        let reader = RepairReader { files: Vec::new(), by_path: HashMap::new(), slices: (0..k).map(SliceSrc::Mem).collect(), mem: &mem, kernel: self.inner.opts.kernel };
+        let specs: Vec<InputSpec> = (0..k)
+            .map(|j| InputSpec {
+                kind: InputKind::Recovery { output: j },
+                source: j,
+            })
+            .collect();
+        let reader = RepairReader {
+            files: Vec::new(),
+            by_path: HashMap::new(),
+            slices: (0..k).map(SliceSrc::Mem).collect(),
+            mem: &mem,
+            kernel: self.inner.opts.kernel,
+        };
         // Outputs: rows → (file, offset, len); patch directly into the target files.
         let mut out_map: Vec<(usize, u64, u64)> = Vec::with_capacity(rows.len());
         let mut targets: HashMap<usize, File> = HashMap::new();
         for &g in &rows {
-            let fi = self.inner.files.iter().position(|f| g >= f.first_slice && g < f.first_slice + f.slice_count).expect("slice belongs to a file");
+            let fi = self
+                .inner
+                .files
+                .iter()
+                .position(|f| g >= f.first_slice && g < f.first_slice + f.slice_count)
+                .expect("slice belongs to a file");
             let f = &self.inner.files[fi];
             if let std::collections::hash_map::Entry::Vacant(slot) = targets.entry(fi) {
                 if let Some(p) = f.target_path.parent() {
-                    std::fs::create_dir_all(p).map_err(io_ctx(format!("creating {}", p.display())))?;
+                    std::fs::create_dir_all(p)
+                        .map_err(io_ctx(format!("creating {}", p.display())))?;
                 }
-                let fh = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&f.target_path).map_err(io_ctx(format!("opening {}", f.target_path.display())))?;
+                let fh = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&f.target_path)
+                    .map_err(io_ctx(format!("opening {}", f.target_path.display())))?;
                 if fh.metadata().map(|m| m.len()).unwrap_or(0) < f.length {
-                    fh.set_len(f.length).map_err(io_ctx(format!("sizing {}", f.target_path.display())))?;
+                    fh.set_len(f.length)
+                        .map_err(io_ctx(format!("sizing {}", f.target_path.display())))?;
                 }
                 slot.insert(fh);
             }
@@ -2189,15 +2819,34 @@ impl StreamingParSession {
             }
             Ok(())
         };
-        let config = EngineConfig { num_threads: self.inner.opts.solve_threads, mem_limit_bytes: self.inner.opts.solve_mem_limit_bytes, ..EngineConfig::default() };
-        let engine = Engine { slice_size: ss as u64, inputs: &specs, output_exponents: &plan.used_exponents, post_transform: Some(&sub), config, kernel: self.inner.opts.kernel };
-        let run = engine.run(&reader, &mut sink as &mut dyn OutputSink, None, &mut |_, _, _, _| {});
+        let config = EngineConfig {
+            num_threads: self.inner.opts.solve_threads,
+            mem_limit_bytes: self.inner.opts.solve_mem_limit_bytes,
+            ..EngineConfig::default()
+        };
+        let engine = Engine {
+            slice_size: ss as u64,
+            inputs: &specs,
+            output_exponents: &plan.used_exponents,
+            post_transform: Some(&sub),
+            config,
+            kernel: self.inner.opts.kernel,
+        };
+        let run = engine.run(
+            &reader,
+            &mut sink as &mut dyn OutputSink,
+            None,
+            &mut |_, _, _, _| {},
+        );
         // Return the syndromes to their slots before handling the result.
         for (slot, data) in taken {
             slot.lock().unwrap_or_else(|e| e.into_inner()).data = data;
         }
         run.map_err(|e| match e {
-            crate::reed_solomon::RsError::Io(e) => RepairError::Io { context: "early repair".into(), source: e },
+            crate::reed_solomon::RsError::Io(e) => RepairError::Io {
+                context: "early repair".into(),
+                source: e,
+            },
             crate::reed_solomon::RsError::Cancelled => RepairError::Cancelled,
             _ => RepairError::Singular,
         })?;
@@ -2206,7 +2855,12 @@ impl StreamingParSession {
         }
         // Mark and fold the reconstructed slices so later solves see them as verified.
         for (ri, &g) in rows.iter().enumerate() {
-            let fi = self.inner.files.iter().position(|f| g >= f.first_slice && g < f.first_slice + f.slice_count).expect("file");
+            let fi = self
+                .inner
+                .files
+                .iter()
+                .position(|f| g >= f.first_slice && g < f.first_slice + f.slice_count)
+                .expect("file");
             let f = &self.inner.files[fi];
             let b = g - f.first_slice;
             let (_, _, block_len) = out_map[ri];
@@ -2238,7 +2892,9 @@ impl StreamingParSession {
             Self::volume_status_locked(&t, f)
         };
         let ok = if st == VolumeStatus::CompleteAndVerified {
-            crate::hasher::hash_file(&f.target_path).map(|h| h.md5_full == f.hash_full && h.len == f.length).unwrap_or(false)
+            crate::hasher::hash_file(&f.target_path)
+                .map(|h| h.md5_full == f.hash_full && h.len == f.length)
+                .unwrap_or(false)
         } else {
             false
         };
@@ -2256,8 +2912,8 @@ const _: fn() = || {
 mod live_tests {
     use super::*;
     use crate::crc::crc32;
-    use crate::create::{create, CreateOptions, SourceFile, VolumeScheme};
-    use crate::packet::{load_par2_file, PacketIter, PacketType, ScanOptions};
+    use crate::create::{CreateOptions, SourceFile, VolumeScheme, create};
+    use crate::packet::{PacketIter, PacketType, ScanOptions, load_par2_file};
     use std::path::Path;
 
     fn rnd(n: usize, seed: u64) -> Vec<u8> {
@@ -2293,21 +2949,41 @@ mod live_tests {
             sources.push(SourceFile::new(dir.join(&name)));
             files.push((name, data));
         }
-        let opts = CreateOptions { slice_size: slice, recovery_blocks: recovery, volumes: scheme, ..CreateOptions::default() };
+        let opts = CreateOptions {
+            slice_size: slice,
+            recovery_blocks: recovery,
+            volumes: scheme,
+            ..CreateOptions::default()
+        };
         let rep = create(&sources, &dir, "set", &opts, None, &mut |_, _, _| {}).unwrap();
         for (n, _) in &files {
             std::fs::remove_file(dir.join(n)).unwrap();
         }
         let set = load_par2_file(&rep.files[0], ScanOptions::FULL).unwrap();
-        Fx { dir, files, set, vols: rep.files[1..].to_vec() }
+        Fx {
+            dir,
+            files,
+            set,
+            vols: rep.files[1..].to_vec(),
+        }
     }
 
     fn fid(fx: &Fx, name: &str) -> FileId {
-        fx.set.file_descs.values().find(|d| d.name == name.as_bytes()).unwrap().file_id
+        fx.set
+            .file_descs
+            .values()
+            .find(|d| d.name == name.as_bytes())
+            .unwrap()
+            .file_id
     }
 
     fn write_at(path: &Path, off: u64, data: &[u8]) {
-        let f = OpenOptions::new().create(true).write(true).truncate(false).open(path).unwrap();
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
         write_all_at(&f, off, data).unwrap();
     }
 
@@ -2324,7 +3000,10 @@ mod live_tests {
     }
 
     fn vol_blocks(p: &Path) -> i32 {
-        crate::filenames::volume_blocks_bytes(&crate::filenames::os_str_bytes(p.file_name().unwrap())).unwrap() as i32
+        crate::filenames::volume_blocks_bytes(&crate::filenames::os_str_bytes(
+            p.file_name().unwrap(),
+        ))
+        .unwrap() as i32
     }
 
     #[test]
@@ -2340,29 +3019,66 @@ mod live_tests {
 
     #[test]
     fn tracker_states_scheduler_and_in_flight_accounting() {
-        let fx = fixture("sched", &[20_000, 10_000], 1000, 12, VolumeScheme::Uniform(1));
-        let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions { preallocated_syndrome_slots: 4, ..Default::default() }).unwrap();
+        let fx = fixture(
+            "sched",
+            &[20_000, 10_000],
+            1000,
+            12,
+            VolumeScheme::Uniform(1),
+        );
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                preallocated_syndrome_slots: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(s.set_id(), fx.set.set_id.unwrap());
         assert_eq!(s.slice_size(), 1000);
         // Twelve paused one-block volumes in the queue.
         for (i, v) in fx.vols.iter().enumerate() {
-            s.register_queued_volume(QueuedVolume { id: 100 + i as u64, blocks: vol_blocks(v), paused: true });
+            s.register_queued_volume(QueuedVolume {
+                id: 100 + i as u64,
+                blocks: vol_blocks(v),
+                paused: true,
+            });
         }
         let f0 = fid(&fx, "part00.rar");
         let f1 = fid(&fx, "part01.rar");
         let d0 = &fx.files[0].1;
         let p0 = fx.dir.join("part00.rar");
-        std::fs::File::create(&p0).unwrap().set_len(d0.len() as u64).unwrap();
+        std::fs::File::create(&p0)
+            .unwrap()
+            .set_len(d0.len() as u64)
+            .unwrap();
         // Articles of 700 bytes; first article arrives → slice 0 partially arrived.
         write_at(&p0, 0, &d0[..700]);
-        let out = s.on_article_finished(&f0, 0, 700, crc32(&d0[..700]), None).unwrap();
+        let out = s
+            .on_article_finished(&f0, 0, 700, crc32(&d0[..700]), None)
+            .unwrap();
         assert!(out.events.is_empty());
-        assert_eq!(s.slice_state(&f0, 0).unwrap(), SliceState::PartiallyArrived { covered: vec![ByteRange::new(0, 700)] });
+        assert_eq!(
+            s.slice_state(&f0, 0).unwrap(),
+            SliceState::PartiallyArrived {
+                covered: vec![ByteRange::new(0, 700)]
+            }
+        );
         assert_eq!(s.status().partially_arrived, 1);
         // Second article completes slice 0 and partially covers slice 1.
         write_at(&p0, 700, &d0[700..1400]);
-        let out = s.on_article_finished(&f0, 700, 700, crc32(&d0[700..1400]), Some(&d0[700..1400])).unwrap();
-        assert_eq!(out.events, vec![SliceEvent { file_id: f0, slice_idx: 0, state: SliceState::VerifiedGood }]);
+        let out = s
+            .on_article_finished(&f0, 700, 700, crc32(&d0[700..1400]), Some(&d0[700..1400]))
+            .unwrap();
+        assert_eq!(
+            out.events,
+            vec![SliceEvent {
+                file_id: f0,
+                slice_idx: 0,
+                state: SliceState::VerifiedGood
+            }]
+        );
         assert!(out.unpause.is_none());
         assert_eq!(s.status().verified, 1);
         // Permanent failure of an article spanning slices 2 and 3 → damaged, 2 blocks needed → unpause two 1-block volumes.
@@ -2381,12 +3097,20 @@ mod live_tests {
         let (_, action2) = s.on_article_failed_permanently(&f0, 5000, 10).unwrap();
         let action2 = action2.unwrap();
         assert_eq!(action2.volume_ids_to_unpause.len(), 1);
-        assert!(!action.volume_ids_to_unpause.contains(&action2.volume_ids_to_unpause[0]));
+        assert!(
+            !action
+                .volume_ids_to_unpause
+                .contains(&action2.volume_ids_to_unpause[0])
+        );
         // Repeated failure on the same slice: no new action.
         let (ev, action3) = s.on_article_failed_permanently(&f0, 5000, 10).unwrap();
         assert!(ev.is_empty() && action3.is_none());
         // Unpaused volumes arrive: in-flight drops, ready rises.
-        for id in action.volume_ids_to_unpause.iter().chain(action2.volume_ids_to_unpause.iter()) {
+        for id in action
+            .volume_ids_to_unpause
+            .iter()
+            .chain(action2.volume_ids_to_unpause.iter())
+        {
             let v = &fx.vols[(*id - 100) as usize];
             assert_eq!(s.on_recovery_volume_arrived(v, Some(*id)).unwrap(), 1);
         }
@@ -2395,12 +3119,35 @@ mod live_tests {
         assert_eq!(st.ready_recovery, 3);
         assert_eq!(st.needed_recovery_blocks, 0);
         // Unknown file / bad index.
-        assert!(matches!(s.on_article_finished(&FileId([9; 16]), 0, 1, 0, None), Err(RepairError::UnknownFile(_))));
-        assert!(matches!(s.slice_state(&f1, 999), Err(RepairError::UnknownFile(_))));
-        assert_eq!(s.volume_status(&f1).unwrap(), VolumeStatus::Incomplete { verified: 0, damaged: 0, unarrived: 10 });
+        assert!(matches!(
+            s.on_article_finished(&FileId([9; 16]), 0, 1, 0, None),
+            Err(RepairError::UnknownFile(_))
+        ));
+        assert!(matches!(
+            s.slice_state(&f1, 999),
+            Err(RepairError::UnknownFile(_))
+        ));
+        assert_eq!(
+            s.volume_status(&f1).unwrap(),
+            VolumeStatus::Incomplete {
+                verified: 0,
+                damaged: 0,
+                unarrived: 10
+            }
+        );
         // Out-of-range articles are ignored.
-        assert!(s.on_article_finished(&f0, 10_000_000, 5, 0, None).unwrap().events.is_empty());
-        assert!(s.on_article_failed_permanently(&f0, 10_000_000, 5).unwrap().0.is_empty());
+        assert!(
+            s.on_article_finished(&f0, 10_000_000, 5, 0, None)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert!(
+            s.on_article_failed_permanently(&f0, 10_000_000, 5)
+                .unwrap()
+                .0
+                .is_empty()
+        );
         // Scheduler shortfall when nothing is left to unpause.
         for b in 6..20 {
             let _ = s.on_article_failed_permanently(&f0, b * 1000, 1).unwrap();
@@ -2415,11 +3162,26 @@ mod live_tests {
     /// scheduler asks for them; at the end an early cutover repairs everything without any
     /// re-read of the data files.
     fn simulate(fold_threads: usize, with_bytes: bool) {
-        let fx = fixture(&format!("sim{fold_threads}{with_bytes}"), &[60_000, 35_000, 12_345], 1000, 16, VolumeScheme::Uniform(2));
-        let opts = SessionOptions { preallocated_syndrome_slots: 6, fold_threads, fold_queue_depth: 2, ..Default::default() };
+        let fx = fixture(
+            &format!("sim{fold_threads}{with_bytes}"),
+            &[60_000, 35_000, 12_345],
+            1000,
+            16,
+            VolumeScheme::Uniform(2),
+        );
+        let opts = SessionOptions {
+            preallocated_syndrome_slots: 6,
+            fold_threads,
+            fold_queue_depth: 2,
+            ..Default::default()
+        };
         let s = StreamingParSession::new(&fx.set, &fx.dir, opts).unwrap();
         for (i, v) in fx.vols.iter().enumerate() {
-            s.register_queued_volume(QueuedVolume { id: i as u64, blocks: vol_blocks(v), paused: true });
+            s.register_queued_volume(QueuedVolume {
+                id: i as u64,
+                blocks: vol_blocks(v),
+                paused: true,
+            });
         }
         let article = 650usize;
         let mut arrived_vols = std::collections::BTreeSet::new();
@@ -2427,25 +3189,39 @@ mod live_tests {
         for (name, data) in &fx.files {
             let id = fid(&fx, name);
             let path = fx.dir.join(name);
-            std::fs::File::create(&path).unwrap().set_len(data.len() as u64).unwrap();
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(data.len() as u64)
+                .unwrap();
             let n = data.len().div_ceil(article);
             for si in shuffled(n, 31) {
                 let off = si * article;
                 let end = (off + article).min(data.len());
                 if name == "part00.rar" && si % 13 == 5 {
                     lost += 1;
-                    let (_, act) = s.on_article_failed_permanently(&id, off as u64, (end - off) as u64).unwrap();
+                    let (_, act) = s
+                        .on_article_failed_permanently(&id, off as u64, (end - off) as u64)
+                        .unwrap();
                     if let Some(a) = act {
                         for vid in a.volume_ids_to_unpause {
                             // The unpaused volume "downloads" immediately.
-                            s.on_recovery_volume_arrived(&fx.vols[vid as usize], Some(vid)).unwrap();
+                            s.on_recovery_volume_arrived(&fx.vols[vid as usize], Some(vid))
+                                .unwrap();
                             arrived_vols.insert(vid);
                         }
                     }
                     continue;
                 }
                 write_at(&path, off as u64, &data[off..end]);
-                let out = s.on_article_finished(&id, off as u64, (end - off) as u64, crc32(&data[off..end]), with_bytes.then_some(&data[off..end])).unwrap();
+                let out = s
+                    .on_article_finished(
+                        &id,
+                        off as u64,
+                        (end - off) as u64,
+                        crc32(&data[off..end]),
+                        with_bytes.then_some(&data[off..end]),
+                    )
+                    .unwrap();
                 assert!(out.unpause.is_none());
             }
         }
@@ -2463,7 +3239,10 @@ mod live_tests {
         let rep = s.repair_available_targets_now(&[f0]).unwrap();
         assert_eq!(rep.erasures, st.damaged);
         assert_eq!(rep.repaired_slices.len(), st.damaged);
-        assert_eq!(rep.files, vec![(f0, VolumeStatus::CompleteAndVerified, true)]);
+        assert_eq!(
+            rep.files,
+            vec![(f0, VolumeStatus::CompleteAndVerified, true)]
+        );
         for (n, d) in &fx.files {
             assert_eq!(std::fs::read(fx.dir.join(n)).unwrap(), *d, "{n}");
         }
@@ -2485,9 +3264,22 @@ mod live_tests {
     #[test]
     fn concurrent_article_writers() {
         let fx = fixture("conc", &[80_000, 40_000], 1000, 8, VolumeScheme::Single);
-        let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions { preallocated_syndrome_slots: 8, fold_threads: 2, fold_queue_depth: 1, ..Default::default() }).unwrap();
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                preallocated_syndrome_slots: 8,
+                fold_threads: 2,
+                fold_queue_depth: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for (name, data) in &fx.files {
-            std::fs::File::create(fx.dir.join(name)).unwrap().set_len(data.len() as u64).unwrap();
+            std::fs::File::create(fx.dir.join(name))
+                .unwrap()
+                .set_len(data.len() as u64)
+                .unwrap();
         }
         // 4 writer threads share the session; each handles an interleaved subset of articles.
         let article = 1000usize;
@@ -2505,11 +3297,23 @@ mod live_tests {
                             let end = (off + article).min(data.len());
                             // Slice 7 of part00 is lost.
                             if name == "part00.rar" && si == 7 {
-                                s.on_article_failed_permanently(&id, off as u64, (end - off) as u64).unwrap();
+                                s.on_article_failed_permanently(
+                                    &id,
+                                    off as u64,
+                                    (end - off) as u64,
+                                )
+                                .unwrap();
                                 continue;
                             }
                             write_at(&path, off as u64, &data[off..end]);
-                            s.on_article_finished(&id, off as u64, (end - off) as u64, crc32(&data[off..end]), Some(&data[off..end])).unwrap();
+                            s.on_article_finished(
+                                &id,
+                                off as u64,
+                                (end - off) as u64,
+                                crc32(&data[off..end]),
+                                Some(&data[off..end]),
+                            )
+                            .unwrap();
                         }
                     }
                 });
@@ -2527,7 +3331,10 @@ mod live_tests {
         let f0 = fid(&fx, "part00.rar");
         let rep = s.repair_available_targets_now(&[f0]).unwrap();
         assert_eq!(rep.repaired_slices, vec![(f0, 7)]);
-        assert_eq!(std::fs::read(fx.dir.join("part00.rar")).unwrap(), fx.files[0].1);
+        assert_eq!(
+            std::fs::read(fx.dir.join("part00.rar")).unwrap(),
+            fx.files[0].1
+        );
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
 
@@ -2535,24 +3342,56 @@ mod live_tests {
     fn early_cutover_repairs_target_volume_while_rest_still_downloading() {
         // part00 finished with 2 damaged slices; part01 and part02 (18 slices) not downloaded
         // yet; 24 recovery blocks available → D + U = 20 <= 24. Only part00 rows are computed.
-        let fx = fixture("early", &[30_000, 12_000, 6_000], 1000, 24, VolumeScheme::Single);
-        let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions { preallocated_syndrome_slots: 24, ..Default::default() }).unwrap();
+        let fx = fixture(
+            "early",
+            &[30_000, 12_000, 6_000],
+            1000,
+            24,
+            VolumeScheme::Single,
+        );
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                preallocated_syndrome_slots: 24,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let f0 = fid(&fx, "part00.rar");
         let d0 = &fx.files[0].1;
         let p0 = fx.dir.join("part00.rar");
-        std::fs::File::create(&p0).unwrap().set_len(d0.len() as u64).unwrap();
+        std::fs::File::create(&p0)
+            .unwrap()
+            .set_len(d0.len() as u64)
+            .unwrap();
         for si in 0..30 {
             let off = si * 1000;
             if matches!(si, 4 | 17) {
-                s.on_article_failed_permanently(&f0, off as u64, 1000).unwrap();
+                s.on_article_failed_permanently(&f0, off as u64, 1000)
+                    .unwrap();
                 continue;
             }
             write_at(&p0, off as u64, &d0[off..off + 1000]);
-            s.on_article_finished(&f0, off as u64, 1000, crc32(&d0[off..off + 1000]), None).unwrap();
+            s.on_article_finished(&f0, off as u64, 1000, crc32(&d0[off..off + 1000]), None)
+                .unwrap();
         }
-        assert_eq!(s.volume_status(&f0).unwrap(), VolumeStatus::Incomplete { verified: 28, damaged: 2, unarrived: 0 });
+        assert_eq!(
+            s.volume_status(&f0).unwrap(),
+            VolumeStatus::Incomplete {
+                verified: 28,
+                damaged: 2,
+                unarrived: 0
+            }
+        );
         // Not possible before the volume arrives.
-        assert!(matches!(s.repair_available_targets_now(&[f0]), Err(RepairError::NotEnoughRecovery { needed: 20, available: 0 })));
+        assert!(matches!(
+            s.repair_available_targets_now(&[f0]),
+            Err(RepairError::NotEnoughRecovery {
+                needed: 20,
+                available: 0
+            })
+        ));
         assert_eq!(s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(), 24);
         let st = s.status();
         assert!(st.early_cutover_possible);
@@ -2561,7 +3400,10 @@ mod live_tests {
         assert_eq!(rep.erasures, 20);
         assert_eq!(rep.recovery_used, 20);
         assert_eq!(rep.repaired_slices.len(), 2);
-        assert_eq!(rep.files, vec![(f0, VolumeStatus::CompleteAndVerified, true)]);
+        assert_eq!(
+            rep.files,
+            vec![(f0, VolumeStatus::CompleteAndVerified, true)]
+        );
         assert_eq!(std::fs::read(&p0).unwrap(), *d0);
         // The other parts were not touched (still absent).
         assert!(!fx.dir.join("part01.rar").exists());
@@ -2570,25 +3412,37 @@ mod live_tests {
             let id = fid(&fx, name);
             let path = fx.dir.join(name);
             std::fs::write(&path, data).unwrap();
-            s.on_article_finished(&id, 0, data.len() as u64, crc32(data), None).unwrap();
-            assert_eq!(s.volume_status(&id).unwrap(), VolumeStatus::CompleteAndVerified);
+            s.on_article_finished(&id, 0, data.len() as u64, crc32(data), None)
+                .unwrap();
+            assert_eq!(
+                s.volume_status(&id).unwrap(),
+                VolumeStatus::CompleteAndVerified
+            );
         }
         let all: Vec<FileId> = fx.files.iter().map(|(n, _)| fid(&fx, n)).collect();
         let rep = s.repair_available_targets_now(&all).unwrap();
         assert_eq!(rep.erasures, 0);
         assert!(rep.repaired_slices.is_empty());
-        assert!(rep.files.iter().all(|(_, st, ok)| *st == VolumeStatus::CompleteAndVerified && *ok));
+        assert!(
+            rep.files
+                .iter()
+                .all(|(_, st, ok)| *st == VolumeStatus::CompleteAndVerified && *ok)
+        );
         // Or reconstruct a never-downloaded part entirely (U slices requested explicitly).
         let fx2 = fixture("early2", &[8_000, 5_000], 1000, 8, VolumeScheme::Single);
         let s2 = StreamingParSession::new(&fx2.set, &fx2.dir, SessionOptions::default()).unwrap();
         let (n0, d0) = &fx2.files[0];
         std::fs::write(fx2.dir.join(n0), d0).unwrap();
-        s2.on_article_finished(&fid(&fx2, n0), 0, d0.len() as u64, crc32(d0), None).unwrap();
+        s2.on_article_finished(&fid(&fx2, n0), 0, d0.len() as u64, crc32(d0), None)
+            .unwrap();
         s2.on_recovery_volume_arrived(&fx2.vols[0], None).unwrap();
         let f1 = fid(&fx2, "part01.rar");
         let rep = s2.repair_available_targets_now(&[f1]).unwrap();
         assert_eq!(rep.repaired_slices.len(), 5);
-        assert_eq!(std::fs::read(fx2.dir.join("part01.rar")).unwrap(), fx2.files[1].1);
+        assert_eq!(
+            std::fs::read(fx2.dir.join("part01.rar")).unwrap(),
+            fx2.files[1].1
+        );
         std::fs::remove_dir_all(&fx.dir).unwrap();
         std::fs::remove_dir_all(&fx2.dir).unwrap();
     }
@@ -2601,58 +3455,109 @@ mod live_tests {
         let f0 = fid(&fx, "part00.rar");
         let d0 = &fx.files[0].1;
         let p0 = fx.dir.join("part00.rar");
-        std::fs::File::create(&p0).unwrap().set_len(d0.len() as u64).unwrap();
+        std::fs::File::create(&p0)
+            .unwrap()
+            .set_len(d0.len() as u64)
+            .unwrap();
         // Articles of 750 bytes; articles 3 and 10 lost (hole 2250..3000 and 7500..8250).
         for si in 0..27 {
             let off = si * 750;
             let end = (off + 750).min(d0.len());
             if matches!(si, 3 | 10) {
-                s.on_article_failed_permanently(&f0, off as u64, (end - off) as u64).unwrap();
+                s.on_article_failed_permanently(&f0, off as u64, (end - off) as u64)
+                    .unwrap();
                 continue;
             }
             write_at(&p0, off as u64, &d0[off..end]);
-            s.on_article_finished(&f0, off as u64, (end - off) as u64, crc32(&d0[off..end]), None).unwrap();
+            s.on_article_finished(
+                &f0,
+                off as u64,
+                (end - off) as u64,
+                crc32(&d0[off..end]),
+                None,
+            )
+            .unwrap();
         }
         // 2250..3000 → slice 2; 7500..8250 → slices 7 and 8.
-        assert_eq!(s.volume_status(&f0).unwrap(), VolumeStatus::Incomplete { verified: 17, damaged: 3, unarrived: 0 });
+        assert_eq!(
+            s.volume_status(&f0).unwrap(),
+            VolumeStatus::Incomplete {
+                verified: 17,
+                damaged: 3,
+                unarrived: 0
+            }
+        );
         assert!(!s.status().early_cutover_possible);
         // Wrong donor bytes: nothing healed.
         let bogus = vec![0xEEu8; 750];
-        assert!(s.try_splice_live_slice(&f0, ByteRange::new(2250, 750), &bogus, &p0).unwrap().is_empty());
+        assert!(
+            s.try_splice_live_slice(&f0, ByteRange::new(2250, 750), &bogus, &p0)
+                .unwrap()
+                .is_empty()
+        );
         // Correct donor bytes for the first hole.
-        let healed = s.try_splice_live_slice(&f0, ByteRange::new(2250, 750), &d0[2250..3000], &p0).unwrap();
+        let healed = s
+            .try_splice_live_slice(&f0, ByteRange::new(2250, 750), &d0[2250..3000], &p0)
+            .unwrap();
         assert_eq!(healed, vec![2]);
         // Second hole spans slices 7 and 8.
-        let healed = s.try_splice_live_slice(&f0, ByteRange::new(7500, 750), &d0[7500..8250], &p0).unwrap();
+        let healed = s
+            .try_splice_live_slice(&f0, ByteRange::new(7500, 750), &d0[7500..8250], &p0)
+            .unwrap();
         assert_eq!(healed, vec![7, 8]);
         // Remaining damaged slices (if any) come from articles whose other half was also lost.
         let st = s.volume_status(&f0).unwrap();
         if st != VolumeStatus::CompleteAndVerified {
             // Heal whatever is left with donor bytes for the whole file.
-            let healed = s.try_splice_live_slice(&f0, ByteRange::new(0, d0.len() as i64), d0, &p0).unwrap();
+            let healed = s
+                .try_splice_live_slice(&f0, ByteRange::new(0, d0.len() as i64), d0, &p0)
+                .unwrap();
             assert!(!healed.is_empty());
         }
-        assert_eq!(s.volume_status(&f0).unwrap(), VolumeStatus::CompleteAndVerified);
+        assert_eq!(
+            s.volume_status(&f0).unwrap(),
+            VolumeStatus::CompleteAndVerified
+        );
         assert_eq!(std::fs::read(&p0).unwrap(), *d0);
         // Already-verified slices are skipped; empty / invalid ranges ignored.
-        assert!(s.try_splice_live_slice(&f0, ByteRange::new(0, 1000), d0, &p0).unwrap().is_empty());
-        assert!(s.try_splice_live_slice(&f0, ByteRange::new(0, 0), d0, &p0).unwrap().is_empty());
-        assert!(s.try_splice_live_slice(&f0, ByteRange::new(5, 10), &d0[..3], &p0).unwrap().is_empty());
-        assert!(matches!(s.try_splice_live_slice(&FileId([1; 16]), ByteRange::new(0, 1), d0, &p0), Err(RepairError::UnknownFile(_))));
+        assert!(
+            s.try_splice_live_slice(&f0, ByteRange::new(0, 1000), d0, &p0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            s.try_splice_live_slice(&f0, ByteRange::new(0, 0), d0, &p0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            s.try_splice_live_slice(&f0, ByteRange::new(5, 10), &d0[..3], &p0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            s.try_splice_live_slice(&FileId([1; 16]), ByteRange::new(0, 1), d0, &p0),
+            Err(RepairError::UnknownFile(_))
+        ));
         // Healed slices were folded: with the single 2-block volume, a later 1-slice loss in
         // part01 is repairable using the syndromes.
         let f1 = fid(&fx, "part01.rar");
         let d1 = &fx.files[1].1;
         let p1 = fx.dir.join("part01.rar");
-        std::fs::File::create(&p1).unwrap().set_len(d1.len() as u64).unwrap();
+        std::fs::File::create(&p1)
+            .unwrap()
+            .set_len(d1.len() as u64)
+            .unwrap();
         for si in 0..50 {
             let off = si * 1000;
             if si == 25 {
-                s.on_article_failed_permanently(&f1, off as u64, 1000).unwrap();
+                s.on_article_failed_permanently(&f1, off as u64, 1000)
+                    .unwrap();
                 continue;
             }
             write_at(&p1, off as u64, &d1[off..off + 1000]);
-            s.on_article_finished(&f1, off as u64, 1000, crc32(&d1[off..off + 1000]), None).unwrap();
+            s.on_article_finished(&f1, off as u64, 1000, crc32(&d1[off..off + 1000]), None)
+                .unwrap();
         }
         s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap();
         let rep = s.repair_available_targets_now(&[f1]).unwrap();
@@ -2666,20 +3571,41 @@ mod live_tests {
         // Pre-allocate only exponents 0 and 1; the volume carries 0..5. Slots 2..4 are created
         // on arrival (cap 5) and back-filled from the already written target files.
         let fx = fixture("late", &[15_000, 9_000], 1000, 6, VolumeScheme::Single);
-        let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions { preallocated_syndrome_slots: 2, max_syndrome_slots: 5, max_staging_bytes: 0, ..Default::default() }).unwrap();
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                preallocated_syndrome_slots: 2,
+                max_syndrome_slots: 5,
+                max_staging_bytes: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(s.status().syndrome_slots, 2);
         for (name, data) in &fx.files {
             let id = fid(&fx, name);
             let path = fx.dir.join(name);
-            std::fs::File::create(&path).unwrap().set_len(data.len() as u64).unwrap();
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(data.len() as u64)
+                .unwrap();
             for (si, chunk) in data.chunks(1000).enumerate() {
                 if name == "part00.rar" && matches!(si, 1 | 6 | 11 | 14) {
-                    s.on_article_failed_permanently(&id, (si * 1000) as u64, 1000).unwrap();
+                    s.on_article_failed_permanently(&id, (si * 1000) as u64, 1000)
+                        .unwrap();
                     continue;
                 }
                 write_at(&path, (si * 1000) as u64, chunk);
                 // Bytes offered but staging budget is 0 → verified from disk.
-                s.on_article_finished(&id, (si * 1000) as u64, chunk.len() as u64, crc32(chunk), Some(chunk)).unwrap();
+                s.on_article_finished(
+                    &id,
+                    (si * 1000) as u64,
+                    chunk.len() as u64,
+                    crc32(chunk),
+                    Some(chunk),
+                )
+                .unwrap();
             }
         }
         assert_eq!(s.status().damaged, 4);
@@ -2694,7 +3620,10 @@ mod live_tests {
         let rep = s.repair_available_targets_now(&[f0]).unwrap();
         assert_eq!(rep.repaired_slices.len(), 4);
         assert_eq!(rep.recovery_used, 4);
-        assert_eq!(std::fs::read(fx.dir.join("part00.rar")).unwrap(), fx.files[0].1);
+        assert_eq!(
+            std::fs::read(fx.dir.join("part00.rar")).unwrap(),
+            fx.files[0].1
+        );
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
 
@@ -2705,7 +3634,10 @@ mod live_tests {
         let f0 = fid(&fx, "part00.rar");
         let d0 = &fx.files[0].1;
         let p0 = fx.dir.join("part00.rar");
-        std::fs::File::create(&p0).unwrap().set_len(d0.len() as u64).unwrap();
+        std::fs::File::create(&p0)
+            .unwrap()
+            .set_len(d0.len() as u64)
+            .unwrap();
         // Articles of 500 bytes tile each slice exactly → combined CRC path. Article 3 is
         // written corrupted but reported with the CRC of the corrupt bytes.
         for si in 0..12 {
@@ -2715,35 +3647,67 @@ mod live_tests {
                 chunk[7] ^= 1;
             }
             write_at(&p0, off as u64, &chunk);
-            let out = s.on_article_finished(&f0, off as u64, 500, crc32(&chunk), None).unwrap();
+            let out = s
+                .on_article_finished(&f0, off as u64, 500, crc32(&chunk), None)
+                .unwrap();
             if si == 3 {
-                assert_eq!(out.events, vec![SliceEvent { file_id: f0, slice_idx: 1, state: SliceState::Damaged }]);
+                assert_eq!(
+                    out.events,
+                    vec![SliceEvent {
+                        file_id: f0,
+                        slice_idx: 1,
+                        state: SliceState::Damaged
+                    }]
+                );
                 // Nothing queued: the scheduler reports the shortfall instead of volumes.
                 let a = out.unpause.as_ref().unwrap();
-                assert!(a.volume_ids_to_unpause.is_empty() && a.blocks_requested == 0 && a.shortfall == 1);
+                assert!(
+                    a.volume_ids_to_unpause.is_empty()
+                        && a.blocks_requested == 0
+                        && a.shortfall == 1
+                );
             }
         }
-        assert_eq!(s.volume_status(&f0).unwrap(), VolumeStatus::Incomplete { verified: 5, damaged: 1, unarrived: 0 });
+        assert_eq!(
+            s.volume_status(&f0).unwrap(),
+            VolumeStatus::Incomplete {
+                verified: 5,
+                damaged: 1,
+                unarrived: 0
+            }
+        );
         // Missing-IFSC set: slices can never be verified individually.
         let bytes = std::fs::read(fx.dir.join("set.par2")).unwrap();
-        let raws: Vec<_> = PacketIter::new(&bytes[..], ScanOptions::UNVERIFIED).map(|r| r.unwrap()).collect();
+        let raws: Vec<_> = PacketIter::new(&bytes[..], ScanOptions::UNVERIFIED)
+            .map(|r| r.unwrap())
+            .collect();
         let mut stripped = Vec::new();
         for r in raws {
             if r.header.kind() != PacketType::Ifsc {
-                stripped.extend_from_slice(&bytes[r.offset as usize..(r.offset + r.header.length) as usize]);
+                stripped.extend_from_slice(
+                    &bytes[r.offset as usize..(r.offset + r.header.length) as usize],
+                );
             }
         }
         let set2 = crate::packet::load_par2_bytes(&stripped, ScanOptions::FULL).unwrap();
         let s2 = StreamingParSession::new(&set2, &fx.dir, SessionOptions::default()).unwrap();
-        let out = s2.on_article_finished(&f0, 0, 1000, crc32(&d0[..1000]), Some(&d0[..1000])).unwrap();
+        let out = s2
+            .on_article_finished(&f0, 0, 1000, crc32(&d0[..1000]), Some(&d0[..1000]))
+            .unwrap();
         assert_eq!(out.events[0].state, SliceState::Damaged);
         // Session construction errors.
         let mut no_main = set2.clone();
         no_main.main = None;
-        assert!(matches!(StreamingParSession::new(&no_main, &fx.dir, SessionOptions::default()), Err(RepairError::NoMainPacket)));
+        assert!(matches!(
+            StreamingParSession::new(&no_main, &fx.dir, SessionOptions::default()),
+            Err(RepairError::NoMainPacket)
+        ));
         let mut no_desc = set2.clone();
         no_desc.file_descs.clear();
-        assert!(matches!(StreamingParSession::new(&no_desc, &fx.dir, SessionOptions::default()), Err(RepairError::IncompleteMetadata { .. })));
+        assert!(matches!(
+            StreamingParSession::new(&no_desc, &fx.dir, SessionOptions::default()),
+            Err(RepairError::IncompleteMetadata { .. })
+        ));
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
 }
