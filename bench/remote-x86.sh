@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build nzbget-parity and its competitors on an x86_64 Linux box and run bench/compare.py.
+# Build par-rs and its competitors on an x86_64 Linux box and run bench/compare.py.
 #
 # Usage (on the server, from the repo root):  bash bench/remote-x86.sh [runs]
 # Needs: git, curl, gcc/cc, xz. Installs rustup under $HOME if cargo is missing. Fetches
@@ -29,7 +29,7 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 cargo --version
 
-echo "== building nzbget-parity"
+echo "== building par-rs"
 (cd "$REPO" && cargo build --release --examples 2>&1 | tail -1)
 
 echo "== nzbfast (parfast)"
@@ -68,7 +68,7 @@ done
 echo "== benchmark (best of $RUNS)"
 cd "$REPO"
 DATA="$DATA" WORK="$BENCH_HOME/work" \
-NZBPAR="$REPO/target/release/examples/nzbpar" \
+PAR_RS="$REPO/target/release/examples/par-rs" \
 PARFAST="$BENCH_HOME/nzbfast/target/release/parfast" \
 TURBO="$BENCH_HOME/turbo/par2" \
 PARPAR="$BENCH_HOME/parpar/parpar" \

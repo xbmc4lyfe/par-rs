@@ -3,7 +3,7 @@
 
 Usage: [RUNS=3] python3 bench/compare.py [tool ...]
 Environment: DATA (directory of input files), WORK (scratch directory), and the tool binaries
-NZBPAR, PARFAST (nzbfast), TURBO (par2cmdline-turbo), PARPAR, PARMESAN. Tools whose binary is
+PAR_RS, PARFAST (nzbfast), TURBO (par2cmdline-turbo), PARPAR, PARMESAN. Tools whose binary is
 missing are skipped. Each run copies the data set fresh, warms the page cache and times one
 process; repairs are checked against the originals' MD5s.
 """
@@ -16,7 +16,7 @@ def tool(env, default):
     b = os.environ.get(env, default)
     return os.path.abspath(b) if os.path.isfile(b) else b
 
-OURS = tool("NZBPAR", "target/release/examples/nzbpar")
+OURS = tool("PAR_RS", "target/release/examples/par-rs")
 PARFAST = tool("PARFAST", "parfast")
 TURBO = tool("TURBO", "par2")
 PARPAR = tool("PARPAR", "parpar")

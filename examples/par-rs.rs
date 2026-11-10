@@ -2,11 +2,11 @@
 //! against `par2cmdline`.
 //!
 //! ```text
-//! nzbpar create [-s slice_size] [-r recovery_blocks] [-n volumes|exp|single] <base.par2> <files...>
-//! nzbpar verify [--extra <dir>] <file.par2>
-//! nzbpar repair [--extra <dir>] [--threads N] [--mem MiB] [--full-md5] [--sync] <file.par2>
-//! nzbpar rename [--dry-run] <dir>
-//! nzbpar info <file.par2>
+//! par-rs create [-s slice_size] [-r recovery_blocks] [-n volumes|exp|single] <base.par2> <files...>
+//! par-rs verify [--extra <dir>] <file.par2>
+//! par-rs repair [--extra <dir>] [--threads N] [--mem MiB] [--full-md5] [--sync] <file.par2>
+//! par-rs rename [--dry-run] <dir>
+//! par-rs info <file.par2>
 //! ```
 
 use par_rs::create::{create, CreateOptions, SourceFile, VolumeScheme};
@@ -35,11 +35,11 @@ impl RepairObserver for Console {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: nzbpar create [-s slice] [-r blocks] [-n N|exp|single] <base> <files...>");
-    eprintln!("       nzbpar verify [--extra dir] [--threads N] [--full-md5] <file.par2>");
-    eprintln!("       nzbpar repair [--extra dir] [--threads N] [--mem MiB] [--no-verify] [--full-md5] [--sync] <file.par2>");
-    eprintln!("       nzbpar rename [--dry-run] <dir>");
-    eprintln!("       nzbpar info <file.par2>");
+    eprintln!("usage: par-rs create [-s slice] [-r blocks] [-n N|exp|single] <base> <files...>");
+    eprintln!("       par-rs verify [--extra dir] [--threads N] [--full-md5] <file.par2>");
+    eprintln!("       par-rs repair [--extra dir] [--threads N] [--mem MiB] [--no-verify] [--full-md5] [--sync] <file.par2>");
+    eprintln!("       par-rs rename [--dry-run] <dir>");
+    eprintln!("       par-rs info <file.par2>");
     ExitCode::from(2)
 }
 
