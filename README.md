@@ -59,7 +59,7 @@ produced correct output (verified by MD5 against the originals). Harness: `bench
 
 | tool | create | verify (intact) | repair (40 corrupt blocks in 4 files) | repair (1 file missing, 100 blocks) |
 |---|---|---|---|---|
-| **par-rs** (`nzbpar`) | 0.96 | **0.10** | **0.52** | **0.79** |
+| **par-rs** | 0.96 | **0.10** | **0.52** | **0.79** |
 | nzbfast `parfast` 1.9.0 | 0.92 | 0.17 | 0.56 | 0.87 |
 | ParPar 0.4.6 | **0.89** | – | – | – |
 | par2cmdline-turbo 1.5.0 | 1.45 | 0.78 | 1.86 | 1.44 |
@@ -120,7 +120,7 @@ What makes the hashing phases fast:
 ## Usage
 
 ```rust
-use nzbget_parity::{Par2Repairer, RepairOptions, NullObserver, RepairResult, QuickInfo};
+use par_rs::{Par2Repairer, RepairOptions, NullObserver, RepairResult, QuickInfo};
 
 let mut r = Par2Repairer::new("/downloads/release", RepairOptions::default());
 r.load_par2_set(std::path::Path::new("/downloads/release/release.par2"))?;
@@ -188,7 +188,14 @@ syndrome slot plus an optional bounded folder pool (full queue ⇒ inline fold, 
 writer), and each slot keeps a `folded_mask` bitset so slots allocated when a late volume arrives
 are back-filled from disk for exactly the slices they lack.
 
-CLI front end for manual use: `cargo run --release --example nzbpar -- {create|verify|repair|rename|info} ...`
+CLI front end for manual use:
+
+```sh
+cargo build --release --example par-rs
+./target/release/examples/par-rs verify /path/to/files.par2
+```
+
+Or run through Cargo: `cargo run --release --example par-rs -- {create|verify|repair|rename|info} ...`
 
 ## Testing
 
