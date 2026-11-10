@@ -201,6 +201,7 @@ Or run through Cargo: `cargo run --release --example par-rs -- {create|verify|re
 ## Development
 
 Install Rust 1.99.1 with the `clippy` and `rustfmt` components, `just` 1.59.0, and Vale 3.26.0.
+GitHub CI also installs `par2cmdline-turbo` 1.5.0 for the differential compatibility tests.
 Run these commands from the repository root:
 
 | Command | Purpose |

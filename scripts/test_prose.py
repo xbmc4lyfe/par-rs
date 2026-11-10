@@ -41,13 +41,18 @@ class ProseCoverage(unittest.TestCase):
         for expression in (
             'println!("Use e.g. this example.");',
             'eprintln!("Use e.g. this example.");',
+            'std::println!("Use e.g. this example.");',
             'format!("Use e.g. this example.");',
             'println!(r#"Use e.g. this example."#);',
             'observer.message(Level::Info, "Use e.g. this example.");',
+            'observer.progress(Stage::Scan, 0, 1, "Use e.g. this example.");',
+            'formatter.write_str("Use e.g. this example.");',
+            'formatter.write_str(r#"Use e.g. this example."#);',
         ):
             with self.subTest(expression=expression):
                 self.assert_latin(".rs", "fn main() { " + expression + " }\n")
         self.assert_latin(".rs", '#[error("Use e.g. this example.")]\nstruct Error;\n')
+        self.assert_latin(".rs", '#[error(r#"Use e.g. this example."#)]\nstruct Error;\n')
 
     def test_rust_data_is_not_prose(self):
         code, alerts = self.lint(".rs", 'const DATA: &str = "// e.g. file(s)";\n')

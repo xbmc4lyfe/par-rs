@@ -10,7 +10,7 @@ without changing Rust files. Both commands fail on Google warnings and errors.
 Suggestions remain advisory and are available with `vale --no-global --minAlertLevel=suggestion`.
 
 The syntax-aware views cover Rust comments and printed, formatted, observer, and
-error messages. Python comments and docstrings, shell comments, task descriptions,
+error messages, including `Formatter::write_str` output. Python comments and docstrings, shell comments, task descriptions,
 and Markdown are also checked. Code spans, fenced examples, and command argument
 placeholders retain their literal spelling. Build output and vendored style rules
 are outside the prose scope.

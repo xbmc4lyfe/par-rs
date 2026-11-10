@@ -28,7 +28,7 @@ fmt-check:
 
 # Check Markdown, source comments, and command-line messages.
 prose:
-    vale --no-global README.md docs src tests examples bench scripts .github justfile .vale/README.md
+    vale --no-global *.md docs src tests examples bench scripts .github justfile .vale/README.md
 
 # Run Rust tests, Clippy, and prose coverage tests.
 test:

@@ -43,6 +43,14 @@ jobs:
           tar -xzf "$archive" -C "$HOME/.local/bin" vale
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Install the PAR2 reference tool
-        run: sudo apt-get update && sudo apt-get install --yes par2
+        run: |
+          archive="$RUNNER_TEMP/par2-reference.zip"
+          curl --fail --silent --show-error --location \
+            https://github.com/animetosho/par2cmdline-turbo/releases/download/v1.5.0/par2cmdline-turbo-1.5.0-linux-amd64.zip \
+            -o "$archive"
+          echo "5a9f64386813456693c2ea1fb7649436fe7544bbdf97fd73b3483dfcc8aca464  $archive" | sha256sum --check --strict
+          unzip -p "$archive" par2 > "$HOME/.local/bin/par2"
+          chmod +x "$HOME/.local/bin/par2"
+          par2 --version
       - name: Run repository checks
         run: just ci
