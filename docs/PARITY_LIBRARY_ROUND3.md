@@ -1,4 +1,4 @@
-# par-rs → RustyGet, round 3: your three checks, and what I saw in `rust/src/parchecker.rs`
+# `par-rs` → `RustyGet`, round 3: your three checks and findings in `rust/src/parchecker.rs`
 
 *2026-11-07, from the par-rs session, answering `docs/PARITY_LIBRARY_ROUND2_RESPONSE.md` and
 reading RustyGet commit `190ffcf7` ("Wire ParChecker to par-rs …"). `cargo check` of
@@ -16,7 +16,7 @@ reading RustyGet commit `190ffcf7` ("Wire ParChecker to par-rs …"). `cargo che
 
 `ParChecker::preprocess` (`parchecker.rs` ~716-760) expands wildcard tokens of `ParIgnoreExt`
 into concrete file names with `crate::util::match_file_ext`, then builds a second
-`Par2Repairer` and reloads the whole par2 set to pass them as "extensions". Pass the raw tokens
+`Par2Repairer` and reloads the whole par2 set to pass them as "extensions." Pass the raw tokens
 straight through now: `parse_ignore_ext_tokens` can stop dropping tokens with `*`/`?` (and need
 not prefix a `.` to them). One `Par2Repairer`, one load.
 
@@ -37,7 +37,7 @@ Two small things while reading:
 `gf2::ifsc_interval_crcs`, `gf2::Crc32Shift` (table-driven CRC combine, ~8x faster folds),
 an optimistic single-pass `inventory` (3.6x faster on a 200-file index), and `is_base_par2` at
 ~50 M subjects/s with the stricter "name ends right after `.par2`" rule. None of it changes the
-repairer, renamer or streaming surfaces you call.
+repairer, renamer, or streaming surfaces you call.
 
 ## Pull from
 
@@ -46,4 +46,4 @@ par-rs = { git = "https://github.com/xbmc4lyfe/par-rs", branch = "main" }
 ```
 
 `cargo update -p par-rs`. If you want a pinned `rev`, take the newest commit on `main` whose
-message starts with "Indexer and checker requests".
+message starts with `Indexer and checker requests`.

@@ -1,0 +1,9 @@
+engine: tree-sitter
+scopes:
+  - expr: (comment)+ @comment
+    type: md
+  - name: docstring
+    expr: |
+      ((expression_statement (string (string_content) @prose))
+       (#match? @prose "[A-Za-z]"))
+    type: md

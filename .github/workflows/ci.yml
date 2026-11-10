@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Format, prose, tests, and build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.1
+          components: clippy, rustfmt
+      - name: Install just
+        uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+        with:
+          just-version: 1.59.0
+      - name: Install Vale
+        env:
+          VALE_VERSION: 3.26.0
+        run: |
+          archive="vale_${VALE_VERSION}_Linux_64-bit.tar.gz"
+          url="https://github.com/vale-cli/vale/releases/download/v${VALE_VERSION}"
+          curl --fail --silent --show-error --location "$url/$archive" -o "$RUNNER_TEMP/$archive"
+          curl --fail --silent --show-error --location "$url/vale_${VALE_VERSION}_checksums.txt" -o "$RUNNER_TEMP/vale-checksums.txt"
+          cd "$RUNNER_TEMP"
+          grep "  $archive$" vale-checksums.txt | sha256sum --check --strict
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$archive" -C "$HOME/.local/bin" vale
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install the PAR2 reference tool
+        run: |
+          archive="$RUNNER_TEMP/par2-reference.zip"
+          curl --fail --silent --show-error --location \
+            https://github.com/animetosho/par2cmdline-turbo/releases/download/v1.5.0/par2cmdline-turbo-1.5.0-linux-amd64.zip \
+            -o "$archive"
+          echo "5a9f64386813456693c2ea1fb7649436fe7544bbdf97fd73b3483dfcc8aca464  $archive" | sha256sum --check --strict
+          unzip -p "$archive" par2 > "$HOME/.local/bin/par2"
+          chmod +x "$HOME/.local/bin/par2"
+          par2 --version
+      - name: Run repository checks
+        run: just ci

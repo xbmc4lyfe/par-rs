@@ -11,7 +11,7 @@
 //! single cache-tiled SIMD pass and then dropped; a recovery slice is XORed into its buffer
 //! whenever it arrives (before, during or after the data). The moment the unknown slices
 //! (damaged *or not yet downloaded*) are no more numerous than the buffers whose recovery slice
-//! has arrived, the whole set is solvable from the bank alone — no byte is read twice, and the
+//! has arrived, the whole set is solvable from the bank alone—no byte is read twice, and the
 //! remaining downloads can be cancelled.
 //!
 //! [`StreamingSliceAssembler`] sits on top: it accepts out-of-order `(file, offset, bytes)`
@@ -19,9 +19,9 @@
 //! only the slices an article boundary cuts through, zero pads the final slice of each file,
 //! verifies every completed slice against the IFSC checksums and folds it into the bank.
 
+use crate::gf2::crc32;
 use crate::gf16::simd::Kernel;
 use crate::gf16::{input_constant_logs, rs_coefficient};
-use crate::gf2::crc32;
 use crate::packet::SliceChecksum;
 use crate::reed_solomon::plan_recovery;
 use crate::repair::{RepairError, fold_tiled, xor_into};
@@ -43,7 +43,12 @@ pub struct SyndromeBank {
 
 impl SyndromeBank {
     /// Bank for `total_slices` input slices and the given recovery exponents.
-    pub fn new(slice_size: usize, total_slices: usize, exponents: &[u32], kernel: Kernel) -> Result<Self, RepairError> {
+    pub fn new(
+        slice_size: usize,
+        total_slices: usize,
+        exponents: &[u32],
+        kernel: Kernel,
+    ) -> Result<Self, RepairError> {
         if slice_size == 0 {
             return Err(RepairError::ZeroSliceSize);
         }
@@ -52,7 +57,16 @@ impl SyndromeBank {
         exps.sort_unstable();
         exps.dedup();
         let n = exps.len();
-        Ok(Self { slice_size, logs, exponents: exps, bufs: vec![vec![0u8; slice_size]; n], have_recovery: vec![false; n], folded: vec![false; total_slices], folded_count: 0, kernel })
+        Ok(Self {
+            slice_size,
+            logs,
+            exponents: exps,
+            bufs: vec![vec![0u8; slice_size]; n],
+            have_recovery: vec![false; n],
+            folded: vec![false; total_slices],
+            folded_count: 0,
+            kernel,
+        })
     }
 
     /// Slice size.
@@ -82,23 +96,38 @@ impl SyndromeBank {
 
     /// Input slices not yet folded (damaged or pending).
     pub fn unknown_slices(&self) -> Vec<usize> {
-        self.folded.iter().enumerate().filter(|(_, f)| !**f).map(|(i, _)| i).collect()
+        self.folded
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !**f)
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Exponents whose recovery slice has arrived: their buffers are complete syndromes.
     pub fn ready_syndromes(&self) -> Vec<u32> {
-        self.exponents.iter().zip(&self.have_recovery).filter(|(_, h)| **h).map(|(e, _)| *e).collect()
+        self.exponents
+            .iter()
+            .zip(&self.have_recovery)
+            .filter(|(_, h)| **h)
+            .map(|(e, _)| *e)
+            .collect()
     }
 
     /// `unknown_slices().len() <= ready_syndromes().len()`.
     pub fn can_solve_now(&self) -> bool {
-        self.folded.len().saturating_sub(self.folded_count) <= self.have_recovery.iter().filter(|h| **h).count()
+        self.folded.len().saturating_sub(self.folded_count)
+            <= self.have_recovery.iter().filter(|h| **h).count()
     }
 
     /// Fold a verified input slice (exactly `slice_size` bytes, zero padded) into every buffer.
     pub fn fold_verified(&mut self, global: usize, data: &[u8]) -> Result<(), RepairError> {
         if data.len() != self.slice_size {
-            return Err(RepairError::SliceSizeMismatch { index: global, expected: self.slice_size, got: data.len() });
+            return Err(RepairError::SliceSizeMismatch {
+                index: global,
+                expected: self.slice_size,
+                got: data.len(),
+            });
         }
         match self.folded.get(global) {
             None => return Err(RepairError::BadIndex(global)),
@@ -106,7 +135,11 @@ impl SyndromeBank {
             Some(false) => {}
         }
         let log = self.logs.get(global).copied().unwrap_or(0);
-        let coeffs: Vec<u16> = self.exponents.iter().map(|&e| rs_coefficient(log, e)).collect();
+        let coeffs: Vec<u16> = self
+            .exponents
+            .iter()
+            .map(|&e| rs_coefficient(log, e))
+            .collect();
         fold_tiled(&self.kernel, &mut self.bufs, data, &coeffs);
         if let Some(f) = self.folded.get_mut(global) {
             *f = true;
@@ -119,9 +152,15 @@ impl SyndromeBank {
     /// exponents and duplicate deliveries are ignored (`Ok(false)`).
     pub fn xor_recovery(&mut self, exponent: u32, data: &[u8]) -> Result<bool, RepairError> {
         if data.len() != self.slice_size {
-            return Err(RepairError::SliceSizeMismatch { index: exponent as usize, expected: self.slice_size, got: data.len() });
+            return Err(RepairError::SliceSizeMismatch {
+                index: exponent as usize,
+                expected: self.slice_size,
+                got: data.len(),
+            });
         }
-        let Some(j) = self.exponents.iter().position(|&e| e == exponent) else { return Ok(false) };
+        let Some(j) = self.exponents.iter().position(|&e| e == exponent) else {
+            return Ok(false);
+        };
         if self.have_recovery.get(j).copied().unwrap_or(false) {
             return Ok(false); // duplicate delivery
         }
@@ -161,11 +200,26 @@ impl SyndromeBank {
         let syn: Vec<&[u8]> = plan
             .used_exponents
             .iter()
-            .map(|e| self.exponents.iter().position(|x| x == e).and_then(|j| self.bufs.get(j)).map(Vec::as_slice).unwrap_or(&[]))
+            .map(|e| {
+                self.exponents
+                    .iter()
+                    .position(|x| x == e)
+                    .and_then(|j| self.bufs.get(j))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            })
             .collect();
         let mut out: Vec<Vec<u8>> = vec![vec![0u8; self.slice_size]; rows.len()];
         for (j, s) in syn.iter().enumerate() {
-            let coeffs: Vec<u16> = rows.iter().map(|w| plan.missing.iter().position(|m| m == w).map_or(0, |m| plan.inverse.get(m, j))).collect();
+            let coeffs: Vec<u16> = rows
+                .iter()
+                .map(|w| {
+                    plan.missing
+                        .iter()
+                        .position(|m| m == w)
+                        .map_or(0, |m| plan.inverse.get(m, j))
+                })
+                .collect();
             fold_tiled(&self.kernel, &mut out, s, &coeffs);
         }
         Ok(rows.into_iter().zip(out).collect())
@@ -283,8 +337,14 @@ pub struct StreamingSliceAssembler {
 
 impl StreamingSliceAssembler {
     /// Assembler over `files` (any order; sorted into `libpar2` file-id order here) tracking `exponents`.
-    /// `max_staging_bytes` bounds the partially-filled slice buffers (0 = unbounded).
-    pub fn new(slice_size: usize, mut files: Vec<FileLayout>, exponents: &[u32], kernel: Kernel, max_staging_bytes: usize) -> Result<Self, RepairError> {
+    /// `max_staging_bytes` bounds the partially filled slice buffers (0 = unbounded).
+    pub fn new(
+        slice_size: usize,
+        mut files: Vec<FileLayout>,
+        exponents: &[u32],
+        kernel: Kernel,
+        max_staging_bytes: usize,
+    ) -> Result<Self, RepairError> {
         if slice_size == 0 {
             return Err(RepairError::ZeroSliceSize);
         }
@@ -297,10 +357,21 @@ impl StreamingSliceAssembler {
                 return Err(RepairError::BadIndex(f.slices.len()));
             }
             first_slice.push(total);
-            total = total.checked_add(f.slices.len()).ok_or(RepairError::TooManyInputs)?;
+            total = total
+                .checked_add(f.slices.len())
+                .ok_or(RepairError::TooManyInputs)?;
         }
         let bank = SyndromeBank::new(slice_size, total, exponents, kernel)?;
-        Ok(Self { bank, files, first_slice, state: vec![SliceState::Pending; total], staging: BTreeMap::new(), staging_bytes: 0, max_staging_bytes, announced_ready: false })
+        Ok(Self {
+            bank,
+            files,
+            first_slice,
+            state: vec![SliceState::Pending; total],
+            staging: BTreeMap::new(),
+            staging_bytes: 0,
+            max_staging_bytes,
+            announced_ready: false,
+        })
     }
 
     /// The underlying bank.
@@ -335,12 +406,21 @@ impl StreamingSliceAssembler {
 
     /// Global slice number of `(file, slice)`.
     pub fn global_slice(&self, file: usize, slice: usize) -> Option<usize> {
-        (slice < self.files.get(file)?.slices.len()).then(|| self.first_slice.get(file).copied().unwrap_or(0).saturating_add(slice))
+        (slice < self.files.get(file)?.slices.len()).then(|| {
+            self.first_slice
+                .get(file)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(slice)
+        })
     }
 
     /// `(file, slice)` of a global slice.
     pub fn locate_global(&self, global: usize) -> Option<(usize, usize)> {
-        let fi = self.first_slice.partition_point(|&s| s <= global).checked_sub(1)?;
+        let fi = self
+            .first_slice
+            .partition_point(|&s| s <= global)
+            .checked_sub(1)?;
         let slice = global.checked_sub(*self.first_slice.get(fi)?)?;
         (slice < self.files.get(fi)?.slices.len()).then_some((fi, slice))
     }
@@ -353,7 +433,15 @@ impl StreamingSliceAssembler {
     pub fn status(&self) -> StreamStatus {
         let unknown = self.state.len().saturating_sub(self.bank.folded_count());
         let ready = self.bank.ready_syndromes().len();
-        if self.bank.can_solve_now() { StreamStatus::ReadyToSolve { unknown, ready } } else { StreamStatus::Collecting { verified: self.bank.folded_count(), unknown, ready } }
+        if self.bank.can_solve_now() {
+            StreamStatus::ReadyToSolve { unknown, ready }
+        } else {
+            StreamStatus::Collecting {
+                verified: self.bank.folded_count(),
+                unknown,
+                ready,
+            }
+        }
     }
 
     /// Whether every unknown slice can be solved now.
@@ -373,8 +461,17 @@ impl StreamingSliceAssembler {
     }
 
     /// Verify a complete (padded) slice buffer and fold it.
-    fn complete_slice(&mut self, global: usize, fi: usize, si: usize, buf: &[u8], events: &mut Vec<StreamEvent>) {
-        let Some(exp) = self.files.get(fi).and_then(|f| f.slices.get(si)) else { return };
+    fn complete_slice(
+        &mut self,
+        global: usize,
+        fi: usize,
+        si: usize,
+        buf: &[u8],
+        events: &mut Vec<StreamEvent>,
+    ) {
+        let Some(exp) = self.files.get(fi).and_then(|f| f.slices.get(si)) else {
+            return;
+        };
         let ok = crc32(buf) == exp.crc32 && <[u8; 16]>::from(Md5::digest(buf)) == exp.md5;
         if ok && self.bank.fold_verified(global, buf).is_ok() {
             if let Some(s) = self.state.get_mut(global) {
@@ -391,10 +488,20 @@ impl StreamingSliceAssembler {
 
     /// Deliver decoded bytes of file `file_id` starting at `byte_offset`. Bytes beyond the file
     /// size are ignored. Returns the events this chunk produced.
-    pub fn push_chunk(&mut self, file_id: &[u8; 16], byte_offset: u64, data: &[u8]) -> Result<Vec<StreamEvent>, RepairError> {
+    pub fn push_chunk(
+        &mut self,
+        file_id: &[u8; 16],
+        byte_offset: u64,
+        data: &[u8],
+    ) -> Result<Vec<StreamEvent>, RepairError> {
         let mut events = Vec::new();
-        let Some(fi) = self.file_index(file_id) else { return Err(RepairError::BadIndex(usize::MAX)) };
-        let (size, ss) = (self.files.get(fi).map_or(0, |f| f.size), self.bank.slice_size() as u64);
+        let Some(fi) = self.file_index(file_id) else {
+            return Err(RepairError::BadIndex(usize::MAX));
+        };
+        let (size, ss) = (
+            self.files.get(fi).map_or(0, |f| f.size),
+            self.bank.slice_size() as u64,
+        );
         if byte_offset >= size || data.is_empty() {
             return Ok(events);
         }
@@ -408,9 +515,17 @@ impl StreamingSliceAssembler {
             let in_slice = usize::try_from(pos - slice_start).unwrap_or(0);
             let seg_len = usize::try_from(seg_end - pos).unwrap_or(0);
             let src_off = usize::try_from(pos - byte_offset).unwrap_or(0);
-            let Some(segment) = data.get(src_off..src_off.saturating_add(seg_len)) else { break };
-            let Some(global) = self.global_slice(fi, si) else { break };
-            let state = self.state.get(global).copied().unwrap_or(SliceState::Pending);
+            let Some(segment) = data.get(src_off..src_off.saturating_add(seg_len)) else {
+                break;
+            };
+            let Some(global) = self.global_slice(fi, si) else {
+                break;
+            };
+            let state = self
+                .state
+                .get(global)
+                .copied()
+                .unwrap_or(SliceState::Pending);
             if state == SliceState::Pending {
                 if in_slice == 0 && seg_len == slice_len {
                     // Whole slice in this chunk: verify straight from the article.
@@ -426,14 +541,29 @@ impl StreamingSliceAssembler {
                 } else {
                     let ss_us = self.bank.slice_size();
                     if !self.staging.contains_key(&global) {
-                        if self.max_staging_bytes != 0 && self.staging_bytes.saturating_add(ss_us) > self.max_staging_bytes {
-                            return Err(RepairError::Io { context: "staging budget exhausted".into(), source: std::io::Error::new(std::io::ErrorKind::OutOfMemory, "staging budget exhausted") });
+                        if self.max_staging_bytes != 0
+                            && self.staging_bytes.saturating_add(ss_us) > self.max_staging_bytes
+                        {
+                            return Err(RepairError::Io {
+                                context: "staging budget exhausted".into(),
+                                source: std::io::Error::new(
+                                    std::io::ErrorKind::OutOfMemory,
+                                    "staging budget exhausted",
+                                ),
+                            });
                         }
-                        self.staging.insert(global, Staging { buf: vec![0u8; ss_us], covered: Vec::new() });
+                        self.staging.insert(
+                            global,
+                            Staging {
+                                buf: vec![0u8; ss_us],
+                                covered: Vec::new(),
+                            },
+                        );
                         self.staging_bytes = self.staging_bytes.saturating_add(ss_us);
                     }
                     let done = if let Some(st) = self.staging.get_mut(&global) {
-                        if let Some(d) = st.buf.get_mut(in_slice..in_slice.saturating_add(seg_len)) {
+                        if let Some(d) = st.buf.get_mut(in_slice..in_slice.saturating_add(seg_len))
+                        {
                             d.copy_from_slice(segment);
                         }
                         st.add(in_slice, in_slice.saturating_add(seg_len));
@@ -455,10 +585,20 @@ impl StreamingSliceAssembler {
 
     /// An article covering `[byte_offset, byte_offset + len)` of `file_id` failed for good:
     /// every pending slice it touches becomes damaged (verified slices are unaffected).
-    pub fn mark_range_damaged(&mut self, file_id: &[u8; 16], byte_offset: u64, len: u64) -> Vec<StreamEvent> {
+    pub fn mark_range_damaged(
+        &mut self,
+        file_id: &[u8; 16],
+        byte_offset: u64,
+        len: u64,
+    ) -> Vec<StreamEvent> {
         let mut events = Vec::new();
-        let Some(fi) = self.file_index(file_id) else { return events };
-        let (size, ss) = (self.files.get(fi).map_or(0, |f| f.size), self.bank.slice_size() as u64);
+        let Some(fi) = self.file_index(file_id) else {
+            return events;
+        };
+        let (size, ss) = (
+            self.files.get(fi).map_or(0, |f| f.size),
+            self.bank.slice_size() as u64,
+        );
         if len == 0 || byte_offset >= size {
             return events;
         }
@@ -466,7 +606,9 @@ impl StreamingSliceAssembler {
         let first = usize::try_from(byte_offset / ss).unwrap_or(usize::MAX);
         let last = usize::try_from((end - 1) / ss).unwrap_or(usize::MAX);
         for si in first..=last {
-            let Some(global) = self.global_slice(fi, si) else { break };
+            let Some(global) = self.global_slice(fi, si) else {
+                break;
+            };
             if self.state.get(global).copied() == Some(SliceState::Pending) {
                 if let Some(s) = self.state.get_mut(global) {
                     *s = SliceState::Damaged;
@@ -482,7 +624,11 @@ impl StreamingSliceAssembler {
     }
 
     /// A recovery slice arrived (any time). Untracked exponents are ignored.
-    pub fn push_recovery(&mut self, exponent: u32, data: &[u8]) -> Result<Vec<StreamEvent>, RepairError> {
+    pub fn push_recovery(
+        &mut self,
+        exponent: u32,
+        data: &[u8],
+    ) -> Result<Vec<StreamEvent>, RepairError> {
         let mut events = Vec::new();
         if self.bank.xor_recovery(exponent, data)? {
             events.push(StreamEvent::RecoveryReceived { exponent });
@@ -496,19 +642,32 @@ impl StreamingSliceAssembler {
         self.bank.solve_now()
     }
 
-    /// Solve only the given unknown slices (e.g. an archive's header and tail).
-    pub fn solve_selected_slices(&self, wanted: &[usize]) -> Result<Vec<(usize, Vec<u8>)>, RepairError> {
+    /// Solve only the given unknown slices (for example, an archive's header and tail).
+    pub fn solve_selected_slices(
+        &self,
+        wanted: &[usize],
+    ) -> Result<Vec<(usize, Vec<u8>)>, RepairError> {
         self.bank.solve_selected(wanted)
     }
 
     /// Global indices of damaged slices.
     pub fn damaged_slices(&self) -> Vec<usize> {
-        self.state.iter().enumerate().filter(|(_, s)| **s == SliceState::Damaged).map(|(i, _)| i).collect()
+        self.state
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == SliceState::Damaged)
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Global indices of pending slices.
     pub fn pending_slices(&self) -> Vec<usize> {
-        self.state.iter().enumerate().filter(|(_, s)| **s == SliceState::Pending).map(|(i, _)| i).collect()
+        self.state
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == SliceState::Pending)
+            .map(|(i, _)| i)
+            .collect()
     }
 }
 
@@ -518,7 +677,9 @@ mod tests {
     use crate::reed_solomon::encode_reference;
 
     fn data(n: usize, seed: u32) -> Vec<u8> {
-        (0..n as u32).map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8).collect()
+        (0..n as u32)
+            .map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8)
+            .collect()
     }
 
     fn layout(id: u8, bytes: &[u8], ss: usize) -> (FileLayout, Vec<Vec<u8>>) {
@@ -530,8 +691,21 @@ mod tests {
                 p
             })
             .collect();
-        let slices = padded.iter().map(|p| SliceChecksum { md5: Md5::digest(p).into(), crc32: crc32(p) }).collect();
-        (FileLayout { file_id: [id; 16], size: bytes.len() as u64, slices }, padded)
+        let slices = padded
+            .iter()
+            .map(|p| SliceChecksum {
+                md5: Md5::digest(p).into(),
+                crc32: crc32(p),
+            })
+            .collect();
+        (
+            FileLayout {
+                file_id: [id; 16],
+                size: bytes.len() as u64,
+                slices,
+            },
+            padded,
+        )
     }
 
     #[test]
@@ -546,7 +720,9 @@ mod tests {
         let all: Vec<Vec<u8>> = pa.iter().chain(&pb).cloned().collect();
         let refs: Vec<&[u8]> = all.iter().map(|v| v.as_slice()).collect();
         let rec = encode_reference(ss, &refs, &[0, 1, 2]);
-        let mut asm = StreamingSliceAssembler::new(ss, vec![lb.clone(), la.clone()], &[0, 1, 2], k, 0).unwrap();
+        let mut asm =
+            StreamingSliceAssembler::new(ss, vec![lb.clone(), la.clone()], &[0, 1, 2], k, 0)
+                .unwrap();
         assert_eq!(asm.files()[0].file_id, [5; 16]);
         assert_eq!(asm.total_slices(), 6);
         assert_eq!(asm.global_slice(1, 1), Some(5));
@@ -565,7 +741,13 @@ mod tests {
         let ev = asm.push_chunk(&[5; 16], 0, &a[0..700]).unwrap();
         assert!(ev.is_empty());
         let ev = asm.push_chunk(&[5; 16], 700, &a[700..1400]).unwrap();
-        assert_eq!(ev, vec![StreamEvent::SliceVerified { global: 0 }, StreamEvent::SliceVerified { global: 1 }]);
+        assert_eq!(
+            ev,
+            vec![
+                StreamEvent::SliceVerified { global: 0 },
+                StreamEvent::SliceVerified { global: 1 }
+            ]
+        );
         assert_eq!(asm.staging_bytes(), ss);
         // Article 3 (2100..2800) still leaves slice 2 (2000..3000) open; article 4 (2800..3500)
         // would finish it and carry the padded tail slice 3.
@@ -574,28 +756,62 @@ mod tests {
         assert_eq!(asm.staging_bytes(), ss);
         // Article 4 lost: slices 2 and 3 damaged, staging released.
         let ev = asm.mark_range_damaged(&[5; 16], 2800, 700);
-        assert_eq!(ev, vec![StreamEvent::SliceDamaged { global: 2 }, StreamEvent::SliceDamaged { global: 3 }]);
+        assert_eq!(
+            ev,
+            vec![
+                StreamEvent::SliceDamaged { global: 2 },
+                StreamEvent::SliceDamaged { global: 3 }
+            ]
+        );
         assert_eq!(asm.staging_bytes(), 0);
         assert_eq!(asm.slice_state(3), Some(SliceState::Damaged));
         // File b: slice 0 whole, slice 1 pending. Unknown = {2, 3, 5} > ready {1}.
         let ev = asm.push_chunk(&[9; 16], 0, &b[..1000]).unwrap();
         assert_eq!(ev, vec![StreamEvent::SliceVerified { global: 4 }]);
         assert!(!asm.can_solve_now());
-        assert_eq!(asm.status(), StreamStatus::Collecting { verified: 3, unknown: 3, ready: 1 });
+        assert_eq!(
+            asm.status(),
+            StreamStatus::Collecting {
+                verified: 3,
+                unknown: 3,
+                ready: 1
+            }
+        );
         let ev = asm.push_recovery(0, &rec[0]).unwrap();
         assert_eq!(ev, vec![StreamEvent::RecoveryReceived { exponent: 0 }]);
         // Third recovery slice → ready, without downloading b's second slice.
         let ev = asm.push_recovery(2, &rec[2]).unwrap();
-        assert_eq!(ev, vec![StreamEvent::RecoveryReceived { exponent: 2 }, StreamEvent::ReadyToSolve]);
-        assert_eq!(asm.status(), StreamStatus::ReadyToSolve { unknown: 3, ready: 3 });
+        assert_eq!(
+            ev,
+            vec![
+                StreamEvent::RecoveryReceived { exponent: 2 },
+                StreamEvent::ReadyToSolve
+            ]
+        );
+        assert_eq!(
+            asm.status(),
+            StreamStatus::ReadyToSolve {
+                unknown: 3,
+                ready: 3
+            }
+        );
         assert_eq!(asm.damaged_slices(), vec![2, 3]);
         assert_eq!(asm.pending_slices(), vec![5]);
         let solved = asm.solve_now().unwrap();
-        assert_eq!(solved, vec![(2, pa[2].clone()), (3, pa[3].clone()), (5, pb[1].clone())]);
+        assert_eq!(
+            solved,
+            vec![(2, pa[2].clone()), (3, pa[3].clone()), (5, pb[1].clone())]
+        );
         // Surgical: just the pending tail of b.
-        assert_eq!(asm.solve_selected_slices(&[5]).unwrap(), vec![(5, pb[1].clone())]);
-        assert!(matches!(asm.solve_selected_slices(&[0]), Err(RepairError::NotMissing(0))));
-        // Duplicate delivery and late data are harmless.
+        assert_eq!(
+            asm.solve_selected_slices(&[5]).unwrap(),
+            vec![(5, pb[1].clone())]
+        );
+        assert!(matches!(
+            asm.solve_selected_slices(&[0]),
+            Err(RepairError::NotMissing(0))
+        ));
+        // Duplicate delivery and late arrival of data cause no harm.
         assert!(asm.push_recovery(0, &rec[0]).unwrap().is_empty());
         let ev = asm.push_chunk(&[9; 16], 1000, &b[1000..]).unwrap();
         assert_eq!(ev, vec![StreamEvent::SliceVerified { global: 5 }]);
@@ -604,7 +820,10 @@ mod tests {
         let mut asm2 = StreamingSliceAssembler::new(ss, vec![la.clone()], &[0], k, 0).unwrap();
         let mut bad = a[..1000].to_vec();
         bad[3] ^= 1;
-        assert_eq!(asm2.push_chunk(&[5; 16], 0, &bad).unwrap(), vec![StreamEvent::SliceMismatch { global: 0 }]);
+        assert_eq!(
+            asm2.push_chunk(&[5; 16], 0, &bad).unwrap(),
+            vec![StreamEvent::SliceMismatch { global: 0 }]
+        );
         assert!(asm2.push_chunk(&[7; 16], 0, &bad).is_err());
         assert!(asm2.push_chunk(&[5; 16], 99_999, &bad).unwrap().is_empty());
         assert!(asm2.mark_range_damaged(&[7; 16], 0, 1).is_empty());
@@ -639,11 +858,20 @@ mod tests {
         assert!(bank.xor_recovery(8, &rec[1]).unwrap());
         assert!(bank.can_solve_now());
         assert_eq!(bank.ready_syndromes(), vec![3, 8]);
-        assert_eq!(bank.solve_now().unwrap(), vec![(1, inputs[1].clone()), (3, inputs[3].clone())]);
+        assert_eq!(
+            bank.solve_now().unwrap(),
+            vec![(1, inputs[1].clone()), (3, inputs[3].clone())]
+        );
         assert!(bank.fold_verified(9, &inputs[0]).is_err());
         assert!(bank.fold_verified(1, &inputs[0][..5]).is_err());
-        assert!(matches!(bank.solve_selected(&[0]), Err(RepairError::NotMissing(0))));
-        assert!(matches!(bank.solve_selected(&[77]), Err(RepairError::BadIndex(77))));
+        assert!(matches!(
+            bank.solve_selected(&[0]),
+            Err(RepairError::NotMissing(0))
+        ));
+        assert!(matches!(
+            bank.solve_selected(&[77]),
+            Err(RepairError::BadIndex(77))
+        ));
         assert!(bank.solve_selected(&[]).unwrap().is_empty());
         assert!(bank.is_folded(0) && !bank.is_folded(1) && !bank.is_folded(99));
         assert!(SyndromeBank::new(0, 1, &[0], k).is_err());

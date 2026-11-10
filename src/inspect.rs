@@ -2,7 +2,7 @@
 //!
 //! [`inspect_par2`] walks a byte buffer (typically the decoded articles of a `.par2` file or the
 //! head of a `.volNNN+MM.par2` volume) and classifies every packet of the twelve PAR2 v2.0
-//! packet types, resynchronising on the `PAR2\0PKT` magic after garbage, truncation or a
+//! packet types, resynchronising on the `PAR2\0PKT` magic after garbage, truncation, or a
 //! corrupt header. Nothing is copied out of the buffer except the small decoded fields; slice
 //! payloads are reported as `(offset, length)` ranges. Every field is bounds checked: a
 //! truncated or adversarial buffer yields a partial report, never a panic.
@@ -38,11 +38,11 @@ pub enum PacketKind {
     RecvSlic,
     /// `Creator`: client string.
     Creator,
-    /// `UniFileN`: UTF-16LE file name.
+    /// `UniFileN`: `UTF-16LE` filename.
     UniFileN,
-    /// `CommASCI`: ASCII comment.
+    /// `CommASCI`: `ASCII` comment.
     CommAsci,
-    /// `CommUni`: UTF-16LE comment.
+    /// `CommUni`: `UTF-16LE` comment.
     CommUni,
     /// `FileSlic`: an input file slice stored inside the par2 set.
     FileSlic,
@@ -187,7 +187,11 @@ pub fn detect_format(data: &[u8]) -> Option<ParFormat> {
     let p2 = memchr::memmem::find(head, &PAR2_MAGIC);
     let p3 = memchr::memmem::find(head, &PAR3_MAGIC);
     match (p2, p3) {
-        (Some(a), Some(b)) => Some(if a <= b { ParFormat::Par2 } else { ParFormat::Par3 }),
+        (Some(a), Some(b)) => Some(if a <= b {
+            ParFormat::Par2
+        } else {
+            ParFormat::Par3
+        }),
         (Some(_), None) => Some(ParFormat::Par2),
         (None, Some(_)) => Some(ParFormat::Par3),
         (None, None) => None,
@@ -239,9 +243,9 @@ pub struct CreatorInfo {
     pub raw: String,
     /// Classified tool.
     pub tool: CreatorTool,
-    /// Version token (e.g. `0.8.1`, `1.5.0`), if present.
+    /// Version token (for example, `0.8.1`, `1.5.0`), if present.
     pub version: Option<String>,
-    /// Architecture / platform token (e.g. `x86_64`, `aarch64`, `win64`), if present.
+    /// Architecture / platform token (for example, `x86_64`, `aarch64`, `win64`), if present.
     pub arch: Option<String>,
 }
 
@@ -262,7 +266,10 @@ impl CreatorInfo {
             CreatorTool::ParPar
         } else if lower.contains("nzbfast") || lower.contains("parfast") {
             CreatorTool::Nzbfast
-        } else if lower.contains("par-rs") || lower.contains("nzbget-parity") || lower.contains("par_rs") {
+        } else if lower.contains("par-rs")
+            || lower.contains("nzbget-parity")
+            || lower.contains("par_rs")
+        {
             CreatorTool::ParRs
         } else {
             CreatorTool::Other
@@ -272,24 +279,39 @@ impl CreatorInfo {
             .map(|t| t.trim_start_matches(['v', 'V']))
             .find(|t| {
                 let mut dots = 0;
-                !t.is_empty() && t.chars().all(|c| {
-                    if c == '.' {
-                        dots += 1;
-                    }
-                    c.is_ascii_digit() || c == '.'
-                }) && dots >= 1
+                !t.is_empty()
+                    && t.chars().all(|c| {
+                        if c == '.' {
+                            dots += 1;
+                        }
+                        c.is_ascii_digit() || c == '.'
+                    })
+                    && dots >= 1
                     && t.chars().next().is_some_and(|c| c.is_ascii_digit())
             })
             .map(str::to_owned);
-        let arch = ["x86_64", "amd64", "x64", "aarch64", "arm64", "armv7", "armhf", "i686", "x86", "win64", "win32", "linux", "darwin", "macos", "windows"]
-            .iter()
-            .find(|a| lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|t| t == **a))
-            .map(|a| (*a).to_owned());
-        Self { set_id: None, raw, tool, version, arch }
+        let arch = [
+            "x86_64", "amd64", "x64", "aarch64", "arm64", "armv7", "armhf", "i686", "x86", "win64",
+            "win32", "linux", "darwin", "macos", "windows",
+        ]
+        .iter()
+        .find(|a| {
+            lower
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|t| t == **a)
+        })
+        .map(|a| (*a).to_owned());
+        Self {
+            set_id: None,
+            raw,
+            tool,
+            version,
+            arch,
+        }
     }
 }
 
-/// Analysis of a PAR2 file name.
+/// Analysis of a PAR2 filename.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Par2FileName {
     /// Name without the `.par2` / `.volNNN+MM.par2` suffix.
@@ -308,20 +330,35 @@ pub fn parse_par2_filename(name: &str) -> Option<Par2FileName> {
     let stem = lower.strip_suffix(".par2")?;
     let orig_stem = name.get(..stem.len())?;
     let Some(dot) = stem.rfind(".vol") else {
-        return Some(Par2FileName { base: orig_stem.to_owned(), first_block: None, block_count: None, is_index: true });
+        return Some(Par2FileName {
+            base: orig_stem.to_owned(),
+            first_block: None,
+            block_count: None,
+            is_index: true,
+        });
     };
     let seg = stem.get(dot.checked_add(4)?..)?;
     let base = orig_stem.get(..dot)?.to_owned();
     if let Some((a, b)) = seg.split_once('+') {
         let first = a.parse::<u32>().ok()?;
         let count = b.parse::<u32>().ok()?;
-        return Some(Par2FileName { base, first_block: Some(first), block_count: Some(count), is_index: false });
+        return Some(Par2FileName {
+            base,
+            first_block: Some(first),
+            block_count: Some(count),
+            is_index: false,
+        });
     }
     if let Some((a, b)) = seg.split_once('-') {
         let first = a.parse::<u32>().ok()?;
         let last = b.parse::<u32>().ok()?;
         let count = last.checked_sub(first)?.checked_add(1)?;
-        return Some(Par2FileName { base, first_block: Some(first), block_count: Some(count), is_index: false });
+        return Some(Par2FileName {
+            base,
+            first_block: Some(first),
+            block_count: Some(count),
+            is_index: false,
+        });
     }
     None
 }
@@ -360,9 +397,9 @@ pub struct MainInfo {
     pub non_recovery_set: Vec<[u8; 16]>,
     /// The body was shorter than its file count claimed.
     pub truncated: bool,
-    /// `MD5(body) == set_id`: PAR2 derives the set id from the Main packet body, so when this
-    /// holds the file lists above are exactly the ones the set id was made from (nobody added a
-    /// file to the set afterwards).
+    /// `MD5(body) == set_id`: `PAR2` derives the set id from the Main packet body, so when this
+    /// holds the `recovery_set` and `non_recovery_set` lists are exactly the ones the set id was
+    /// made from (nobody added a file to the set afterwards).
     pub body_hashes_to_set_id: bool,
 }
 
@@ -506,11 +543,11 @@ fn shaped(length: u64) -> bool {
     length >= HEADER_LEN as u64 && length.is_multiple_of(4)
 }
 
-/// Decode a PAR2 name: UTF-8 (lossily) with control characters, ANSI escape sequences and
+/// Decode a PAR2 name: `UTF-8` (lossily) with control characters, ANSI escape sequences, and
 /// path components removed. An empty result becomes `"_"`.
 pub fn sanitize_name(raw: &[u8]) -> String {
     let s = String::from_utf8_lossy(trim_nul(raw));
-    // Drop ESC [ ... <final byte> sequences, then every other control character.
+    // Drop `ESC [ ... <final byte>` sequences, then every other control character.
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -533,13 +570,24 @@ pub fn sanitize_name(raw: &[u8]) -> String {
     // Keep only the final path component; `..` components vanish with the rest.
     let last = out.rsplit(['/', '\\']).next().unwrap_or("").trim();
     let last = last.trim_start_matches('.').trim();
-    if last.is_empty() { "_".to_owned() } else { last.to_owned() }
+    if last.is_empty() {
+        "_".to_owned()
+    } else {
+        last.to_owned()
+    }
 }
 
 /// Decode UTF-16LE (lossily) and sanitise like [`sanitize_name`].
 pub fn sanitize_utf16le_name(raw: &[u8]) -> String {
-    let units: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
-    let s: String = char::decode_utf16(units.iter().copied()).map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER)).collect();
+    let units: Vec<u16> = raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    let s: String = char::decode_utf16(units.iter().copied())
+        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
     let trimmed = s.trim_end_matches('\0');
     sanitize_name(trimmed.as_bytes())
 }
@@ -579,7 +627,15 @@ fn parse_main(set_id: [u8; 16], body: &[u8], packed: bool) -> Option<MainInfo> {
         }
     }
     let body_hashes_to_set_id = <[u8; 16]>::from(Md5::digest(body)) == set_id;
-    Some(MainInfo { set_id, slice_size, subslice_size, recovery_set, non_recovery_set, truncated, body_hashes_to_set_id })
+    Some(MainInfo {
+        set_id,
+        slice_size,
+        subslice_size,
+        recovery_set,
+        non_recovery_set,
+        truncated,
+        body_hashes_to_set_id,
+    })
 }
 
 fn parse_file_desc(set_id: [u8; 16], body: &[u8]) -> Option<FileDescInfo> {
@@ -589,7 +645,15 @@ fn parse_file_desc(set_id: [u8; 16], body: &[u8]) -> Option<FileDescInfo> {
     let length = u64_le(body, 48)?;
     let name_raw = trim_nul(body.get(56..)?).to_vec();
     let name = sanitize_name(&name_raw);
-    Some(FileDescInfo { set_id, file_id, md5, md5_16k, length, name_raw, name })
+    Some(FileDescInfo {
+        set_id,
+        file_id,
+        md5,
+        md5_16k,
+        length,
+        name_raw,
+        name,
+    })
 }
 
 fn parse_checksum_pairs(body: &[u8]) -> Vec<([u8; 16], u32)> {
@@ -619,7 +683,14 @@ pub enum VerifyMode {
 /// Inspect a PAR2 buffer. With `verify_packet_md5` every packet whose body is fully present has
 /// its MD5 checked (recovery slices included, which costs one pass over their data).
 pub fn inspect_par2(data: &[u8], verify_packet_md5: bool) -> Par2Inspection {
-    inspect_par2_with(data, if verify_packet_md5 { VerifyMode::All } else { VerifyMode::None })
+    inspect_par2_with(
+        data,
+        if verify_packet_md5 {
+            VerifyMode::All
+        } else {
+            VerifyMode::None
+        },
+    )
 }
 
 /// [`inspect_par2`] with a choice of which packets to verify.
@@ -628,7 +699,10 @@ pub fn inspect_par2(data: &[u8], verify_packet_md5: bool) -> Par2Inspection {
 /// declared length either: the scanner resynchronises right after its magic, so a garbage header
 /// cannot swallow the real packet that follows it.
 pub fn inspect_par2_with(data: &[u8], verify: VerifyMode) -> Par2Inspection {
-    let mut r = Par2Inspection { format: detect_format(data), ..Par2Inspection::default() };
+    let mut r = Par2Inspection {
+        format: detect_format(data),
+        ..Par2Inspection::default()
+    };
     if let Some(h) = parse_par1_header(data) {
         r.par1 = Some(h);
         return r;
@@ -688,20 +762,26 @@ pub fn inspect_par2_with(data: &[u8], verify: VerifyMode) -> Par2Inspection {
             break;
         };
         if !shaped(length) {
-            // Corrupt header: resynchronise after the magic.
+            // Corrupt header: resynchronize after the magic.
             pos = off.saturating_add(8);
             continue;
         }
         let kind = PacketKind::from_type(&type_bytes);
         let body_off = off.saturating_add(HEADER_LEN);
         let body_len_u64 = length - HEADER_LEN as u64;
-        let available_body = data.len().saturating_sub(body_off).min(usize::try_from(body_len_u64).unwrap_or(usize::MAX));
+        let available_body = data
+            .len()
+            .saturating_sub(body_off)
+            .min(usize::try_from(body_len_u64).unwrap_or(usize::MAX));
         let complete = available_body as u64 == body_len_u64;
         if !complete {
             r.truncated = true;
         }
         let body = take(data, body_off, available_body).unwrap_or(&[]);
-        let bulk = matches!(kind, PacketKind::RecvSlic | PacketKind::PkdRecvS | PacketKind::FileSlic);
+        let bulk = matches!(
+            kind,
+            PacketKind::RecvSlic | PacketKind::PkdRecvS | PacketKind::FileSlic
+        );
         let check = match verify {
             VerifyMode::None => false,
             VerifyMode::Metadata => !bulk,
@@ -720,7 +800,15 @@ pub fn inspect_par2_with(data: &[u8], verify: VerifyMode) -> Par2Inspection {
         } else {
             None
         };
-        r.packets.push(PacketInfo { offset: off, length, set_id, kind, type_bytes, md5_ok, md5 });
+        r.packets.push(PacketInfo {
+            offset: off,
+            length,
+            set_id,
+            kind,
+            type_bytes,
+            md5_ok,
+            md5,
+        });
         // A failed MD5, or an unknown type that could not be verified, means the header itself
         // may be garbage: do not skip its declared length, look for the next magic instead.
         if md5_ok == Some(false) || (kind == PacketKind::Unknown && md5_ok != Some(true)) {
@@ -742,14 +830,20 @@ pub fn inspect_par2_with(data: &[u8], verify: VerifyMode) -> Par2Inspection {
                 PacketKind::Ifsc => {
                     if let Some(file_id) = array::<16>(body, 0) {
                         let slices = parse_checksum_pairs(body.get(16..).unwrap_or(&[]));
-                        r.ifsc.push(IfscInfo { set_id, file_id, slices });
+                        r.ifsc.push(IfscInfo {
+                            set_id,
+                            file_id,
+                            slices,
+                        });
                     }
                 }
                 PacketKind::RecvSlic | PacketKind::PkdRecvS => {
                     if let Some(exponent) = u32_le(body, 0) {
                         let payload = body.get(4..).unwrap_or(&[]);
                         let exp0_prefix_md5 = (exponent == 0 && !payload.is_empty()).then(|| {
-                            let head = payload.get(..payload.len().min(EXP0_PREFIX_LEN)).unwrap_or(payload);
+                            let head = payload
+                                .get(..payload.len().min(EXP0_PREFIX_LEN))
+                                .unwrap_or(payload);
                             Md5::digest(head).into()
                         });
                         r.recovery.push(RecoverySliceInfo {
@@ -763,35 +857,71 @@ pub fn inspect_par2_with(data: &[u8], verify: VerifyMode) -> Par2Inspection {
                         });
                     }
                 }
-                PacketKind::Creator => r.creators.push(CreatorInfo { set_id: Some(set_id), ..CreatorInfo::parse(body) }),
+                PacketKind::Creator => r.creators.push(CreatorInfo {
+                    set_id: Some(set_id),
+                    ..CreatorInfo::parse(body)
+                }),
                 PacketKind::UniFileN => {
                     if let Some(file_id) = array::<16>(body, 0) {
-                        r.unicode_names.push(UnicodeNameInfo { set_id, file_id, name: sanitize_utf16le_name(body.get(16..).unwrap_or(&[])) });
+                        r.unicode_names.push(UnicodeNameInfo {
+                            set_id,
+                            file_id,
+                            name: sanitize_utf16le_name(body.get(16..).unwrap_or(&[])),
+                        });
                     }
                 }
                 PacketKind::CommAsci => {
-                    r.comments.push(CommentInfo { set_id, text: String::from_utf8_lossy(trim_nul(body)).into_owned(), unicode: false });
+                    r.comments.push(CommentInfo {
+                        set_id,
+                        text: String::from_utf8_lossy(trim_nul(body)).into_owned(),
+                        unicode: false,
+                    });
                 }
                 PacketKind::CommUni => {
-                    // 16 bytes: MD5 of the ASCII comment packet, then UTF-16LE text.
+                    // 16 bytes: `MD5` of the ASCII comment packet, then UTF-16LE text.
                     let text_bytes = body.get(16..).unwrap_or(&[]);
-                    let units: Vec<u16> = text_bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
-                    let text: String = char::decode_utf16(units).map(|x| x.unwrap_or(char::REPLACEMENT_CHARACTER)).collect();
-                    r.comments.push(CommentInfo { set_id, text: text.trim_end_matches('\0').to_owned(), unicode: true });
+                    let units: Vec<u16> = text_bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| u16::from_le_bytes(*c))
+                        .collect();
+                    let text: String = char::decode_utf16(units)
+                        .map(|x| x.unwrap_or(char::REPLACEMENT_CHARACTER))
+                        .collect();
+                    r.comments.push(CommentInfo {
+                        set_id,
+                        text: text.trim_end_matches('\0').to_owned(),
+                        unicode: true,
+                    });
                 }
                 PacketKind::FileSlic => {
-                    if let (Some(file_id), Some(slice_index)) = (array::<16>(body, 0), u64_le(body, 16)) {
-                        r.file_slices.push(FileSliceInfo { set_id, file_id, slice_index, data_offset: body_off.saturating_add(24), data_len: body_len_u64.saturating_sub(24) });
+                    if let (Some(file_id), Some(slice_index)) =
+                        (array::<16>(body, 0), u64_le(body, 16))
+                    {
+                        r.file_slices.push(FileSliceInfo {
+                            set_id,
+                            file_id,
+                            slice_index,
+                            data_offset: body_off.saturating_add(24),
+                            data_len: body_len_u64.saturating_sub(24),
+                        });
                     }
                 }
-                PacketKind::Rfsc => r.recovery_checksums.push(RecoveryChecksumInfo { set_id, slices: parse_checksum_pairs(body) }),
+                PacketKind::Rfsc => r.recovery_checksums.push(RecoveryChecksumInfo {
+                    set_id,
+                    slices: parse_checksum_pairs(body),
+                }),
                 PacketKind::Unknown => {}
             }
         }
         if !complete {
             break;
         }
-        pos = match usize::try_from(length).ok().and_then(|l| off.checked_add(l)) {
+        pos = match usize::try_from(length)
+            .ok()
+            .and_then(|l| off.checked_add(l))
+        {
             Some(p) => p,
             None => break,
         };
@@ -811,7 +941,10 @@ pub(crate) fn inspect_for_inventory(data: &[u8]) -> Option<Par2Inspection> {
     if parse_par1_header(data).is_some() {
         return None;
     }
-    let mut r = Par2Inspection { format: detect_format(data), ..Par2Inspection::default() };
+    let mut r = Par2Inspection {
+        format: detect_format(data),
+        ..Par2Inspection::default()
+    };
     let finder = memchr::memmem::Finder::new(&PAR2_MAGIC);
     let mut msgs: Vec<&[u8]> = Vec::new();
     let mut expected: Vec<[u8; 16]> = Vec::new();
@@ -820,7 +953,12 @@ pub(crate) fn inspect_for_inventory(data: &[u8]) -> Option<Par2Inspection> {
         let rest = data.get(pos..)?;
         let Some(rel) = finder.find(rest) else { break };
         let off = pos.saturating_add(rel);
-        let (Some(length), Some(md5), Some(set_id), Some(type_bytes)) = (u64_le(data, off.saturating_add(8)), array::<16>(data, off.saturating_add(16)), array::<16>(data, off.saturating_add(32)), array::<16>(data, off.saturating_add(48))) else {
+        let (Some(length), Some(md5), Some(set_id), Some(type_bytes)) = (
+            u64_le(data, off.saturating_add(8)),
+            array::<16>(data, off.saturating_add(16)),
+            array::<16>(data, off.saturating_add(32)),
+            array::<16>(data, off.saturating_add(48)),
+        ) else {
             r.truncated = true;
             break;
         };
@@ -831,7 +969,10 @@ pub(crate) fn inspect_for_inventory(data: &[u8]) -> Option<Par2Inspection> {
         let kind = PacketKind::from_type(&type_bytes);
         let body_off = off.saturating_add(HEADER_LEN);
         let body_len_u64 = length - HEADER_LEN as u64;
-        let available_body = data.len().saturating_sub(body_off).min(usize::try_from(body_len_u64).unwrap_or(usize::MAX));
+        let available_body = data
+            .len()
+            .saturating_sub(body_off)
+            .min(usize::try_from(body_len_u64).unwrap_or(usize::MAX));
         let complete = available_body as u64 == body_len_u64;
         if !complete {
             if kind == PacketKind::Unknown {
@@ -841,10 +982,20 @@ pub(crate) fn inspect_for_inventory(data: &[u8]) -> Option<Par2Inspection> {
             break;
         }
         let body = take(data, body_off, available_body).unwrap_or(&[]);
-        let bulk = matches!(kind, PacketKind::RecvSlic | PacketKind::PkdRecvS | PacketKind::FileSlic);
+        let bulk = matches!(
+            kind,
+            PacketKind::RecvSlic | PacketKind::PkdRecvS | PacketKind::FileSlic
+        );
         if !bulk {
             // set id ‖ type ‖ body is contiguous in the buffer: hash it in place later.
-            msgs.push(take(data, off.saturating_add(32), available_body.saturating_add(32)).unwrap_or(&[]));
+            msgs.push(
+                take(
+                    data,
+                    off.saturating_add(32),
+                    available_body.saturating_add(32),
+                )
+                .unwrap_or(&[]),
+            );
             expected.push(md5);
         }
         match kind {
@@ -860,18 +1011,31 @@ pub(crate) fn inspect_for_inventory(data: &[u8]) -> Option<Par2Inspection> {
             }
             PacketKind::Ifsc => {
                 if let Some(file_id) = array::<16>(body, 0) {
-                    r.ifsc.push(IfscInfo { set_id, file_id, slices: parse_checksum_pairs(body.get(16..).unwrap_or(&[])) });
+                    r.ifsc.push(IfscInfo {
+                        set_id,
+                        file_id,
+                        slices: parse_checksum_pairs(body.get(16..).unwrap_or(&[])),
+                    });
                 }
             }
             PacketKind::UniFileN => {
                 if let Some(file_id) = array::<16>(body, 0) {
-                    r.unicode_names.push(UnicodeNameInfo { set_id, file_id, name: sanitize_utf16le_name(body.get(16..).unwrap_or(&[])) });
+                    r.unicode_names.push(UnicodeNameInfo {
+                        set_id,
+                        file_id,
+                        name: sanitize_utf16le_name(body.get(16..).unwrap_or(&[])),
+                    });
                 }
             }
-            PacketKind::Creator => r.creators.push(CreatorInfo { set_id: Some(set_id), ..CreatorInfo::parse(body) }),
+            PacketKind::Creator => r.creators.push(CreatorInfo {
+                set_id: Some(set_id),
+                ..CreatorInfo::parse(body)
+            }),
             _ => {}
         }
-        pos = usize::try_from(length).ok().and_then(|l| off.checked_add(l))?;
+        pos = usize::try_from(length)
+            .ok()
+            .and_then(|l| off.checked_add(l))?;
     }
     if !msgs.is_empty() {
         let got = crate::md5simd::md5_many(&msgs);
@@ -892,24 +1056,45 @@ mod tests {
         assert_eq!(c.tool, CreatorTool::Par2CmdlineTurbo);
         assert_eq!(c.version.as_deref(), Some("1.1.1"));
         assert_eq!(c.arch.as_deref(), Some("x86_64"));
-        assert_eq!(CreatorInfo::parse(b"Created by par2cmdline version 0.8.1.").tool, CreatorTool::Par2Cmdline);
-        assert_eq!(CreatorInfo::parse(b"QuickPar 0.9").tool, CreatorTool::QuickPar);
-        assert_eq!(CreatorInfo::parse(b"MultiPar v1.3.2.6 (par2j64)").tool, CreatorTool::MultiPar);
-        assert_eq!(CreatorInfo::parse(b"ParPar v0.4.6 [https://animetosho.org/app/parpar]").tool, CreatorTool::ParPar);
-        assert_eq!(CreatorInfo::parse(b"nzbfast parfast 1.9.0").tool, CreatorTool::Nzbfast);
+        assert_eq!(
+            CreatorInfo::parse(b"Created by par2cmdline version 0.8.1.").tool,
+            CreatorTool::Par2Cmdline
+        );
+        assert_eq!(
+            CreatorInfo::parse(b"QuickPar 0.9").tool,
+            CreatorTool::QuickPar
+        );
+        assert_eq!(
+            CreatorInfo::parse(b"MultiPar v1.3.2.6 (par2j64)").tool,
+            CreatorTool::MultiPar
+        );
+        assert_eq!(
+            CreatorInfo::parse(b"ParPar v0.4.6 [https://animetosho.org/app/parpar]").tool,
+            CreatorTool::ParPar
+        );
+        assert_eq!(
+            CreatorInfo::parse(b"nzbfast parfast 1.9.0").tool,
+            CreatorTool::Nzbfast
+        );
         assert_eq!(CreatorInfo::parse(b"par-rs 0.2.0").tool, CreatorTool::ParRs);
         let o = CreatorInfo::parse(b"something else");
         assert_eq!(o.tool, CreatorTool::Other);
         assert_eq!(o.version, None);
         assert_eq!(CreatorTool::ParPar.to_string(), "ParPar");
-        assert_eq!(CreatorInfo::parse(b"MyTool aarch64 linux").arch.as_deref(), Some("aarch64"));
+        assert_eq!(
+            CreatorInfo::parse(b"MyTool aarch64 linux").arch.as_deref(),
+            Some("aarch64")
+        );
     }
 
     #[test]
     fn filename_analysis() {
         let v = parse_par2_filename("Release.vol007+08.PAR2").unwrap();
         assert_eq!(v.base, "Release");
-        assert_eq!((v.first_block, v.block_count, v.is_index), (Some(7), Some(8), false));
+        assert_eq!(
+            (v.first_block, v.block_count, v.is_index),
+            (Some(7), Some(8), false)
+        );
         let i = parse_par2_filename("a.b.par2").unwrap();
         assert_eq!((i.base.as_str(), i.is_index), ("a.b", true));
         let r = parse_par2_filename("x.vol10-19.par2").unwrap();
@@ -928,7 +1113,10 @@ mod tests {
         assert_eq!(sanitize_name(b"/"), "_");
         assert_eq!(sanitize_name(b""), "_");
         assert_eq!(sanitize_name(b"...hidden"), "hidden");
-        let utf16: Vec<u8> = "pâr\u{1f600}.rar".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let utf16: Vec<u8> = "pâr\u{1f600}.rar"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         assert_eq!(sanitize_utf16le_name(&utf16), "pâr\u{1f600}.rar");
         assert_eq!(sanitize_utf16le_name(&utf16[..3]), "p");
     }
@@ -945,7 +1133,16 @@ mod tests {
             p1.extend_from_slice(&v.to_le_bytes());
         }
         let h = parse_par1_header(&p1).unwrap();
-        assert_eq!((h.version, h.client, h.volume_number, h.num_files, h.data_size), (0x0001_0000, 7, 3, 4, 8));
+        assert_eq!(
+            (
+                h.version,
+                h.client,
+                h.volume_number,
+                h.num_files,
+                h.data_size
+            ),
+            (0x0001_0000, 7, 3, 4, 8)
+        );
         assert!(parse_par1_header(&p1[..90]).is_none());
         assert_eq!(detect_format(&p1), Some(ParFormat::Par1));
         let r = inspect_par2(&p1, true);
@@ -987,6 +1184,9 @@ mod tests {
             assert_eq!(PacketKind::from_type(&k.type_bytes().unwrap()), k);
         }
         assert_eq!(PacketKind::Unknown.type_bytes(), None);
-        assert_eq!(PacketKind::from_type(b"PAR 2.0\0Vendor\0\0"), PacketKind::Unknown);
+        assert_eq!(
+            PacketKind::from_type(b"PAR 2.0\0Vendor\0\0"),
+            PacketKind::Unknown
+        );
     }
 }

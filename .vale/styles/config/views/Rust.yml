@@ -1,0 +1,38 @@
+engine: tree-sitter
+scopes:
+  - expr: |
+      [(line_comment) (block_comment)] @comment
+    type: md
+  - name: output
+    expr: |
+      (macro_invocation
+        macro: [(identifier) @_macro
+                (scoped_identifier name: (identifier) @_macro)]
+        (token_tree (string_literal (string_content) @prose))
+        (#match? @_macro "^(print|println|eprint|eprintln|format|write|writeln)$"))
+    type: md
+  - name: output
+    expr: |
+      (macro_invocation
+        macro: [(identifier) @_macro
+                (scoped_identifier name: (identifier) @_macro)]
+        (token_tree (raw_string_literal (string_content) @prose))
+        (#match? @_macro "^(print|println|eprint|eprintln|format|write|writeln)$"))
+    type: md
+  - name: error
+    expr: |
+      (attribute_item
+        (attribute
+          (identifier) @_attribute
+          arguments: (token_tree [(string_literal (string_content) @prose)
+                                 (raw_string_literal (string_content) @prose)]))
+        (#eq? @_attribute "error"))
+    type: md
+  - name: message
+    expr: |
+      (call_expression
+        function: (field_expression field: (field_identifier) @_method)
+        arguments: (arguments [(string_literal (string_content) @prose)
+                               (raw_string_literal (string_content) @prose)])
+        (#match? @_method "^(message|progress|write_str)$"))
+    type: md

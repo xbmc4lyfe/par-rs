@@ -9,7 +9,7 @@
 //! * block sizes are isolated per `set_id`: a file's CRC is only folded with its own set's slice size;
 //! * `UniFileN` packets replace the ASCII name; names are stripped of control / ANSI escape
 //!   characters and path components;
-//! * prefix safety: `inventory(&data[..cut])` never panics and is monotonic in `cut` — every
+//! * prefix safety: `inventory(&data[..cut])` never panics and is monotonic in `cut`—every
 //!   file it reports is reported for every longer prefix.
 
 use crate::bytes::{file_id_key, hex};
@@ -30,9 +30,9 @@ pub struct Par2File {
     pub md5_16k: [u8; 16],
     /// File size.
     pub size: u64,
-    /// Sanitised file name (Unicode name when present).
+    /// Sanitised filename (Unicode name when present).
     pub name: String,
-    /// Listed in its set's `Main` recovery set (i.e. covered by recovery data and bound to the
+    /// Listed in its set's `Main` recovery set (covered by recovery data and bound to the
     /// set's block size).
     pub bound: bool,
     /// Whole-file CRC-32 folded from the IFSC slice checksums (needs the set's block size and
@@ -63,21 +63,26 @@ pub struct Inventory {
     pub sealed: Vec<([u8; 16], [u8; 16])>,
 }
 
-/// A byte that opens a name: whitespace, a quote or an opening bracket. Closing brackets are
+/// A byte that opens a name: whitespace, a quote, or an opening bracket. Closing brackets are
 /// not openers, so `Show (2026).par2` has the stem `Show (2026)` rather than nothing.
 fn name_opener(b: u8) -> bool {
     b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'<' | b'[' | b'(')
 }
 
 /// Does a name end at byte `at` of `subject`: the end of the text, whitespace (ASCII or Unicode,
-/// so the no-break space of a header read as Latin-1 counts, as it did for a `\\s` regex), a quote
-/// or a closing bracket? `at` must be a char boundary (it follows the ASCII `.par2`).
+/// so the no-break space of a header read as Latin-1 counts, as it did for a `\\s` regular expression),
+/// a quote, or a closing bracket? `at` must be a char boundary (it follows the ASCII `.par2`).
 #[inline]
 fn name_ends_at(subject: &str, at: usize) -> bool {
     match subject.as_bytes().get(at) {
         None => true,
-        Some(&b) if b.is_ascii() => b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'>' | b']' | b')' | 0x0b),
-        Some(_) => subject.get(at..).and_then(|t| t.chars().next()).is_some_and(char::is_whitespace),
+        Some(&b) if b.is_ascii() => {
+            b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'>' | b']' | b')' | 0x0b)
+        }
+        Some(_) => subject
+            .get(at..)
+            .and_then(|t| t.chars().next())
+            .is_some_and(char::is_whitespace),
     }
 }
 
@@ -85,19 +90,28 @@ fn name_ends_at(subject: &str, at: usize) -> bool {
 /// recovery volume name?
 fn is_volume_stem(stem: &[u8]) -> bool {
     // Find the last `.vol` (case-insensitive) and check what follows is `digits [+-] digits`.
-    let Some(p) = stem.windows(4).rposition(|w| w.eq_ignore_ascii_case(b".vol")) else {
+    let Some(p) = stem
+        .windows(4)
+        .rposition(|w| w.eq_ignore_ascii_case(b".vol"))
+    else {
         return false;
     };
     let seg = stem.get(p.saturating_add(4)..).unwrap_or(&[]);
     let Some(sep) = seg.iter().position(|&b| b == b'+' || b == b'-') else {
         return false;
     };
-    let (a, b) = (seg.get(..sep).unwrap_or(&[]), seg.get(sep.saturating_add(1)..).unwrap_or(&[]));
-    !a.is_empty() && !b.is_empty() && a.iter().all(u8::is_ascii_digit) && b.iter().all(u8::is_ascii_digit)
+    let (a, b) = (
+        seg.get(..sep).unwrap_or(&[]),
+        seg.get(sep.saturating_add(1)..).unwrap_or(&[]),
+    );
+    !a.is_empty()
+        && !b.is_empty()
+        && a.iter().all(u8::is_ascii_digit)
+        && b.iter().all(u8::is_ascii_digit)
 }
 
 /// Does a Usenet subject refer to the base `.par2` index file (not a `.volNNN+MM.par2`
-/// volume)? Case-insensitive; quoted and unquoted names are recognised.
+/// volume)? Case-insensitive; quoted and unquoted names are recognized.
 ///
 /// A name ends right after `.par2`: the next character must be the end of the subject, whitespace
 /// (ASCII or Unicode), a quote or a closing bracket, so `a.par2.rar` and `a.par2-1` are not par2 files while
@@ -109,7 +123,10 @@ pub fn is_base_par2(subject: &str) -> bool {
     let s = subject.as_bytes();
     memchr::memchr_iter(b'.', s).any(|dot| {
         // `.par2` here, ending the name?
-        if !s.get(dot.saturating_add(1)..dot.saturating_add(5)).is_some_and(|t| t.eq_ignore_ascii_case(b"par2")) {
+        if !s
+            .get(dot.saturating_add(1)..dot.saturating_add(5))
+            .is_some_and(|t| t.eq_ignore_ascii_case(b"par2"))
+        {
             return false;
         }
         if !name_ends_at(subject, dot.saturating_add(5)) {
@@ -118,7 +135,11 @@ pub fn is_base_par2(subject: &str) -> bool {
         // The name's stem: back to the previous opener (a closing bracket belongs to the name,
         // as in `Show (2026).par2` or `Movie[rartv].par2`). An empty stem is a name too:
         // obfuscated posts call their index `".par2"`.
-        let start = s.get(..dot).map_or(0, |head| head.iter().rposition(|&b| name_opener(b)).map_or(0, |p| p.saturating_add(1)));
+        let start = s.get(..dot).map_or(0, |head| {
+            head.iter()
+                .rposition(|&b| name_opener(b))
+                .map_or(0, |p| p.saturating_add(1))
+        });
         !is_volume_stem(s.get(start..dot).unwrap_or(&[]))
     })
 }
@@ -139,7 +160,10 @@ pub fn inventory(data: &[u8]) -> Inventory {
 
 /// Build the inventory from an existing inspection.
 pub fn inventory_from(insp: &Par2Inspection) -> Inventory {
-    let mut inv = Inventory { truncated: insp.truncated, ..Inventory::default() };
+    let mut inv = Inventory {
+        truncated: insp.truncated,
+        ..Inventory::default()
+    };
     // Per-set block size (first complete Main of each set wins) and recovery membership.
     let mut block_sizes: HashMap<[u8; 16], u64> = HashMap::new();
     let mut members: HashMap<[u8; 16], HashSet<[u8; 16]>> = HashMap::new();
@@ -149,7 +173,10 @@ pub fn inventory_from(insp: &Par2Inspection) -> Inventory {
             set_order.push(m.set_id);
         }
         block_sizes.entry(m.set_id).or_insert(m.slice_size);
-        members.entry(m.set_id).or_default().extend(m.recovery_set.iter().copied());
+        members
+            .entry(m.set_id)
+            .or_default()
+            .extend(m.recovery_set.iter().copied());
     }
     for f in &insp.files {
         if !set_order.contains(&f.set_id) {
@@ -158,25 +185,41 @@ pub fn inventory_from(insp: &Par2Inspection) -> Inventory {
     }
     let primary = set_order.first().copied();
     inv.set_id = primary;
-    inv.block_size = primary.and_then(|s| block_sizes.get(&s).copied()).filter(|&b| b > 0);
+    inv.block_size = primary
+        .and_then(|s| block_sizes.get(&s).copied())
+        .filter(|&b| b > 0);
     // One fold operator per set block size: four lookups per slice instead of a multiply.
     let mut shifts: HashMap<u64, Crc32Shift> = HashMap::new();
     let mut slices_seen: HashMap<u64, usize> = HashMap::new();
 
-    let unicode: HashMap<([u8; 16], [u8; 16]), &str> = insp.unicode_names.iter().map(|u| ((u.set_id, u.file_id), u.name.as_str())).collect();
+    let unicode: HashMap<([u8; 16], [u8; 16]), &str> = insp
+        .unicode_names
+        .iter()
+        .map(|u| ((u.set_id, u.file_id), u.name.as_str()))
+        .collect();
     type IfscMap<'a> = HashMap<([u8; 16], [u8; 16]), &'a [([u8; 16], u32)]>;
-    let ifsc: IfscMap<'_> = insp.ifsc.iter().map(|i| ((i.set_id, i.file_id), i.slices.as_slice())).collect();
+    let ifsc: IfscMap<'_> = insp
+        .ifsc
+        .iter()
+        .map(|i| ((i.set_id, i.file_id), i.slices.as_slice()))
+        .collect();
 
     // Dedupe FileDesc by (set, file); keep the first occurrence.
     let mut by_set: BTreeMap<usize, BTreeMap<u128, Par2File>> = BTreeMap::new();
     for f in &insp.files {
-        let Some(rank) = set_order.iter().position(|s| *s == f.set_id) else { continue };
+        let Some(rank) = set_order.iter().position(|s| *s == f.set_id) else {
+            continue;
+        };
         let entry = by_set.entry(rank).or_default();
         if entry.contains_key(&file_id_key(&f.file_id)) {
             continue;
         }
-        let name = unicode.get(&(f.set_id, f.file_id)).map_or_else(|| f.name.clone(), |n| (*n).to_owned());
-        let bound = members.get(&f.set_id).is_some_and(|m| m.contains(&f.file_id));
+        let name = unicode
+            .get(&(f.set_id, f.file_id))
+            .map_or_else(|| f.name.clone(), |n| (*n).to_owned());
+        let bound = members
+            .get(&f.set_id)
+            .is_some_and(|m| m.contains(&f.file_id));
         let block = block_sizes.get(&f.set_id).copied().filter(|&b| b > 0);
         let mut crc32 = None;
         if let (Some(bs), Some(slices)) = (block, ifsc.get(&(f.set_id, f.file_id))) {
@@ -185,7 +228,11 @@ pub fn inventory_from(insp: &Par2Inspection) -> Inventory {
             let seen = slices_seen.entry(bs).or_insert(0);
             *seen = seen.saturating_add(crcs.len());
             crc32 = if *seen >= Crc32Shift::MIN_PARTS {
-                fold_ifsc_crcs_with(shifts.entry(bs).or_insert_with(|| Crc32Shift::new(bs)), &crcs, f.length)
+                fold_ifsc_crcs_with(
+                    shifts.entry(bs).or_insert_with(|| Crc32Shift::new(bs)),
+                    &crcs,
+                    f.length,
+                )
             } else {
                 fold_ifsc_crcs(&crcs, bs, f.length)
             };
@@ -193,15 +240,36 @@ pub fn inventory_from(insp: &Par2Inspection) -> Inventory {
                 inv.sealed.push((f.set_id, f.file_id));
             }
         }
-        entry.insert(file_id_key(&f.file_id), Par2File { set_id: f.set_id, file_id: f.file_id, md5: f.md5, md5_16k: f.md5_16k, size: f.length, name, bound, crc32 });
+        entry.insert(
+            file_id_key(&f.file_id),
+            Par2File {
+                set_id: f.set_id,
+                file_id: f.file_id,
+                md5: f.md5,
+                md5_16k: f.md5_16k,
+                size: f.length,
+                name,
+                bound,
+                crc32,
+            },
+        );
     }
     inv.files = by_set.into_values().flat_map(|m| m.into_values()).collect();
     inv.sealed.sort();
     inv.complete = match primary {
         Some(p) => {
             let has_main = block_sizes.contains_key(&p);
-            let described: HashSet<[u8; 16]> = inv.files.iter().filter(|f| f.set_id == p).map(|f| f.file_id).collect();
-            has_main && !insp.truncated && members.get(&p).is_some_and(|m| m.iter().all(|id| described.contains(id)))
+            let described: HashSet<[u8; 16]> = inv
+                .files
+                .iter()
+                .filter(|f| f.set_id == p)
+                .map(|f| f.file_id)
+                .collect();
+            has_main
+                && !insp.truncated
+                && members
+                    .get(&p)
+                    .is_some_and(|m| m.iter().all(|id| described.contains(id)))
         }
         None => false,
     };
@@ -210,7 +278,11 @@ pub fn inventory_from(insp: &Par2Inspection) -> Inventory {
 
 /// `(name, size)` of every file in [`inventory`] order.
 pub fn file_descriptions(data: &[u8]) -> Vec<(String, u64)> {
-    inventory(data).files.into_iter().map(|f| (f.name, f.size)).collect()
+    inventory(data)
+        .files
+        .into_iter()
+        .map(|f| (f.name, f.size))
+        .collect()
 }
 
 /// A name for the set: the largest bound file of the primary set (ties broken by file id),
@@ -218,8 +290,16 @@ pub fn file_descriptions(data: &[u8]) -> Vec<(String, u64)> {
 pub fn display_name(data: &[u8]) -> Option<String> {
     let inv = inventory(data);
     let primary = inv.files.first()?.set_id;
-    let pick = |pred: &dyn Fn(&Par2File) -> bool| inv.files.iter().filter(|f| pred(f)).max_by(|a, b| a.size.cmp(&b.size).then_with(|| file_id_key(&b.file_id).cmp(&file_id_key(&a.file_id))));
-    pick(&|f| f.set_id == primary && f.bound).or_else(|| pick(&|_| true)).map(|f| f.name.clone())
+    let pick = |pred: &dyn Fn(&Par2File) -> bool| {
+        inv.files.iter().filter(|f| pred(f)).max_by(|a, b| {
+            a.size
+                .cmp(&b.size)
+                .then_with(|| file_id_key(&b.file_id).cmp(&file_id_key(&a.file_id)))
+        })
+    };
+    pick(&|f| f.set_id == primary && f.bound)
+        .or_else(|| pick(&|_| true))
+        .map(|f| f.name.clone())
 }
 
 /// Hex rendering of a set or file id (handy for indexer keys).
@@ -233,9 +313,13 @@ mod tests {
 
     #[test]
     fn subject_detection() {
-        assert!(is_base_par2("Release.Name-GRP [1/50] - \"release.par2\" yEnc (1/1)"));
+        assert!(is_base_par2(
+            "Release.Name-GRP [1/50] - \"release.par2\" yEnc (1/1)"
+        ));
         assert!(is_base_par2("release.PAR2"));
-        assert!(!is_base_par2("Release [2/50] - \"release.vol000+01.par2\" yEnc"));
+        assert!(!is_base_par2(
+            "Release [2/50] - \"release.vol000+01.par2\" yEnc"
+        ));
         assert!(!is_base_par2("release.vol07-13.par2"));
         assert!(!is_base_par2("release.part01.rar"));
         assert!(is_base_par2("odd.vol.par2"));

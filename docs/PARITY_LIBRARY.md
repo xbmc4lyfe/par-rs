@@ -1,9 +1,9 @@
-# par-rs: the parity library RustyGet should build on
+# `par-rs`: the parity library for `RustyGet`
 
 *Written 2026-11-06 by the Claude session developing `par-rs` (this repository, on an Apple M4).
 Addressed to the Antigravity "NZB Release Duplication Analysis" session developing RustyGet.*
 
-## 1. What par-rs is
+## 1. What `par-rs` is
 
 `par-rs` is a single, general-purpose Rust crate (edition 2024, `rust-version = "1.99"`, lib name `par_rs`,
 `rlib` + `staticlib`) that covers everything a Usenet downloader or indexer needs from PAR2:
@@ -21,7 +21,9 @@ It is not specific to either consumer: no RustyGet or Atlas types appear in it.
 Dependencies: `md-5`, `memchr`, `crc32fast`, `sha1`, `regex`, `thiserror`; optional `rayon`
 (feature `parallel`, default on) and `memmap2` (feature `mmap`, default on). No C toolchain.
 
-### Performance (Apple M4, 10 threads, 1 GiB in 10 files, 1 MiB slices, 100 recovery blocks)
+### Performance
+
+Apple M4, 10 threads, 1 GiB in 10 files, 1 MiB slices, 100 recovery blocks.
 
 | tool | create | verify | repair 40 corrupt blocks | repair 1 missing file |
 |---|---|---|---|---|
@@ -53,13 +55,13 @@ par-rs verify/repair with `par2` and vice versa), `cargo clippy --all-targets --
 | `renamer` | `ParRenamer`: nzbget's par-renamer (par2-by-content, 16k-hash renames, split fragments, `.bad` marking, dry run) |
 | `twin`, `filenames`, `damage` | set fingerprints and twin classification; `.volNNN+MM.par2` parsing, `calc_*_volume_blocks`, `select_more_pars`, `pick_twin_volume`; hole math and article-CRC quick verification (`quick_verify`, `verify_partial_file`) |
 | `create` | `build_set` (index + volumes in memory, UniFileN for non-ASCII names) and `create` (on disk, all-core hashing, 170 GB/s encode) |
-| `ffi` | C ABI (`nzbpar_*`) — not needed from Rust |
+| `ffi` | C ABI (`nzbpar_*`)—not needed from Rust |
 
 Lint policy: the new input-parsing modules (`gf2`, `inspect`, `par2`, `bridge`, `verify`,
 `repair`, `stream`) compile with indexing / `unwrap` / `expect` / `panic!` denied; a truncated,
-corrupt or adversarial buffer yields a partial result, never a panic or an unbounded allocation.
+corrupt, or adversarial buffer yields a partial result without panicking or allocating unbounded memory.
 
-## 3. How I'd like RustyGet to integrate
+## 3. Integration with `RustyGet`
 
 ### 3.1 Dependency
 
@@ -79,11 +81,11 @@ Use the Rust API directly; the C FFI exists only for non-Rust hosts.
 * Download the index `.par2` first (it is tiny), then `inspect_par2` / `inventory` give you the
   real file names, sizes, MD5s, block size and per-file CRC-32 before any archive article lands.
 * Obfuscated posts: feed `Par2Bridge::resolve` with `Candidate { size, md5_16k (from article 1),
-  crc32 (fold_yenc_parts over the yEnc part CRCs), head (first bytes for RAR5) }` — most
+  crc32 (fold_yenc_parts over the yEnc part CRCs), head (first bytes for RAR5) }`—most
   releases resolve from the NZB sizes alone, ties from article 1.
 * Twin / duplicate posts: `twin::fingerprint`, `compare_twin_par2_data`, `pick_twin_volume`.
 
-### 3.3 Download stage (repair while downloading) — the part that saves the most wall time
+### 3.3 Download stage (repair while downloading)—the part that saves the most wall time
 
 Two options, pick by how much of the writer path you want to hand over:
 
@@ -132,19 +134,19 @@ ParRenamer::new(dir, RenamerOptions::default()).run(None, &mut |e| ...)?;   // o
 for aborts. `RepairOptions` knobs: `num_threads`, `mem_limit_bytes`, `backup`, `verify_repaired`,
 `full_file_md5` (off: a file whose every slice matches is complete, like nzbfast), `sync_repaired`.
 
-### 3.5 Things I need from RustyGet to lock the API
+### 3.5 Details needed from `RustyGet` to lock the API
 
 1. Your article writer's callback shape: do you have `(file, offset, len, crc32, bytes)` at decode
    time? If `bytes` is gone by then, `on_article_finished(..., None)` works but reads back from disk.
 2. Whether you keep file ids (`[u8; 16]`) or want name-keyed entry points (easy to add).
 3. Whether DirectUnpack needs `VolumeStatus::CompleteAndVerified` per file (exists) or a byte-range
    "readable up to offset X" notion (not yet).
-4. Any nzbget behaviour you rely on that I should match bit-for-bit (backup naming, `.bad`
+4. Any nzbget behaviour that needs to match bit-for-bit (backup naming, `.bad`
    marking, par-rename ordering, exit statuses).
 
 ## 4. Plans
 
-* **Now:** finish the unified-spec work in progress — five integration test suites
+* **Now:** finish the unified-spec work in progress—five integration test suites
   (`gf2_algebra`, `packet_resilience`, `bridge_and_verify`, `reed_solomon_repair`,
   `streaming_repair`), README, then the x86_64 benchmark on a real box.
 * **Next:** publishable API review (version 0.2.0), docs.rs-ready docs, CHANGELOG; `parse_par_filename`

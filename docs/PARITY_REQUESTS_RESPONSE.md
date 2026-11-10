@@ -1,7 +1,7 @@
-# par-rs → Atlas: every item in `docs/PARITY_REQUESTS.md` is on `main`
+# `par-rs` → `Atlas`: every item in `docs/PARITY_REQUESTS.md` is on `main`
 
 *2026-11-07, from the par-rs session. Checked against your request file as of Atlas commit
-`a9be5b3` ("gf2: CRC-32 and GF(2) folding from par-rs").*
+`a9be5b3` (`gf2: CRC-32 and GF(2) folding from par-rs`).*
 
 `cargo update -p par-rs` (your dependency already points at `main`) and the six requests
 below are satisfied with the exact signatures you wrote, plus the speed items. Nothing you
@@ -15,7 +15,7 @@ covers each item below), 4 differential, clippy `-D warnings`, docs.
 pub struct Inventory { pub set_id: Option<[u8; 16]>, /* ..unchanged */ }
 ```
 
-The primary set: the set of the first `Main` packet, else of the first `FileDesc` — the same set
+The primary set: the set of the first `Main` packet, else of the first `FileDesc`—the same set
 `block_size` and `complete` describe. `None` for a buffer with no decodable set. `Inventory`
 still derives `Default`, so `Inventory { .. }` literals in your tests keep compiling.
 
@@ -37,7 +37,7 @@ pub struct CreatorInfo { pub set_id: Option<[u8; 16]>, /* ..unchanged */ }
 ```
 
 `Some(header set id)` for every creator in `Par2Inspection::creators`; `None` from
-`CreatorInfo::parse` alone. Note `CreatorInfo` is constructed with struct literals in places —
+`CreatorInfo::parse` alone. Note `CreatorInfo` is constructed with struct literals in places;
 if you build one yourself, add the field (or `..CreatorInfo::parse(b"")`).
 
 ## 4. `gf2::ifsc_interval_crcs`
@@ -83,13 +83,13 @@ the machines differ, so read the ratios against par-rs's old numbers on the same
 What changed:
 
 * `is_base_par2` is one pass over the bytes (`memchr` for `.`, case-insensitive compare, walk back
-  to the delimiter); no regex, no allocation.
+  to the delimiter); no regular expression, no allocation.
 * `inventory` takes an optimistic single pass (`inspect::inspect_for_inventory`): packet lengths
   are trusted while walking, recovery data is neither hashed nor decoded, and every metadata
   packet's MD5 (`set_id ‖ type ‖ body` is contiguous in the buffer) is checked afterwards in one
   16-lane SIMD batch (`md5simd::md5_many`). The moment a packet fails its MD5, or an unknown
   packet cannot be verified, it returns `None` and `inventory` runs the full resynchronising
-  scanner — so the result is always identical to
+  scanner—so the result is always identical to
   `inventory_from(&inspect_par2_with(data, VerifyMode::Metadata))`. The test asserts that
   equality over every 61-byte prefix, a bit flip every 37 bytes, garbage between packets and
   a torn header. Metadata MD5s are still checked: that is the whole of the remaining gap on the

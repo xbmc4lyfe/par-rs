@@ -75,19 +75,39 @@ impl Lanes for [u32; 4] {
     }
     #[inline(always)]
     fn add(self, o: Self) -> Self {
-        [self[0].wrapping_add(o[0]), self[1].wrapping_add(o[1]), self[2].wrapping_add(o[2]), self[3].wrapping_add(o[3])]
+        [
+            self[0].wrapping_add(o[0]),
+            self[1].wrapping_add(o[1]),
+            self[2].wrapping_add(o[2]),
+            self[3].wrapping_add(o[3]),
+        ]
     }
     #[inline(always)]
     fn xor(self, o: Self) -> Self {
-        [self[0] ^ o[0], self[1] ^ o[1], self[2] ^ o[2], self[3] ^ o[3]]
+        [
+            self[0] ^ o[0],
+            self[1] ^ o[1],
+            self[2] ^ o[2],
+            self[3] ^ o[3],
+        ]
     }
     #[inline(always)]
     fn or(self, o: Self) -> Self {
-        [self[0] | o[0], self[1] | o[1], self[2] | o[2], self[3] | o[3]]
+        [
+            self[0] | o[0],
+            self[1] | o[1],
+            self[2] | o[2],
+            self[3] | o[3],
+        ]
     }
     #[inline(always)]
     fn and(self, o: Self) -> Self {
-        [self[0] & o[0], self[1] & o[1], self[2] & o[2], self[3] & o[3]]
+        [
+            self[0] & o[0],
+            self[1] & o[1],
+            self[2] & o[2],
+            self[3] & o[3],
+        ]
     }
     #[inline(always)]
     fn not(self) -> Self {
@@ -95,7 +115,12 @@ impl Lanes for [u32; 4] {
     }
     #[inline(always)]
     fn rotl<const S: i32, const R: i32>(self) -> Self {
-        [self[0].rotate_left(S as u32), self[1].rotate_left(S as u32), self[2].rotate_left(S as u32), self[3].rotate_left(S as u32)]
+        [
+            self[0].rotate_left(S as u32),
+            self[1].rotate_left(S as u32),
+            self[2].rotate_left(S as u32),
+            self[3].rotate_left(S as u32),
+        ]
     }
 }
 
@@ -110,7 +135,7 @@ mod neon {
     impl Lanes for V {
         #[inline(always)]
         fn splat(x: u32) -> Self {
-            // SAFETY: NEON is a baseline AArch64 feature.
+            // SAFETY: `NEON` is a baseline AArch64 feature.
             V(unsafe { vdupq_n_u32(x) })
         }
         #[inline(always)]
@@ -184,10 +209,22 @@ mod neon {
                     let t1 = vtrn2q_u32(r0, r1);
                     let t2 = vtrn1q_u32(r2, r3);
                     let t3 = vtrn2q_u32(r2, r3);
-                    out[q * 4] = V(vreinterpretq_u32_u64(vtrn1q_u64(vreinterpretq_u64_u32(t0), vreinterpretq_u64_u32(t2))));
-                    out[q * 4 + 1] = V(vreinterpretq_u32_u64(vtrn1q_u64(vreinterpretq_u64_u32(t1), vreinterpretq_u64_u32(t3))));
-                    out[q * 4 + 2] = V(vreinterpretq_u32_u64(vtrn2q_u64(vreinterpretq_u64_u32(t0), vreinterpretq_u64_u32(t2))));
-                    out[q * 4 + 3] = V(vreinterpretq_u32_u64(vtrn2q_u64(vreinterpretq_u64_u32(t1), vreinterpretq_u64_u32(t3))));
+                    out[q * 4] = V(vreinterpretq_u32_u64(vtrn1q_u64(
+                        vreinterpretq_u64_u32(t0),
+                        vreinterpretq_u64_u32(t2),
+                    )));
+                    out[q * 4 + 1] = V(vreinterpretq_u32_u64(vtrn1q_u64(
+                        vreinterpretq_u64_u32(t1),
+                        vreinterpretq_u64_u32(t3),
+                    )));
+                    out[q * 4 + 2] = V(vreinterpretq_u32_u64(vtrn2q_u64(
+                        vreinterpretq_u64_u32(t0),
+                        vreinterpretq_u64_u32(t2),
+                    )));
+                    out[q * 4 + 3] = V(vreinterpretq_u32_u64(vtrn2q_u64(
+                        vreinterpretq_u64_u32(t1),
+                        vreinterpretq_u64_u32(t3),
+                    )));
                 }
             }
             out
@@ -206,7 +243,7 @@ mod sse2 {
     impl Lanes for V {
         #[inline(always)]
         fn splat(x: u32) -> Self {
-            // SAFETY: SSE2 is a baseline x86_64 feature.
+            // SAFETY: `SSE2` is a baseline x86_64 feature.
             V(unsafe { _mm_set1_epi32(x as i32) })
         }
         #[inline(always)]
@@ -304,7 +341,10 @@ fn compress<L: Lanes, const G: usize>(st: &mut [[L; 4]; G], m: &[[L; 16]; G]) {
     macro_rules! step {
         ($fun:ident, $a:ident, $b:ident, $c:ident, $d:ident, $k:literal, $s:literal, $mi:literal) => {
             for g in 0..G {
-                let t = $a[g].add(L::$fun($b[g], $c[g], $d[g])).add(L::splat($k)).add(m[g][$mi]);
+                let t = $a[g]
+                    .add(L::$fun($b[g], $c[g], $d[g]))
+                    .add(L::splat($k))
+                    .add(m[g][$mi]);
                 $a[g] = $b[g].add(t.rotl::<$s, { 32 - $s }>());
             }
         };
@@ -428,7 +468,14 @@ fn run<L: Lanes, const G: usize>(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
                 *s = L::splat(INIT[j]);
             }
         }
-        let nblocks: Vec<usize> = (0..lanes).map(|l| batch.get(l).map(|&i| block_count(msgs[i].len())).unwrap_or(0)).collect();
+        let nblocks: Vec<usize> = (0..lanes)
+            .map(|l| {
+                batch
+                    .get(l)
+                    .map(|&i| block_count(msgs[i].len()))
+                    .unwrap_or(0)
+            })
+            .collect();
         let max_blocks = nblocks.iter().copied().max().unwrap_or(0);
         let mut m = [[L::splat(0); 16]; G];
         for t in 0..max_blocks {
@@ -502,13 +549,33 @@ mod tests {
     use crate::hasher::md5;
 
     fn data(n: usize, seed: u32) -> Vec<u8> {
-        (0..n as u32).map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8).collect()
+        (0..n as u32)
+            .map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8)
+            .collect()
     }
 
     #[test]
     fn matches_scalar_for_all_lengths_near_block_boundaries() {
-        let lens: Vec<usize> = (0..200).chain([255, 256, 319, 320, 511, 512, 1000, 4095, 4096, 70_000, 1 << 20]).collect();
-        let bufs: Vec<Vec<u8>> = lens.iter().enumerate().map(|(i, &n)| data(n, i as u32)).collect();
+        let lens: Vec<usize> = (0..200)
+            .chain([
+                255,
+                256,
+                319,
+                320,
+                511,
+                512,
+                1000,
+                4095,
+                4096,
+                70_000,
+                1 << 20,
+            ])
+            .collect();
+        let bufs: Vec<Vec<u8>> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| data(n, i as u32))
+            .collect();
         let msgs: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
         let got = md5_many(&msgs);
         let portable = md5_many_portable(&msgs);

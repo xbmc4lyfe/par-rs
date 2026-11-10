@@ -10,7 +10,9 @@ use par_rs::{Isa, Kernel};
 
 fn data(n: usize, seed: u32) -> Vec<u8> {
     // Seeds are mixed in before the multiply so two files are never shifted copies of each other.
-    (0..n as u32).map(|i| ((i ^ seed.wrapping_mul(0x9E37_79B9)).wrapping_mul(2654435761) >> 13) as u8).collect()
+    (0..n as u32)
+        .map(|i| ((i ^ seed.wrapping_mul(0x9E37_79B9)).wrapping_mul(2654435761) >> 13) as u8)
+        .collect()
 }
 
 fn rar5(volume: Option<u64>, body: &[u8]) -> Vec<u8> {
@@ -31,19 +33,32 @@ fn rar5(volume: Option<u64>, body: &[u8]) -> Vec<u8> {
 }
 
 fn opts(ss: usize) -> SetOptions {
-    SetOptions { slice_size: ss, recovery_blocks: 6, volumes: VolumeScheme::Single, kernel: Kernel::with_isa(Isa::Scalar).unwrap_or_else(Kernel::detect), ..SetOptions::default() }
+    SetOptions {
+        slice_size: ss,
+        recovery_blocks: 6,
+        volumes: VolumeScheme::Single,
+        kernel: Kernel::with_isa(Isa::Scalar).unwrap_or_else(Kernel::detect),
+        ..SetOptions::default()
+    }
 }
 
 #[test]
 fn bridge_resolves_obfuscated_rar_set() {
-    // Four same-size RAR volumes with RAR5 headers, a smaller last volume and an nfo.
+    // Four same-size RAR volumes with RAR5 headers, a smaller last volume, and an nfo.
     let v1 = rar5(None, &data(50_000 - 20, 1));
     let v2 = rar5(Some(1), &data(50_000 - 21, 2));
     let v3 = rar5(Some(2), &data(50_000 - 21, 3));
     let v4 = rar5(Some(3), &data(50_000 - 21, 4));
     let v5 = rar5(Some(4), &data(10_000, 5));
     let nfo = data(777, 6);
-    let files: Vec<(&str, &[u8])> = vec![("rel.part1.rar", &v1), ("rel.part2.rar", &v2), ("rel.part3.rar", &v3), ("rel.part4.rar", &v4), ("rel.part5.rar", &v5), ("rel.nfo", &nfo)];
+    let files: Vec<(&str, &[u8])> = vec![
+        ("rel.part1.rar", &v1),
+        ("rel.part2.rar", &v2),
+        ("rel.part3.rar", &v3),
+        ("rel.part4.rar", &v4),
+        ("rel.part5.rar", &v5),
+        ("rel.nfo", &nfo),
+    ];
     let set = build_set("rel", &files, &opts(4096)).unwrap();
     let inv = inventory(&set.index);
     assert_eq!(inv.files.len(), 6);
@@ -52,24 +67,86 @@ fn bridge_resolves_obfuscated_rar_set() {
     // Obfuscated downloads with partial knowledge: article-1 MD5 for one, yEnc CRC for another,
     // only the RAR header bytes for the rest.
     let md5_16k = |d: &[u8]| -> [u8; 16] { par_rs::hasher::md5_16k(d) };
-    let yenc_crc = |d: &[u8]| fold_yenc_parts(&d.chunks(7000).map(|c| (crc32(c), c.len())).collect::<Vec<_>>()).unwrap();
+    let yenc_crc = |d: &[u8]| {
+        fold_yenc_parts(
+            &d.chunks(7000)
+                .map(|c| (crc32(c), c.len()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
     let cands = vec![
-        Candidate { name: "a1b2.bin".into(), size: v5.len() as u64, ..Default::default() },                                 // unique size
-        Candidate { name: "c3d4.bin".into(), size: v2.len() as u64, md5_16k: Some(md5_16k(&v2)), ..Default::default() },   // md5
-        Candidate { name: "e5f6.bin".into(), size: v3.len() as u64, crc32: Some(yenc_crc(&v3)), ..Default::default() },    // crc
-        Candidate { name: "g7h8.bin".into(), size: v4.len() as u64, head: Some(v4[..64].to_vec()), ..Default::default() }, // rar5 vol 3 -> part4
-        Candidate { name: "i9j0.bin".into(), size: v1.len() as u64, head: Some(v1[..64].to_vec()), ..Default::default() }, // rar5 vol 0 -> part1
-        Candidate { name: "k1l2.bin".into(), size: nfo.len() as u64, ..Default::default() },                                // unique size
-        Candidate { name: "stray.bin".into(), size: 123, ..Default::default() },
+        Candidate {
+            name: "a1b2.bin".into(),
+            size: v5.len() as u64,
+            ..Default::default()
+        }, // unique size
+        Candidate {
+            name: "c3d4.bin".into(),
+            size: v2.len() as u64,
+            md5_16k: Some(md5_16k(&v2)),
+            ..Default::default()
+        }, // md5
+        Candidate {
+            name: "e5f6.bin".into(),
+            size: v3.len() as u64,
+            crc32: Some(yenc_crc(&v3)),
+            ..Default::default()
+        }, // crc
+        Candidate {
+            name: "g7h8.bin".into(),
+            size: v4.len() as u64,
+            head: Some(v4[..64].to_vec()),
+            ..Default::default()
+        }, // rar5 vol 3 -> part4
+        Candidate {
+            name: "i9j0.bin".into(),
+            size: v1.len() as u64,
+            head: Some(v1[..64].to_vec()),
+            ..Default::default()
+        }, // rar5 vol 0 -> part1
+        Candidate {
+            name: "k1l2.bin".into(),
+            size: nfo.len() as u64,
+            ..Default::default()
+        }, // unique size
+        Candidate {
+            name: "stray.bin".into(),
+            size: 123,
+            ..Default::default()
+        },
     ];
     let r = bridge.resolve(&cands);
-    let name_of = |c: usize| r.resolved.iter().find(|x| x.candidate == c).map(|x| (bridge.files()[x.file].name.clone(), x.method));
-    assert_eq!(name_of(0), Some(("rel.part5.rar".into(), ResolveMethod::SizeChain)));
-    assert_eq!(name_of(1), Some(("rel.part2.rar".into(), ResolveMethod::Md5_16k)));
-    assert_eq!(name_of(2), Some(("rel.part3.rar".into(), ResolveMethod::Crc32)));
-    assert_eq!(name_of(3), Some(("rel.part4.rar".into(), ResolveMethod::Rar5Volume)));
-    assert_eq!(name_of(4), Some(("rel.part1.rar".into(), ResolveMethod::Rar5Volume)));
-    assert_eq!(name_of(5), Some(("rel.nfo".into(), ResolveMethod::SizeChain)));
+    let name_of = |c: usize| {
+        r.resolved
+            .iter()
+            .find(|x| x.candidate == c)
+            .map(|x| (bridge.files()[x.file].name.clone(), x.method))
+    };
+    assert_eq!(
+        name_of(0),
+        Some(("rel.part5.rar".into(), ResolveMethod::SizeChain))
+    );
+    assert_eq!(
+        name_of(1),
+        Some(("rel.part2.rar".into(), ResolveMethod::Md5_16k))
+    );
+    assert_eq!(
+        name_of(2),
+        Some(("rel.part3.rar".into(), ResolveMethod::Crc32))
+    );
+    assert_eq!(
+        name_of(3),
+        Some(("rel.part4.rar".into(), ResolveMethod::Rar5Volume))
+    );
+    assert_eq!(
+        name_of(4),
+        Some(("rel.part1.rar".into(), ResolveMethod::Rar5Volume))
+    );
+    assert_eq!(
+        name_of(5),
+        Some(("rel.nfo".into(), ResolveMethod::SizeChain))
+    );
     assert_eq!(r.unresolved_candidates, vec![6]);
     assert!(r.unmatched_files.is_empty());
 }
@@ -84,8 +161,26 @@ fn set_verifier_from_inspection() {
     let v = SetVerifier::from_inspection(&insp).unwrap();
     assert_eq!(v.block_size(), ss as u64);
     assert_eq!(v.total_slices(), 10 + 5);
-    let fa = v.file_index(&insp.files.iter().find(|f| f.name == "a.bin").unwrap().file_id).unwrap();
-    let fb = v.file_index(&insp.files.iter().find(|f| f.name == "b.bin").unwrap().file_id).unwrap();
+    let fa = v
+        .file_index(
+            &insp
+                .files
+                .iter()
+                .find(|f| f.name == "a.bin")
+                .unwrap()
+                .file_id,
+        )
+        .unwrap();
+    let fb = v
+        .file_index(
+            &insp
+                .files
+                .iter()
+                .find(|f| f.name == "b.bin")
+                .unwrap()
+                .file_id,
+        )
+        .unwrap();
 
     assert!(v.verify_file(fa, &a).is_intact());
     assert!(v.verify_file(fb, &b).is_intact());
@@ -98,7 +193,13 @@ fn set_verifier_from_inspection() {
     db.drain(4096..4196);
     let report = v.verify_files(&[(fa, &da), (fb, &db)]);
     let ra = &report.files[0];
-    assert_eq!(ra.slices.iter().filter(|s| **s == SliceStatus::Damaged).count(), 2);
+    assert_eq!(
+        ra.slices
+            .iter()
+            .filter(|s| **s == SliceStatus::Damaged)
+            .count(),
+        2
+    );
     let rb = &report.files[1];
     assert!(!rb.size_ok);
     assert_eq!(rb.slices[0], SliceStatus::Verified);

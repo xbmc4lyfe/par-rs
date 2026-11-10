@@ -32,7 +32,11 @@ pub const fn multmodp(a: u32, b: u32) -> u32 {
             }
         }
         m >>= 1;
-        b = if b & 1 != 0 { (b >> 1) ^ GF2_POLY } else { b >> 1 };
+        b = if b & 1 != 0 {
+            (b >> 1) ^ GF2_POLY
+        } else {
+            b >> 1
+        };
     }
     p
 }
@@ -81,7 +85,11 @@ fn xpow_bytes(n_bytes: u64) -> u32 {
 fn xpow_bytes_inv(n_bytes: u64) -> u32 {
     // 8 · n_bytes mod ORDER without overflow: n_bytes mod ORDER first (ORDER is odd, 8 is a unit).
     let bits = (n_bytes % GF2_ORDER).wrapping_mul(8) % GF2_ORDER;
-    if bits == 0 { 1 << 31 } else { xpow(GF2_ORDER - bits) }
+    if bits == 0 {
+        1 << 31
+    } else {
+        xpow(GF2_ORDER - bits)
+    }
 }
 
 /// Byte-wise CRC-32 table (`T[b] = b · x^8 mod P`, with the byte in the low bits).
@@ -93,7 +101,11 @@ const TABLE: [u32; 256] = {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { (c >> 1) ^ GF2_POLY } else { c >> 1 };
+            c = if c & 1 != 0 {
+                (c >> 1) ^ GF2_POLY
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         t[i] = c;
@@ -134,7 +146,10 @@ pub fn crc32_unzero(padded_crc: u32, zero_len: usize) -> u32 {
 
 /// [`crc32_unzero`] with a 64-bit length.
 pub fn crc32_unzero_u64(padded_crc: u32, zero_len: u64) -> u32 {
-    multmodp(xpow_bytes_inv(zero_len), padded_crc ^ crc32_zeros_u64(zero_len))
+    multmodp(
+        xpow_bytes_inv(zero_len),
+        padded_crc ^ crc32_zeros_u64(zero_len),
+    )
 }
 
 /// Alias of [`crc32_unzero`].
@@ -212,10 +227,13 @@ impl Crc32Shift {
     #[allow(clippy::indexing_slicing)] // indices are bytes of `crc`
     pub fn apply(&self, crc: u32) -> u32 {
         let [b0, b1, b2, b3] = crc.to_le_bytes();
-        self.tables[0][b0 as usize] ^ self.tables[1][b1 as usize] ^ self.tables[2][b2 as usize] ^ self.tables[3][b3 as usize]
+        self.tables[0][b0 as usize]
+            ^ self.tables[1][b1 as usize]
+            ^ self.tables[2][b2 as usize]
+            ^ self.tables[3][b3 as usize]
     }
 
-    /// [`crc32_combine`] with `len2 == self.len()`: CRC of `crc1`'s data followed by
+    /// [`crc32_combine`] with `len2 == self.len()`: `CRC` of `crc1`'s data followed by
     /// `crc2`'s data.
     #[inline]
     pub fn combine(&self, crc1: u32, crc2: u32) -> u32 {
@@ -233,7 +251,11 @@ struct Folder {
 
 impl Folder {
     fn new(expected_parts: usize) -> Self {
-        Self { shift: None, use_tables: expected_parts >= Crc32Shift::MIN_PARTS, rebuilds: 0 }
+        Self {
+            shift: None,
+            use_tables: expected_parts >= Crc32Shift::MIN_PARTS,
+            rebuilds: 0,
+        }
     }
 
     #[inline]
@@ -275,8 +297,12 @@ impl fmt::Display for FoldError {
         match self {
             FoldError::Empty => f.write_str("no parts to fold"),
             FoldError::MissingPart(i) => write!(f, "part {i} is missing"),
-            FoldError::CorruptPart(i) => write!(f, "part {i} was supplied twice with different values"),
-            FoldError::LengthMismatch => f.write_str("part indices do not match the declared part count"),
+            FoldError::CorruptPart(i) => {
+                write!(f, "part {i} was supplied twice with different values")
+            }
+            FoldError::LengthMismatch => {
+                f.write_str("part indices do not match the declared part count")
+            }
         }
     }
 }
@@ -290,12 +316,17 @@ pub fn fold_yenc_parts(parts: &[(u32, usize)]) -> Result<u32, FoldError> {
         return Err(FoldError::Empty);
     };
     let mut folder = Folder::new(parts.len());
-    Ok(it.fold(first, |acc, &(crc, len)| folder.combine(acc, crc, len as u64)))
+    Ok(it.fold(first, |acc, &(crc, len)| {
+        folder.combine(acc, crc, len as u64)
+    }))
 }
 
 /// Fold yEnc parts given as `(part index, crc32, length)` in any order; every index in
 /// `0..total` must be present exactly once (duplicates must agree).
-pub fn fold_yenc_indexed_parts(total: usize, parts: &[(usize, u32, usize)]) -> Result<u32, FoldError> {
+pub fn fold_yenc_indexed_parts(
+    total: usize,
+    parts: &[(usize, u32, usize)],
+) -> Result<u32, FoldError> {
     if total == 0 || parts.is_empty() {
         return Err(FoldError::Empty);
     }
@@ -340,17 +371,26 @@ pub fn fold_ifsc_crcs(slice_crcs: &[u32], block_size: u64, file_size: u64) -> Op
     if slice_crcs.len() >= Crc32Shift::MIN_PARTS {
         return fold_ifsc_crcs_with(&Crc32Shift::new(block_size), slice_crcs, file_size);
     }
-    fold_ifsc_impl(slice_crcs, block_size, file_size, |a, c| crc32_combine_u64(a, c, block_size))
+    fold_ifsc_impl(slice_crcs, block_size, file_size, |a, c| {
+        crc32_combine_u64(a, c, block_size)
+    })
 }
 
 /// [`fold_ifsc_crcs`] with a prebuilt operator for the set's block size (`shift.byte_len()`), for
 /// callers folding many files of one set: four lookups per slice instead of a multiply.
 pub fn fold_ifsc_crcs_with(shift: &Crc32Shift, slice_crcs: &[u32], file_size: u64) -> Option<u32> {
-    fold_ifsc_impl(slice_crcs, shift.byte_len(), file_size, |a, c| shift.combine(a, c))
+    fold_ifsc_impl(slice_crcs, shift.byte_len(), file_size, |a, c| {
+        shift.combine(a, c)
+    })
 }
 
 /// Shared body of the IFSC folds; `combine_full(acc, crc)` appends one full `block_size` slice.
-fn fold_ifsc_impl(slice_crcs: &[u32], block_size: u64, file_size: u64, combine_full: impl Fn(u32, u32) -> u32) -> Option<u32> {
+fn fold_ifsc_impl(
+    slice_crcs: &[u32],
+    block_size: u64,
+    file_size: u64,
+    combine_full: impl Fn(u32, u32) -> u32,
+) -> Option<u32> {
     if block_size == 0 {
         return None;
     }
@@ -386,7 +426,12 @@ fn fold_ifsc_impl(slice_crcs: &[u32], block_size: u64, file_size: u64, combine_f
 ///
 /// `None` when `grid_size` is not a positive multiple of `block_size`, `block_size == 0`, or
 /// the slice count does not fit `file_size`. A zero-length file has no intervals.
-pub fn ifsc_interval_crcs(slice_crcs: &[u32], block_size: u64, file_size: u64, grid_size: u64) -> Option<Vec<u32>> {
+pub fn ifsc_interval_crcs(
+    slice_crcs: &[u32],
+    block_size: u64,
+    file_size: u64,
+    grid_size: u64,
+) -> Option<Vec<u32>> {
     if block_size == 0 || grid_size == 0 || !grid_size.is_multiple_of(block_size) {
         return None;
     }
@@ -454,7 +499,11 @@ impl RollingCrc32 {
         }
         let i_n = multmodp(shift_n, 0xFFFF_FFFF);
         let i_n1 = multmodp(xpow_bytes(window_size.wrapping_add(1)), 0xFFFF_FFFF);
-        Some(Self { window: window_size, removal, init_fix: i_n ^ i_n1 })
+        Some(Self {
+            window: window_size,
+            removal,
+            init_fix: i_n ^ i_n1,
+        })
     }
 
     /// Window length in bytes.
@@ -496,7 +545,7 @@ pub fn lcm(a: u64, b: u64) -> Option<u64> {
 }
 
 /// LCM of several article sizes: the grid on which every size's article boundaries coincide
-/// (e.g. `LCM(716_800, 768_000) = 10_752_000`, i.e. 15 articles of the first size and 14 of
+/// (for example, `LCM(716_800, 768_000) = 10_752_000`, that is, 15 articles of the first size and 14 of
 /// the second).
 pub fn lcm_grid(sizes: &[u64]) -> Option<u64> {
     let mut it = sizes.iter();
@@ -547,7 +596,9 @@ mod tests {
     use super::*;
 
     fn data(n: usize, seed: u32) -> Vec<u8> {
-        (0..n as u32).map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8).collect()
+        (0..n as u32)
+            .map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8)
+            .collect()
     }
 
     #[test]
@@ -593,19 +644,39 @@ mod tests {
         }
         assert_eq!(fold_yenc_parts(&parts), Ok(crc32(&file)));
         assert_eq!(fold_yenc_parts(&[]), Err(FoldError::Empty));
-        let indexed: Vec<(usize, u32, usize)> = parts.iter().enumerate().rev().map(|(i, &(c, l))| (i, c, l)).collect();
+        let indexed: Vec<(usize, u32, usize)> = parts
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, &(c, l))| (i, c, l))
+            .collect();
         assert_eq!(fold_yenc_indexed_parts(4, &indexed), Ok(crc32(&file)));
         let mut dup = indexed.clone();
         dup.push(indexed[2]);
         assert_eq!(fold_yenc_indexed_parts(4, &dup), Ok(crc32(&file)));
         dup.push((2, 1, 3000));
-        assert_eq!(fold_yenc_indexed_parts(4, &dup), Err(FoldError::CorruptPart(2)));
-        assert_eq!(fold_yenc_indexed_parts(5, &indexed), Err(FoldError::MissingPart(4)));
-        assert_eq!(fold_yenc_indexed_parts(4, &indexed[2..]), Err(FoldError::MissingPart(2)));
-        assert_eq!(fold_yenc_indexed_parts(3, &indexed), Err(FoldError::LengthMismatch));
+        assert_eq!(
+            fold_yenc_indexed_parts(4, &dup),
+            Err(FoldError::CorruptPart(2))
+        );
+        assert_eq!(
+            fold_yenc_indexed_parts(5, &indexed),
+            Err(FoldError::MissingPart(4))
+        );
+        assert_eq!(
+            fold_yenc_indexed_parts(4, &indexed[2..]),
+            Err(FoldError::MissingPart(2))
+        );
+        assert_eq!(
+            fold_yenc_indexed_parts(3, &indexed),
+            Err(FoldError::LengthMismatch)
+        );
         assert_eq!(fold_yenc_indexed_parts(0, &indexed), Err(FoldError::Empty));
         assert_eq!(fold_yenc_indexed_parts(4, &[]), Err(FoldError::Empty));
-        assert_eq!(fold_yenc_indexed_parts(4, &[(1, 0, 1)]), Err(FoldError::MissingPart(0)));
+        assert_eq!(
+            fold_yenc_indexed_parts(4, &[(1, 0, 1)]),
+            Err(FoldError::MissingPart(0))
+        );
         assert_eq!(FoldError::MissingPart(3).to_string(), "part 3 is missing");
     }
 
@@ -619,13 +690,19 @@ mod tests {
             padded.resize(bs as usize, 0);
             crcs.push(crc32(&padded));
         }
-        assert_eq!(fold_ifsc_crcs(&crcs, bs, file.len() as u64), Some(crc32(&file)));
+        assert_eq!(
+            fold_ifsc_crcs(&crcs, bs, file.len() as u64),
+            Some(crc32(&file))
+        );
         assert_eq!(fold_ifsc_crcs(&crcs[..2], bs, file.len() as u64), None);
         assert_eq!(fold_ifsc_crcs(&[], bs, 0), Some(0));
         assert_eq!(fold_ifsc_crcs(&crcs, 0, 1), None);
         // Exact multiple: no padding on the last slice.
         let exact = &file[..2 * bs as usize];
-        assert_eq!(fold_ifsc_crcs(&crcs[..2], bs, exact.len() as u64), Some(crc32(exact)));
+        assert_eq!(
+            fold_ifsc_crcs(&crcs[..2], bs, exact.len() as u64),
+            Some(crc32(exact))
+        );
 
         assert_eq!(gcd(716_800, 768_000), 51_200);
         // 716_800 = 14 · 51_200 and 768_000 = 15 · 51_200, so the grid is 14 · 15 · 51_200.

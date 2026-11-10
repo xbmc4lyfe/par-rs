@@ -81,9 +81,14 @@ pub enum RepairError {
 impl From<RsError> for RepairError {
     fn from(e: RsError) -> Self {
         match e {
-            RsError::NotEnoughRecovery { needed, available } => RepairError::NotEnoughRecovery { needed, available },
+            RsError::NotEnoughRecovery { needed, available } => {
+                RepairError::NotEnoughRecovery { needed, available }
+            }
             RsError::TooManyInputs => RepairError::TooManyInputs,
-            RsError::Io(source) => RepairError::Io { context: "engine".into(), source },
+            RsError::Io(source) => RepairError::Io {
+                context: "engine".into(),
+                source,
+            },
             _ => RepairError::Singular,
         }
     }
@@ -104,13 +109,23 @@ pub struct RepairPlan {
 
 impl RepairPlan {
     /// Plan the repair of the slices absent from `present` (length `total`) with `exponents`.
-    pub fn new(total: usize, present: &[bool], exponents: &[u32], kernel: &Kernel) -> Result<Self, RepairError> {
+    pub fn new(
+        total: usize,
+        present: &[bool],
+        exponents: &[u32],
+        kernel: &Kernel,
+    ) -> Result<Self, RepairError> {
         if present.len() != total {
             return Err(RepairError::BadIndex(present.len()));
         }
         let logs = input_constant_logs(total).map_err(|_| RepairError::TooManyInputs)?;
         let plan = plan_recovery(&logs, present, exponents, kernel)?;
-        Ok(Self { missing: plan.missing, used_exponents: plan.used_exponents, inverse: plan.inverse, logs })
+        Ok(Self {
+            missing: plan.missing,
+            used_exponents: plan.used_exponents,
+            inverse: plan.inverse,
+            logs,
+        })
     }
 
     /// Coefficient of present slice `i` in syndrome `j`.
@@ -128,12 +143,19 @@ pub fn fold_tiled(kernel: &Kernel, dsts: &mut [Vec<u8>], src: &[u8], coeffs: &[u
     let mut start = 0usize;
     while start < src.len() {
         let end = start.saturating_add(TILE_BYTES).min(src.len());
-        let Some(src_tile) = src.get(start..end) else { break };
+        let Some(src_tile) = src.get(start..end) else {
+            break;
+        };
         let mut g = 0usize;
         while g < n {
             let g_end = g.saturating_add(MAX_MULTI).min(n);
-            let Some(group) = dsts.get_mut(g..g_end) else { break };
-            let mut tiles: Vec<&mut [u8]> = group.iter_mut().filter_map(|d| d.get_mut(start..end)).collect();
+            let Some(group) = dsts.get_mut(g..g_end) else {
+                break;
+            };
+            let mut tiles: Vec<&mut [u8]> = group
+                .iter_mut()
+                .filter_map(|d| d.get_mut(start..end))
+                .collect();
             if tiles.len() == g_end - g
                 && let Some(c) = coeffs.get(g..g_end)
             {
@@ -153,15 +175,31 @@ pub fn xor_into(dst: &mut [u8], src: &[u8]) {
 }
 
 fn check_len(index: usize, expected: usize, data: &[u8]) -> Result<(), RepairError> {
-    if data.len() != expected { Err(RepairError::SliceSizeMismatch { index, expected, got: data.len() }) } else { Ok(()) }
+    if data.len() != expected {
+        Err(RepairError::SliceSizeMismatch {
+            index,
+            expected,
+            got: data.len(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 /// Compute the syndromes `S_j = R_{e_j} ⊕ ⨁ C_i^{e_j} D_i` for a plan.
-fn syndromes(plan: &RepairPlan, slice_size: usize, present: &[(usize, &[u8])], recovery: &[(u32, &[u8])], kernel: &Kernel) -> Result<Vec<Vec<u8>>, RepairError> {
+fn syndromes(
+    plan: &RepairPlan,
+    slice_size: usize,
+    present: &[(usize, &[u8])],
+    recovery: &[(u32, &[u8])],
+    kernel: &Kernel,
+) -> Result<Vec<Vec<u8>>, RepairError> {
     let k = plan.used_exponents.len();
     let mut syn: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; k];
     for (j, &e) in plan.used_exponents.iter().enumerate() {
-        let Some((_, r)) = recovery.iter().find(|(x, _)| *x == e) else { return Err(RepairError::Singular) };
+        let Some((_, r)) = recovery.iter().find(|(x, _)| *x == e) else {
+            return Err(RepairError::Singular);
+        };
         check_len(e as usize, slice_size, r)?;
         if let Some(s) = syn.get_mut(j) {
             xor_into(s, r);
@@ -169,13 +207,17 @@ fn syndromes(plan: &RepairPlan, slice_size: usize, present: &[(usize, &[u8])], r
     }
     let fold_group = |group: &mut [Vec<u8>], first: usize| {
         for &(i, d) in present {
-            let coeffs: Vec<u16> = (first..first.saturating_add(group.len())).map(|j| plan.coefficient(i, j).unwrap_or(0)).collect();
+            let coeffs: Vec<u16> = (first..first.saturating_add(group.len()))
+                .map(|j| plan.coefficient(i, j).unwrap_or(0))
+                .collect();
             fold_tiled(kernel, group, d, &coeffs);
         }
     };
     #[cfg(feature = "parallel")]
     {
-        syn.par_chunks_mut(MAX_MULTI).enumerate().for_each(|(c, group)| fold_group(group, c.saturating_mul(MAX_MULTI)));
+        syn.par_chunks_mut(MAX_MULTI)
+            .enumerate()
+            .for_each(|(c, group)| fold_group(group, c.saturating_mul(MAX_MULTI)));
     }
     #[cfg(not(feature = "parallel"))]
     {
@@ -187,17 +229,30 @@ fn syndromes(plan: &RepairPlan, slice_size: usize, present: &[(usize, &[u8])], r
 }
 
 /// `D_m = ⨁_j inv[m][j] · S_j` for the requested rows.
-fn solve_rows(plan: &RepairPlan, syn: &[Vec<u8>], slice_size: usize, rows: &[usize], kernel: &Kernel) -> Vec<Vec<u8>> {
+fn solve_rows(
+    plan: &RepairPlan,
+    syn: &[Vec<u8>],
+    slice_size: usize,
+    rows: &[usize],
+    kernel: &Kernel,
+) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; rows.len()];
     let solve_group = |group: &mut [Vec<u8>], first: usize| {
         for (j, s) in syn.iter().enumerate() {
-            let coeffs: Vec<u16> = rows.iter().skip(first).take(group.len()).map(|&m| plan.inverse.get(m, j)).collect();
+            let coeffs: Vec<u16> = rows
+                .iter()
+                .skip(first)
+                .take(group.len())
+                .map(|&m| plan.inverse.get(m, j))
+                .collect();
             fold_tiled(kernel, group, s, &coeffs);
         }
     };
     #[cfg(feature = "parallel")]
     {
-        out.par_chunks_mut(MAX_MULTI).enumerate().for_each(|(c, group)| solve_group(group, c.saturating_mul(MAX_MULTI)));
+        out.par_chunks_mut(MAX_MULTI)
+            .enumerate()
+            .for_each(|(c, group)| solve_group(group, c.saturating_mul(MAX_MULTI)));
     }
     #[cfg(not(feature = "parallel"))]
     {
@@ -208,7 +263,11 @@ fn solve_rows(plan: &RepairPlan, syn: &[Vec<u8>], slice_size: usize, rows: &[usi
     out
 }
 
-fn presence(total: usize, present: &[(usize, &[u8])], slice_size: usize) -> Result<Vec<bool>, RepairError> {
+fn presence(
+    total: usize,
+    present: &[(usize, &[u8])],
+    slice_size: usize,
+) -> Result<Vec<bool>, RepairError> {
     if slice_size == 0 {
         return Err(RepairError::ZeroSliceSize);
     }
@@ -230,15 +289,35 @@ fn presence(total: usize, present: &[(usize, &[u8])], slice_size: usize) -> Resu
 /// * `recovery`: `(exponent, data)` of the available recovery slices.
 ///
 /// Returns `(global slice index, data)` for every slice in `0..total` that was not present.
-pub fn repair_slices(slice_size: usize, total: usize, present: &[(usize, &[u8])], recovery: &[(u32, &[u8])], kernel: &Kernel) -> Result<Vec<(usize, Vec<u8>)>, RepairError> {
+pub fn repair_slices(
+    slice_size: usize,
+    total: usize,
+    present: &[(usize, &[u8])],
+    recovery: &[(u32, &[u8])],
+    kernel: &Kernel,
+) -> Result<Vec<(usize, Vec<u8>)>, RepairError> {
     let flags = presence(total, present, slice_size)?;
-    let missing: Vec<usize> = flags.iter().enumerate().filter(|(_, p)| !**p).map(|(i, _)| i).collect();
-    repair_rows(slice_size, total, &flags, &missing, present, recovery, kernel)
+    let missing: Vec<usize> = flags
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !**p)
+        .map(|(i, _)| i)
+        .collect();
+    repair_rows(
+        slice_size, total, &flags, &missing, present, recovery, kernel,
+    )
 }
 
 /// Reconstruct only `wanted` (a subset of the missing slices). All missing slices still count
 /// towards the recovery slices required, but only the requested rows of `A⁻¹ · S` are formed.
-pub fn repair_selected_slices(slice_size: usize, total: usize, present: &[(usize, &[u8])], recovery: &[(u32, &[u8])], wanted: &[usize], kernel: &Kernel) -> Result<Vec<(usize, Vec<u8>)>, RepairError> {
+pub fn repair_selected_slices(
+    slice_size: usize,
+    total: usize,
+    present: &[(usize, &[u8])],
+    recovery: &[(u32, &[u8])],
+    wanted: &[usize],
+    kernel: &Kernel,
+) -> Result<Vec<(usize, Vec<u8>)>, RepairError> {
     let flags = presence(total, present, slice_size)?;
     let mut rows = wanted.to_vec();
     rows.sort_unstable();
@@ -253,7 +332,15 @@ pub fn repair_selected_slices(slice_size: usize, total: usize, present: &[(usize
     repair_rows(slice_size, total, &flags, &rows, present, recovery, kernel)
 }
 
-fn repair_rows(slice_size: usize, total: usize, flags: &[bool], wanted: &[usize], present: &[(usize, &[u8])], recovery: &[(u32, &[u8])], kernel: &Kernel) -> Result<Vec<(usize, Vec<u8>)>, RepairError> {
+fn repair_rows(
+    slice_size: usize,
+    total: usize,
+    flags: &[bool],
+    wanted: &[usize],
+    present: &[(usize, &[u8])],
+    recovery: &[(u32, &[u8])],
+    kernel: &Kernel,
+) -> Result<Vec<(usize, Vec<u8>)>, RepairError> {
     let missing_count = flags.iter().filter(|p| !**p).count();
     if missing_count == 0 || wanted.is_empty() {
         return Ok(Vec::new());
@@ -273,9 +360,16 @@ fn repair_rows(slice_size: usize, total: usize, flags: &[bool], wanted: &[usize]
     let exps: Vec<u32> = recovery.iter().map(|(e, _)| *e).collect();
     let plan = RepairPlan::new(total, flags, &exps, kernel)?;
     let syn = syndromes(&plan, slice_size, present, recovery, kernel)?;
-    let rows: Vec<usize> = wanted.iter().filter_map(|w| plan.missing.iter().position(|m| m == w)).collect();
+    let rows: Vec<usize> = wanted
+        .iter()
+        .filter_map(|w| plan.missing.iter().position(|m| m == w))
+        .collect();
     let solved = solve_rows(&plan, &syn, slice_size, &rows, kernel);
-    Ok(rows.iter().zip(solved).filter_map(|(&r, d)| plan.missing.get(r).map(|&g| (g, d))).collect())
+    Ok(rows
+        .iter()
+        .zip(solved)
+        .filter_map(|(&r, d)| plan.missing.get(r).map(|&g| (g, d)))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -298,7 +392,7 @@ pub struct DiskFile {
 /// Where a present slice lives on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiskLocation {
-    /// Path of the file holding the slice (the target itself, a backup, a misnamed copy ...).
+    /// Path of the file holding the slice, such as the target itself, a backup, or a misnamed copy.
     pub path: PathBuf,
     /// Byte offset of the slice data.
     pub offset: u64,
@@ -340,7 +434,10 @@ pub struct DiskRepairReport {
 }
 
 fn io_err(context: impl Into<String>) -> impl FnOnce(io::Error) -> RepairError {
-    move |source| RepairError::Io { context: context.into(), source }
+    move |source| RepairError::Io {
+        context: context.into(),
+        source,
+    }
 }
 
 /// Read-only access to a source file.
@@ -358,8 +455,8 @@ impl Source {
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
             if len > 0
                 // SAFETY: the mapping is private and read-only; the files are inputs the caller
-                // asked us to read, and a concurrent writer would at worst corrupt the data we
-                // verify afterwards, never memory safety here.
+                // supplies for reading. A concurrent writer could corrupt the data that subsequent
+                // verification checks, but cannot compromise memory safety here.
                 && let Ok(m) = unsafe { memmap2::Mmap::map(&f) }
             {
                 return Ok(Source::Map(m));
@@ -387,8 +484,11 @@ impl Source {
             Source::Fd(f) => {
                 let mut done = 0usize;
                 while done < buf.len() {
-                    let Some(dst) = buf.get_mut(done..) else { break };
-                    let n = read_at(f, offset.saturating_add(done as u64), dst).map_err(io_err("reading"))?;
+                    let Some(dst) = buf.get_mut(done..) else {
+                        break;
+                    };
+                    let n = read_at(f, offset.saturating_add(done as u64), dst)
+                        .map_err(io_err("reading"))?;
                     if n == 0 {
                         break;
                     }
@@ -426,7 +526,10 @@ fn write_all_at(f: &File, offset: u64, data: &[u8]) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     let mut done = 0usize;
     while done < data.len() {
-        let n = f.seek_write(data.get(done..).unwrap_or(&[]), offset.saturating_add(done as u64))?;
+        let n = f.seek_write(
+            data.get(done..).unwrap_or(&[]),
+            offset.saturating_add(done as u64),
+        )?;
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
         }
@@ -438,14 +541,22 @@ fn write_all_at(f: &File, offset: u64, data: &[u8]) -> io::Result<()> {
 /// Repair the missing slices of several files on disk: syndromes are accumulated slice by slice
 /// from the present data (memory: `k` slice buffers), solved, and the results written into the
 /// target files at their natural offsets (files are created / sized as needed).
-pub fn repair_on_disk(plan: &DiskRepairPlan, kernel: &Kernel) -> Result<DiskRepairReport, RepairError> {
+pub fn repair_on_disk(
+    plan: &DiskRepairPlan,
+    kernel: &Kernel,
+) -> Result<DiskRepairReport, RepairError> {
     let slice_size = usize::try_from(plan.slice_size).map_err(|_| RepairError::ZeroSliceSize)?;
     if slice_size == 0 {
         return Err(RepairError::ZeroSliceSize);
     }
     let total = plan.present.len();
     let flags: Vec<bool> = plan.present.iter().map(Option::is_some).collect();
-    let missing: Vec<usize> = flags.iter().enumerate().filter(|(_, p)| !**p).map(|(i, _)| i).collect();
+    let missing: Vec<usize> = flags
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !**p)
+        .map(|(i, _)| i)
+        .collect();
     let mut report = DiskRepairReport::default();
     if missing.is_empty() {
         return Ok(report);
@@ -454,19 +565,25 @@ pub fn repair_on_disk(plan: &DiskRepairPlan, kernel: &Kernel) -> Result<DiskRepa
     let rp = RepairPlan::new(total, &flags, &exps, kernel)?;
     let k = rp.used_exponents.len();
     let mut sources: HashMap<PathBuf, Source> = HashMap::new();
-    let source_for = |path: &PathBuf, sources: &mut HashMap<PathBuf, Source>| -> Result<(), RepairError> {
-        if !sources.contains_key(path) {
-            sources.insert(path.clone(), Source::open(path)?);
-        }
-        Ok(())
-    };
+    let source_for =
+        |path: &PathBuf, sources: &mut HashMap<PathBuf, Source>| -> Result<(), RepairError> {
+            if !sources.contains_key(path) {
+                sources.insert(path.clone(), Source::open(path)?);
+            }
+            Ok(())
+        };
     // Syndromes start as the recovery slices.
     let mut syn: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; k];
     let mut buf = vec![0u8; slice_size];
     for (j, &e) in rp.used_exponents.iter().enumerate() {
-        let Some(r) = plan.recovery.iter().find(|r| r.exponent == e) else { return Err(RepairError::Singular) };
+        let Some(r) = plan.recovery.iter().find(|r| r.exponent == e) else {
+            return Err(RepairError::Singular);
+        };
         source_for(&r.path, &mut sources)?;
-        let n = sources.get(&r.path).ok_or(RepairError::Singular)?.read_at(r.offset, &mut buf)?;
+        let n = sources
+            .get(&r.path)
+            .ok_or(RepairError::Singular)?
+            .read_at(r.offset, &mut buf)?;
         report.bytes_read = report.bytes_read.saturating_add(n as u64);
         if let Some(s) = syn.get_mut(j) {
             xor_into(s, &buf);
@@ -476,7 +593,10 @@ pub fn repair_on_disk(plan: &DiskRepairPlan, kernel: &Kernel) -> Result<DiskRepa
     for (i, loc) in plan.present.iter().enumerate() {
         let Some(loc) = loc else { continue };
         source_for(&loc.path, &mut sources)?;
-        let n = sources.get(&loc.path).ok_or(RepairError::Singular)?.read_at(loc.offset, &mut buf)?;
+        let n = sources
+            .get(&loc.path)
+            .ok_or(RepairError::Singular)?
+            .read_at(loc.offset, &mut buf)?;
         report.bytes_read = report.bytes_read.saturating_add(n as u64);
         let coeffs: Vec<u16> = (0..k).map(|j| rp.coefficient(i, j).unwrap_or(0)).collect();
         fold_tiled(kernel, &mut syn, &buf, &coeffs);
@@ -487,22 +607,37 @@ pub fn repair_on_disk(plan: &DiskRepairPlan, kernel: &Kernel) -> Result<DiskRepa
     // Write.
     let mut targets: HashMap<usize, File> = HashMap::new();
     for (m, data) in rp.missing.iter().zip(solved) {
-        let Some(fi) = plan.files.iter().position(|f| *m >= f.first_slice && *m < f.first_slice.saturating_add(f.slice_count)) else {
+        let Some(fi) = plan
+            .files
+            .iter()
+            .position(|f| *m >= f.first_slice && *m < f.first_slice.saturating_add(f.slice_count))
+        else {
             return Err(RepairError::BadIndex(*m));
         };
-        let Some(file) = plan.files.get(fi) else { return Err(RepairError::BadIndex(*m)) };
+        let Some(file) = plan.files.get(fi) else {
+            return Err(RepairError::BadIndex(*m));
+        };
         if let std::collections::hash_map::Entry::Vacant(v) = targets.entry(fi) {
-            let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&file.path).map_err(io_err(format!("opening {}", file.path.display())))?;
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&file.path)
+                .map_err(io_err(format!("opening {}", file.path.display())))?;
             if f.metadata().map(|md| md.len()).unwrap_or(0) < file.size {
-                f.set_len(file.size).map_err(io_err(format!("sizing {}", file.path.display())))?;
+                f.set_len(file.size)
+                    .map_err(io_err(format!("sizing {}", file.path.display())))?;
             }
             v.insert(f);
         }
         let Some(f) = targets.get(&fi) else { continue };
         let slice_in_file = (*m - file.first_slice) as u64;
         let offset = slice_in_file.saturating_mul(plan.slice_size);
-        let len = usize::try_from(file.size.saturating_sub(offset).min(plan.slice_size)).unwrap_or(0);
-        write_all_at(f, offset, data.get(..len).unwrap_or(&[])).map_err(io_err(format!("writing {}", file.path.display())))?;
+        let len =
+            usize::try_from(file.size.saturating_sub(offset).min(plan.slice_size)).unwrap_or(0);
+        write_all_at(f, offset, data.get(..len).unwrap_or(&[]))
+            .map_err(io_err(format!("writing {}", file.path.display())))?;
         report.bytes_written = report.bytes_written.saturating_add(len as u64);
         report.repaired.push(*m);
     }
@@ -515,7 +650,9 @@ mod tests {
     use crate::reed_solomon::encode_reference;
 
     fn data(n: usize, seed: u32) -> Vec<u8> {
-        (0..n as u32).map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8).collect()
+        (0..n as u32)
+            .map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8)
+            .collect()
     }
 
     type Set = (Vec<Vec<u8>>, Vec<(u32, Vec<u8>)>);
@@ -534,7 +671,12 @@ mod tests {
         let (inputs, rec) = set(12, ss, &[0, 1, 2, 3, 4]);
         let recovery: Vec<(u32, &[u8])> = rec.iter().map(|(e, d)| (*e, d.as_slice())).collect();
         let missing = [2usize, 5, 11];
-        let present: Vec<(usize, &[u8])> = inputs.iter().enumerate().filter(|(i, _)| !missing.contains(i)).map(|(i, d)| (i, d.as_slice())).collect();
+        let present: Vec<(usize, &[u8])> = inputs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !missing.contains(i))
+            .map(|(i, d)| (i, d.as_slice()))
+            .collect();
         let out = repair_slices(ss, 12, &present, &recovery, &k).unwrap();
         assert_eq!(out.len(), 3);
         for (g, d) in &out {
@@ -543,28 +685,71 @@ mod tests {
         // Surgical: only slice 11.
         let out = repair_selected_slices(ss, 12, &present, &recovery, &[11, 11], &k).unwrap();
         assert_eq!(out, vec![(11, inputs[11].clone())]);
-        assert!(matches!(repair_selected_slices(ss, 12, &present, &recovery, &[1], &k), Err(RepairError::NotMissing(1))));
-        assert!(matches!(repair_selected_slices(ss, 12, &present, &recovery, &[99], &k), Err(RepairError::BadIndex(99))));
+        assert!(matches!(
+            repair_selected_slices(ss, 12, &present, &recovery, &[1], &k),
+            Err(RepairError::NotMissing(1))
+        ));
+        assert!(matches!(
+            repair_selected_slices(ss, 12, &present, &recovery, &[99], &k),
+            Err(RepairError::BadIndex(99))
+        ));
         // Not enough recovery.
-        assert!(matches!(repair_slices(ss, 12, &present, &recovery[..2], &k), Err(RepairError::NotEnoughRecovery { needed: 3, available: 2 })));
+        assert!(matches!(
+            repair_slices(ss, 12, &present, &recovery[..2], &k),
+            Err(RepairError::NotEnoughRecovery {
+                needed: 3,
+                available: 2
+            })
+        ));
         // XOR fast path: one missing, exponent 0 only.
-        let present1: Vec<(usize, &[u8])> = inputs.iter().enumerate().filter(|(i, _)| *i != 7).map(|(i, d)| (i, d.as_slice())).collect();
+        let present1: Vec<(usize, &[u8])> = inputs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 7)
+            .map(|(i, d)| (i, d.as_slice()))
+            .collect();
         let out = repair_slices(ss, 12, &present1, &recovery[..1], &k).unwrap();
         assert_eq!(out, vec![(7, inputs[7].clone())]);
-        // ... and without exponent 0 it goes through the field.
+        // Without exponent 0, the operation goes through the field.
         let out = repair_slices(ss, 12, &present1, &recovery[3..4], &k).unwrap();
         assert_eq!(out, vec![(7, inputs[7].clone())]);
         // Nothing missing.
-        let all: Vec<(usize, &[u8])> = inputs.iter().enumerate().map(|(i, d)| (i, d.as_slice())).collect();
-        assert!(repair_slices(ss, 12, &all, &recovery, &k).unwrap().is_empty());
+        let all: Vec<(usize, &[u8])> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i, d.as_slice()))
+            .collect();
+        assert!(
+            repair_slices(ss, 12, &all, &recovery, &k)
+                .unwrap()
+                .is_empty()
+        );
         // Errors.
-        assert!(matches!(repair_slices(ss, 12, &[(0, &inputs[0][..10])], &recovery, &k), Err(RepairError::SliceSizeMismatch { .. })));
-        assert!(matches!(repair_slices(ss, 12, &[(0, &inputs[0]), (0, &inputs[1])], &recovery, &k), Err(RepairError::BadIndex(0))));
-        assert!(matches!(repair_slices(0, 12, &[], &recovery, &k), Err(RepairError::ZeroSliceSize)));
+        assert!(matches!(
+            repair_slices(ss, 12, &[(0, &inputs[0][..10])], &recovery, &k),
+            Err(RepairError::SliceSizeMismatch { .. })
+        ));
+        assert!(matches!(
+            repair_slices(ss, 12, &[(0, &inputs[0]), (0, &inputs[1])], &recovery, &k),
+            Err(RepairError::BadIndex(0))
+        ));
+        assert!(matches!(
+            repair_slices(0, 12, &[], &recovery, &k),
+            Err(RepairError::ZeroSliceSize)
+        ));
         let short = [(1u32, &rec[1].1[..5])];
-        assert!(matches!(repair_slices(ss, 12, &present1, &short, &k), Err(RepairError::SliceSizeMismatch { .. })));
-        assert_eq!(RepairError::Singular.to_string(), "recovery matrix is singular");
-        assert!(matches!(RepairError::from(RsError::TooManyInputs), RepairError::TooManyInputs));
+        assert!(matches!(
+            repair_slices(ss, 12, &present1, &short, &k),
+            Err(RepairError::SliceSizeMismatch { .. })
+        ));
+        assert_eq!(
+            RepairError::Singular.to_string(),
+            "recovery matrix is singular"
+        );
+        assert!(matches!(
+            RepairError::from(RsError::TooManyInputs),
+            RepairError::TooManyInputs
+        ));
     }
 
     #[test]
@@ -573,7 +758,12 @@ mod tests {
         let ss = 70_000; // crosses tile boundaries
         let (inputs, rec) = set(20, ss, &(0..20u32).collect::<Vec<_>>());
         let recovery: Vec<(u32, &[u8])> = rec.iter().map(|(e, d)| (*e, d.as_slice())).collect();
-        let present: Vec<(usize, &[u8])> = inputs.iter().enumerate().filter(|(i, _)| i % 2 == 0).map(|(i, d)| (i, d.as_slice())).collect();
+        let present: Vec<(usize, &[u8])> = inputs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(i, d)| (i, d.as_slice()))
+            .collect();
         let out = repair_slices(ss, 20, &present, &recovery, &k).unwrap();
         assert_eq!(out.len(), 10);
         for (g, d) in &out {
@@ -618,17 +808,40 @@ mod tests {
         let plan = DiskRepairPlan {
             slice_size: ss as u64,
             files: vec![
-                DiskFile { path: a_path.clone(), size: 2500, first_slice: 0, slice_count: 3 },
-                DiskFile { path: b_path.clone(), size: 2000, first_slice: 3, slice_count: 2 },
+                DiskFile {
+                    path: a_path.clone(),
+                    size: 2500,
+                    first_slice: 0,
+                    slice_count: 3,
+                },
+                DiskFile {
+                    path: b_path.clone(),
+                    size: 2000,
+                    first_slice: 3,
+                    slice_count: 2,
+                },
             ],
             present: vec![
-                Some(DiskLocation { path: a_path.clone(), offset: 0 }),
+                Some(DiskLocation {
+                    path: a_path.clone(),
+                    offset: 0,
+                }),
                 None,
-                Some(DiskLocation { path: a_path.clone(), offset: 2000 }),
+                Some(DiskLocation {
+                    path: a_path.clone(),
+                    offset: 2000,
+                }),
                 None,
                 None,
             ],
-            recovery: rec_offsets.iter().map(|&(e, o)| DiskRecovery { path: vol_path.clone(), offset: o, exponent: e }).collect(),
+            recovery: rec_offsets
+                .iter()
+                .map(|&(e, o)| DiskRecovery {
+                    path: vol_path.clone(),
+                    offset: o,
+                    exponent: e,
+                })
+                .collect(),
         };
         let report = repair_on_disk(&plan, &k).unwrap();
         assert_eq!(report.repaired, vec![1, 3, 4]);
@@ -637,17 +850,35 @@ mod tests {
         assert_eq!(std::fs::read(&b_path).unwrap(), b);
         // Nothing missing: no-op.
         let mut all = plan.clone();
-        all.present[1] = Some(DiskLocation { path: a_path.clone(), offset: 1000 });
-        all.present[3] = Some(DiskLocation { path: b_path.clone(), offset: 0 });
-        all.present[4] = Some(DiskLocation { path: b_path.clone(), offset: 1000 });
+        all.present[1] = Some(DiskLocation {
+            path: a_path.clone(),
+            offset: 1000,
+        });
+        all.present[3] = Some(DiskLocation {
+            path: b_path.clone(),
+            offset: 0,
+        });
+        all.present[4] = Some(DiskLocation {
+            path: b_path.clone(),
+            offset: 1000,
+        });
         assert!(repair_on_disk(&all, &k).unwrap().repaired.is_empty());
         // Missing source file surfaces as Io.
         let mut bad = plan.clone();
-        bad.present[0] = Some(DiskLocation { path: dir.join("nope"), offset: 0 });
-        assert!(matches!(repair_on_disk(&bad, &k), Err(RepairError::Io { .. })));
+        bad.present[0] = Some(DiskLocation {
+            path: dir.join("nope"),
+            offset: 0,
+        });
+        assert!(matches!(
+            repair_on_disk(&bad, &k),
+            Err(RepairError::Io { .. })
+        ));
         let mut zero = plan.clone();
         zero.slice_size = 0;
-        assert!(matches!(repair_on_disk(&zero, &k), Err(RepairError::ZeroSliceSize)));
+        assert!(matches!(
+            repair_on_disk(&zero, &k),
+            Err(RepairError::ZeroSliceSize)
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -17,8 +17,8 @@
 //! The scanner also produces the fused file hashes (CRC-32, MD5, 16k MD5) of the data it
 //! streams, so a verification pass reads every byte exactly once.
 
-use crate::crc::{self, WindowTable, INIT};
-use crate::hasher::{md5, FileHashes, FileHasher};
+use crate::crc::{self, INIT, WindowTable};
+use crate::hasher::{FileHasher, FileHashes, md5};
 use crate::packet::PacketSource;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,7 +93,16 @@ impl ChecksumIndex {
             let bit = (e.crc32 as usize) & filter_mask;
             filter[bit / 64] |= 1u64 << (bit % 64);
         }
-        Self { slice_size, entries, keys, vals, mask, filter, filter_mask, duplicate_crcs }
+        Self {
+            slice_size,
+            entries,
+            keys,
+            vals,
+            mask,
+            filter,
+            filter_mask,
+            duplicate_crcs,
+        }
     }
 
     /// Slice size.
@@ -191,10 +200,11 @@ impl ScanReport {
     /// Whether every block of `expected` (the slices of one file, in order) was found at its
     /// natural offset.
     pub fn is_full_match(&self, expected: &[ChecksumEntry], slice_size: u64) -> bool {
-        expected
-            .iter()
-            .enumerate()
-            .all(|(i, e)| self.found.iter().any(|f| f.block == e.block && f.offset == i as u64 * slice_size))
+        expected.iter().enumerate().all(|(i, e)| {
+            self.found
+                .iter()
+                .any(|f| f.block == e.block && f.offset == i as u64 * slice_size)
+        })
     }
 }
 
@@ -215,7 +225,12 @@ pub struct ScanConfig<'a> {
 
 impl Default for ScanConfig<'_> {
     fn default() -> Self {
-        Self { aligned_only: false, buffer_size: 8 << 20, hash_file: true, known_aligned: None }
+        Self {
+            aligned_only: false,
+            buffer_size: 8 << 20,
+            hash_file: true,
+            known_aligned: None,
+        }
     }
 }
 
@@ -264,7 +279,8 @@ impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
         if want > filled {
             let (head, tail) = self.buf.split_at_mut(filled);
             let _ = head;
-            self.src.read_at(pos + filled as u64, &mut tail[..want - filled])?;
+            self.src
+                .read_at(pos + filled as u64, &mut tail[..want - filled])?;
         }
         self.len = want;
         if let Some(h) = &mut self.hasher {
@@ -322,10 +338,14 @@ pub fn scan_source<S: PacketSource + ?Sized>(
     progress: &mut dyn FnMut(u64),
 ) -> io::Result<ScanReport> {
     let ss = index.slice_size();
-    let ss_us = usize::try_from(ss).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "slice size too large"))?;
+    let ss_us = usize::try_from(ss)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "slice size too large"))?;
     let file_len = src.source_len();
     let mut report = ScanReport::default();
-    let cap = config.buffer_size.max(ss_us + (64 << 10)).max(2 * ss_us.min(64 << 20));
+    let cap = config
+        .buffer_size
+        .max(ss_us + (64 << 10))
+        .max(2 * ss_us.min(64 << 20));
     let mut win = Window::new(src, cap, config.hash_file);
     let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
 
@@ -336,7 +356,13 @@ pub fn scan_source<S: PacketSource + ?Sized>(
 
     let mut scratch: Vec<u8> = Vec::new();
     // Confirm candidates at `pos` whose CRC is `crc_final`; returns true if any matched.
-    let confirm = |pos: u64, crc_final: u32, win: &Window<'_, S>, report: &mut ScanReport, scratch: &mut Vec<u8>, aligned: bool| -> bool {
+    let confirm = |pos: u64,
+                   crc_final: u32,
+                   win: &Window<'_, S>,
+                   report: &mut ScanReport,
+                   scratch: &mut Vec<u8>,
+                   aligned: bool|
+     -> bool {
         let mut digest: Option<[u8; 16]> = None;
         let mut any = false;
         for e in index.lookup(crc_final) {
@@ -353,7 +379,10 @@ pub fn scan_source<S: PacketSource + ?Sized>(
                 }
             });
             if d == e.md5 {
-                report.found.push(FoundBlock { offset: pos, block: e.block });
+                report.found.push(FoundBlock {
+                    offset: pos,
+                    block: e.block,
+                });
                 any = true;
             } else {
                 report.md5_misses += 1;
@@ -386,7 +415,9 @@ pub fn scan_source<S: PacketSource + ?Sized>(
     // scan reuses these instead of hashing the same window again.
     let mut aligned_ok: Vec<bool> = Vec::new();
     if let Some(exp) = expected {
-        let expected_len_ok = !exp.is_empty() && (exp.len() as u64 - 1) * ss < file_len && file_len <= exp.len() as u64 * ss;
+        let expected_len_ok = !exp.is_empty()
+            && (exp.len() as u64 - 1) * ss < file_len
+            && file_len <= exp.len() as u64 * ss;
         if let Some(known) = config.known_aligned.filter(|k| k.len() == exp.len()) {
             aligned_ok = known.to_vec();
         } else if expected_len_ok {
@@ -414,7 +445,10 @@ pub fn scan_source<S: PacketSource + ?Sized>(
                 };
                 aligned_ok.push(ok);
                 if ok {
-                    report.found.push(FoundBlock { offset: p, block: e.block });
+                    report.found.push(FoundBlock {
+                        offset: p,
+                        block: e.block,
+                    });
                     report.aligned_hits += 1;
                 } else {
                     all = false;
@@ -453,7 +487,10 @@ pub fn scan_source<S: PacketSource + ?Sized>(
         }
         win.ensure(pos, ss)?;
         if let Some(e) = reuse_aligned(pos) {
-            report.found.push(FoundBlock { offset: pos, block: e.block });
+            report.found.push(FoundBlock {
+                offset: pos,
+                block: e.block,
+            });
             report.aligned_hits += 1;
             pos += ss;
             progress(pos.min(file_len));
@@ -462,7 +499,16 @@ pub fn scan_source<S: PacketSource + ?Sized>(
         let mut raw = window_crc_raw(pos, &win);
         let aligned_here = pos.is_multiple_of(ss);
         let final_crc = raw ^ INIT;
-        if index.might_contain(final_crc) && confirm(pos, final_crc, &win, &mut report, &mut scratch, aligned_here) {
+        if index.might_contain(final_crc)
+            && confirm(
+                pos,
+                final_crc,
+                &win,
+                &mut report,
+                &mut scratch,
+                aligned_here,
+            )
+        {
             pos += ss;
             progress(pos.min(file_len));
             continue;
@@ -488,7 +534,11 @@ pub fn scan_source<S: PacketSource + ?Sized>(
                     }
                 }
             }
-            let new_byte = if new_end <= file_len { win.byte(new_end - 1) } else { 0 };
+            let new_byte = if new_end <= file_len {
+                win.byte(new_end - 1)
+            } else {
+                0
+            };
             let old_byte = win.byte(pos);
             raw = wt.slide_raw(raw, new_byte, old_byte);
             pos = new_pos;
@@ -498,7 +548,14 @@ pub fn scan_source<S: PacketSource + ?Sized>(
                 if pos.is_multiple_of(1024) {
                     progress(pos);
                 }
-                if confirm(pos, final_crc, &win, &mut report, &mut scratch, pos.is_multiple_of(ss)) {
+                if confirm(
+                    pos,
+                    final_crc,
+                    &win,
+                    &mut report,
+                    &mut scratch,
+                    pos.is_multiple_of(ss),
+                ) {
                     matched = true;
                     break;
                 }
@@ -536,11 +593,21 @@ pub fn scan_file(
 }
 
 /// Build the checksum entries of one file from its slice checksums.
-pub fn entries_for_file(file_index: u32, slices: &[crate::packet::SliceChecksum]) -> Vec<ChecksumEntry> {
+pub fn entries_for_file(
+    file_index: u32,
+    slices: &[crate::packet::SliceChecksum],
+) -> Vec<ChecksumEntry> {
     slices
         .iter()
         .enumerate()
-        .map(|(i, s)| ChecksumEntry { crc32: s.crc32, md5: s.md5, block: BlockRef { file_index, block_index: i as u32 } })
+        .map(|(i, s)| ChecksumEntry {
+            crc32: s.crc32,
+            md5: s.md5,
+            block: BlockRef {
+                file_index,
+                block_index: i as u32,
+            },
+        })
         .collect()
 }
 
@@ -568,7 +635,14 @@ mod tests {
                 let mut p = c.to_vec();
                 p.resize(ss, 0);
                 let (crc32, md5) = slice_checksums(&p);
-                ChecksumEntry { crc32, md5, block: BlockRef { file_index, block_index: i as u32 } }
+                ChecksumEntry {
+                    crc32,
+                    md5,
+                    block: BlockRef {
+                        file_index,
+                        block_index: i as u32,
+                    },
+                }
             })
             .collect()
     }
@@ -580,7 +654,14 @@ mod tests {
     #[test]
     fn index_lookup_and_filter() {
         let mut es = entries(0, &rnd(10_000, 1), 1000);
-        es.push(ChecksumEntry { crc32: es[3].crc32, md5: [9; 16], block: BlockRef { file_index: 1, block_index: 0 } });
+        es.push(ChecksumEntry {
+            crc32: es[3].crc32,
+            md5: [9; 16],
+            block: BlockRef {
+                file_index: 1,
+                block_index: 0,
+            },
+        });
         let idx = ChecksumIndex::new(1000, es.clone());
         assert_eq!(idx.len(), 11);
         assert!(!idx.is_empty());
@@ -595,7 +676,9 @@ mod tests {
         assert_eq!(idx.lookup(es[3].crc32).count(), 2);
         assert_eq!(idx.lookup(es[0].crc32).count(), 1);
         // A CRC that is not indexed yields nothing (filter may say maybe).
-        let absent = (0u32..).find(|c| !es.iter().any(|e| e.crc32 == *c)).unwrap();
+        let absent = (0u32..)
+            .find(|c| !es.iter().any(|e| e.crc32 == *c))
+            .unwrap();
         assert_eq!(idx.lookup(absent).count(), 0);
         let empty = ChecksumIndex::new(4, vec![]);
         assert!(empty.is_empty());
@@ -608,7 +691,15 @@ mod tests {
         let ss = 1000;
         let es = entries(0, &data, ss);
         let idx = ChecksumIndex::new(ss as u64, es.clone());
-        let r = scan_source(&data, &idx, Some(&es), &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r = scan_source(
+            &data,
+            &idx,
+            Some(&es),
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert_eq!(r.found.len(), 24);
         assert!(r.is_full_match(&es, ss as u64));
         assert_eq!(r.aligned_hits, 24);
@@ -620,11 +711,30 @@ mod tests {
         assert_eq!(fh.crc32, crate::crc::crc32(&data));
         assert_eq!(fh.md5_16k, crate::hasher::md5_16k(&data));
         // Without expectations the general aligned probe finds the same.
-        let r2 = scan_source(&data, &idx, None, &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r2 = scan_source(
+            &data,
+            &idx,
+            None,
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert!(r2.is_full_match(&es, ss as u64));
         assert_eq!(r2.slid_bytes, 0);
         // Aligned-only mode too.
-        let r3 = scan_source(&data, &idx, None, &ScanConfig { aligned_only: true, ..Default::default() }, None, &mut no_progress()).unwrap();
+        let r3 = scan_source(
+            &data,
+            &idx,
+            None,
+            &ScanConfig {
+                aligned_only: true,
+                ..Default::default()
+            },
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert!(r3.is_full_match(&es, ss as u64));
     }
 
@@ -634,17 +744,41 @@ mod tests {
         let data = rnd(4 * ss, 3);
         let es = entries(0, &data, ss);
         let idx = ChecksumIndex::new(ss as u64, es.clone());
-        let r = scan_source(&data, &idx, Some(&es), &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r = scan_source(
+            &data,
+            &idx,
+            Some(&es),
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert!(r.is_full_match(&es, ss as u64));
         // One-byte file.
         let tiny = vec![7u8];
         let et = entries(1, &tiny, ss);
         let idx = ChecksumIndex::new(ss as u64, et.clone());
-        let r = scan_source(&tiny, &idx, Some(&et), &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r = scan_source(
+            &tiny,
+            &idx,
+            Some(&et),
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert!(r.is_full_match(&et, ss as u64));
         // Empty file: nothing to find, hashes of empty.
         let empty: Vec<u8> = vec![];
-        let r = scan_source(&empty, &idx, None, &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r = scan_source(
+            &empty,
+            &idx,
+            None,
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert!(r.found.is_empty());
         assert_eq!(r.file_hashes.unwrap().len, 0);
     }
@@ -658,12 +792,24 @@ mod tests {
         let mut damaged = data.clone();
         damaged[3 * ss + 10] ^= 0xFF;
         let mut last = 0;
-        let r = scan_source(&damaged, &idx, Some(&es), &ScanConfig::default(), None, &mut |p| last = p).unwrap();
+        let r = scan_source(
+            &damaged,
+            &idx,
+            Some(&es),
+            &ScanConfig::default(),
+            None,
+            &mut |p| last = p,
+        )
+        .unwrap();
         assert_eq!(last, damaged.len() as u64);
         assert_eq!(r.found.len(), 9);
         assert!(!r.is_full_match(&es, ss as u64));
         assert!(r.found.iter().all(|f| f.block.block_index != 3));
-        assert!(r.found.iter().all(|f| f.offset == f.block.block_index as u64 * ss as u64));
+        assert!(
+            r.found
+                .iter()
+                .all(|f| f.offset == f.block.block_index as u64 * ss as u64)
+        );
         // The damaged block made the scanner slide across it (1000 bytes) before re-aligning.
         assert_eq!(r.slid_bytes, ss as u64);
         assert_eq!(r.sliding_hits, 0);
@@ -680,30 +826,69 @@ mod tests {
         let mut shifted = data[..3 * ss].to_vec();
         shifted.extend_from_slice(&[0xAB; 17]);
         shifted.extend_from_slice(&data[3 * ss..]);
-        let r = scan_source(&shifted, &idx, Some(&es), &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r = scan_source(
+            &shifted,
+            &idx,
+            Some(&es),
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert_eq!(r.found.len(), 9, "{r:?}");
         for f in &r.found {
-            let expect = if f.block.block_index < 3 { f.block.block_index as u64 * ss as u64 } else { f.block.block_index as u64 * ss as u64 + 17 };
+            let expect = if f.block.block_index < 3 {
+                f.block.block_index as u64 * ss as u64
+            } else {
+                f.block.block_index as u64 * ss as u64 + 17
+            };
             assert_eq!(f.offset, expect, "block {}", f.block.block_index);
         }
         assert!(r.sliding_hits >= 1);
         assert!(r.slid_bytes >= 17);
         // Last (padded) block found at an unaligned offset with virtual zero padding.
-        assert!(r.found.iter().any(|f| f.block.block_index == 8 && f.offset == 8 * ss as u64 + 17));
+        assert!(
+            r.found
+                .iter()
+                .any(|f| f.block.block_index == 8 && f.offset == 8 * ss as u64 + 17)
+        );
 
         // Delete 100 bytes from block 1 → block 1 lost, others shifted back by 100.
         let mut cut = data.clone();
         cut.drain(ss + 200..ss + 300);
-        let r = scan_source(&cut, &idx, Some(&es), &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r = scan_source(
+            &cut,
+            &idx,
+            Some(&es),
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert_eq!(r.found.len(), 8);
         assert!(r.found.iter().all(|f| f.block.block_index != 1));
         for f in &r.found {
-            let expect = if f.block.block_index == 0 { 0 } else { f.block.block_index as u64 * ss as u64 - 100 };
+            let expect = if f.block.block_index == 0 {
+                0
+            } else {
+                f.block.block_index as u64 * ss as u64 - 100
+            };
             assert_eq!(f.offset, expect);
         }
 
         // Aligned-only mode misses shifted blocks.
-        let r = scan_source(&shifted, &idx, None, &ScanConfig { aligned_only: true, ..Default::default() }, None, &mut no_progress()).unwrap();
+        let r = scan_source(
+            &shifted,
+            &idx,
+            None,
+            &ScanConfig {
+                aligned_only: true,
+                ..Default::default()
+            },
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert_eq!(r.found.len(), 3);
     }
 
@@ -718,7 +903,15 @@ mod tests {
 
         // A split into two fragments at an arbitrary point: fragment 2 holds blocks 3..5 unaligned.
         let frag2 = &a[2 * ss + 123..];
-        let r = scan_source(&frag2.to_vec(), &idx, None, &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r = scan_source(
+            &frag2.to_vec(),
+            &idx,
+            None,
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         let idxs: Vec<u32> = r.found.iter().map(|f| f.block.block_index).collect();
         assert_eq!(idxs, vec![3, 4, 5]);
         assert_eq!(r.found[0].offset, (ss - 123) as u64);
@@ -726,11 +919,24 @@ mod tests {
         // Concatenation b ‖ a: all blocks of both files are found.
         let mut cat = b.clone();
         cat.extend_from_slice(&a);
-        let r = scan_source(&cat, &idx, None, &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r = scan_source(
+            &cat,
+            &idx,
+            None,
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert_eq!(r.found.len(), 3 + 6);
         let b_found: Vec<_> = r.found.iter().filter(|f| f.block.file_index == 1).collect();
         assert_eq!(b_found.len(), 3);
-        assert!(r.found.iter().filter(|f| f.block.file_index == 0).all(|f| f.offset == 3 * ss as u64 + f.block.block_index as u64 * ss as u64));
+        assert!(
+            r.found
+                .iter()
+                .filter(|f| f.block.file_index == 0)
+                .all(|f| f.offset == 3 * ss as u64 + f.block.block_index as u64 * ss as u64)
+        );
     }
 
     #[test]
@@ -741,12 +947,35 @@ mod tests {
         let other = rnd(2 * ss, 8);
         es.extend(entries(1, &other, ss));
         // Fake collision: same CRC as other block 0 but a different MD5.
-        es.push(ChecksumEntry { crc32: es[3].crc32, md5: [0xEE; 16], block: BlockRef { file_index: 2, block_index: 0 } });
+        es.push(ChecksumEntry {
+            crc32: es[3].crc32,
+            md5: [0xEE; 16],
+            block: BlockRef {
+                file_index: 2,
+                block_index: 0,
+            },
+        });
         let idx = ChecksumIndex::new(ss as u64, es.clone());
-        let r = scan_source(&zeros[..ss].to_vec(), &idx, None, &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r = scan_source(
+            &zeros[..ss].to_vec(),
+            &idx,
+            None,
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert_eq!(r.found.len(), 3);
         assert!(r.found.iter().all(|f| f.offset == 0));
-        let r = scan_source(&other, &idx, None, &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r = scan_source(
+            &other,
+            &idx,
+            None,
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert_eq!(r.found.len(), 2);
         assert_eq!(r.md5_misses, 1);
         assert!(r.crc_hits >= 3);
@@ -758,14 +987,24 @@ mod tests {
         let data = rnd(40 * ss + 999, 9);
         let es = entries(0, &data, ss);
         let idx = ChecksumIndex::new(ss as u64, es.clone());
-        let cfg = ScanConfig { buffer_size: 1, ..Default::default() }; // forced to minimum
+        let cfg = ScanConfig {
+            buffer_size: 1,
+            ..Default::default()
+        }; // forced to minimum
         // Shift everything by 5 bytes so the sliding path has to cross many refills.
         let mut shifted = vec![1u8, 2, 3, 4, 5];
         shifted.extend_from_slice(&data);
         let r = scan_source(&shifted, &idx, Some(&es), &cfg, None, &mut no_progress()).unwrap();
         assert_eq!(r.found.len(), 41, "{}", r.found.len());
-        assert!(r.found.iter().all(|f| f.offset == f.block.block_index as u64 * ss as u64 + 5));
-        assert_eq!(r.file_hashes.unwrap().md5_full, crate::hasher::md5(&shifted));
+        assert!(
+            r.found
+                .iter()
+                .all(|f| f.offset == f.block.block_index as u64 * ss as u64 + 5)
+        );
+        assert_eq!(
+            r.file_hashes.unwrap().md5_full,
+            crate::hasher::md5(&shifted)
+        );
     }
 
     #[test]
@@ -796,7 +1035,15 @@ mod tests {
         assert_eq!(r.file_hashes.unwrap().md5_full, crate::hasher::md5(&data));
         // Cancelled aligned fast path.
         let cancel = AtomicBool::new(true);
-        let r = scan_source(&data, &idx, Some(&es), &ScanConfig::default(), Some(&cancel), &mut no_progress()).unwrap();
+        let r = scan_source(
+            &data,
+            &idx,
+            Some(&es),
+            &ScanConfig::default(),
+            Some(&cancel),
+            &mut no_progress(),
+        )
+        .unwrap();
         assert!(r.cancelled);
     }
 
@@ -815,15 +1062,39 @@ mod tests {
             .collect();
         let es = entries_for_file(4, &slices);
         assert_eq!(es.len(), 11);
-        assert_eq!(es[10].block, BlockRef { file_index: 4, block_index: 10 });
+        assert_eq!(
+            es[10].block,
+            BlockRef {
+                file_index: 4,
+                block_index: 10
+            }
+        );
         let idx = ChecksumIndex::new(ss as u64, es.clone());
         let dir = std::env::temp_dir().join(format!("par-rs-scan-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("x.bin");
         std::fs::write(&p, &data).unwrap();
-        let r = scan_file(&p, &idx, Some(&es), &ScanConfig::default(), None, &mut no_progress()).unwrap();
+        let r = scan_file(
+            &p,
+            &idx,
+            Some(&es),
+            &ScanConfig::default(),
+            None,
+            &mut no_progress(),
+        )
+        .unwrap();
         assert!(r.is_full_match(&es, ss as u64));
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(scan_file(&p, &idx, None, &ScanConfig::default(), None, &mut no_progress()).is_err());
+        assert!(
+            scan_file(
+                &p,
+                &idx,
+                None,
+                &ScanConfig::default(),
+                None,
+                &mut no_progress()
+            )
+            .is_err()
+        );
     }
 }

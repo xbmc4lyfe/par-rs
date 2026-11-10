@@ -73,12 +73,16 @@ pub fn atoi(bytes: &[u8]) -> i32 {
 
 /// Port of `ParParser::ParseParFilename`.
 ///
-/// * `confirmed`: the name is known to be a par2 file name; when `false`, everything after the
+/// * `confirmed`: the name is known to be a par2 filename; when `false`, everything after the
 ///   last `.par2` is cut off first (handles names like `file.par2.1` or `file.par2_dup`).
 /// * `fold`: byte case folding applied before matching.
 ///
 /// Returns `None` when the name is not a `.par2` name.
-pub fn parse_par_filename(name: &[u8], confirmed: bool, fold: impl Fn(u8) -> u8) -> Option<ParName> {
+pub fn parse_par_filename(
+    name: &[u8],
+    confirmed: bool,
+    fold: impl Fn(u8) -> u8,
+) -> Option<ParName> {
     let truncated = &name[..name.len().min(NAME_CAPACITY - 1)];
     let mut f: Vec<u8> = truncated.iter().map(|&b| fold(b)).collect();
     if f.len() < 6 {
@@ -100,29 +104,39 @@ pub fn parse_par_filename(name: &[u8], confirmed: bool, fold: impl Fn(u8) -> u8)
     f.truncate(f.len() - 5);
     let mut blocks = 0i32;
     if let Some(dot) = f.iter().rposition(|&b| b == b'.')
-        && f[dot..].starts_with(b".vol") {
-            let seg = &f[dot..];
-            if let Some(plus) = seg.iter().position(|&b| b == b'+') {
-                blocks = atoi(&seg[plus + 1..]);
-                f.truncate(dot);
-            } else if seg.contains(&b'-') {
-                blocks = -1;
-                f.truncate(dot);
-            }
+        && f[dot..].starts_with(b".vol")
+    {
+        let seg = &f[dot..];
+        if let Some(plus) = seg.iter().position(|&b| b == b'+') {
+            blocks = atoi(&seg[plus + 1..]);
+            f.truncate(dot);
+        } else if seg.contains(&b'-') {
+            blocks = -1;
+            f.truncate(dot);
         }
-    Some(ParName { base_len: f.len(), blocks })
+    }
+    Some(ParName {
+        base_len: f.len(),
+        blocks,
+    })
 }
 
 /// Port of `ParParser::SameParCollection`: both names parse as par2 names with the same base
 /// length and case-insensitively equal bases.
 pub fn same_par_collection(a: &[u8], b: &[u8], confirmed: bool) -> bool {
-    let (Some(pa), Some(pb)) = (parse_par_filename(a, confirmed, ascii_lower), parse_par_filename(b, confirmed, ascii_lower)) else {
+    let (Some(pa), Some(pb)) = (
+        parse_par_filename(a, confirmed, ascii_lower),
+        parse_par_filename(b, confirmed, ascii_lower),
+    ) else {
         return false;
     };
-    pa.base_len == pb.base_len && a.len() >= pa.base_len && b.len() >= pb.base_len && a[..pa.base_len].eq_ignore_ascii_case(&b[..pb.base_len])
+    pa.base_len == pb.base_len
+        && a.len() >= pa.base_len
+        && b.len() >= pb.base_len
+        && a[..pa.base_len].eq_ignore_ascii_case(&b[..pb.base_len])
 }
 
-/// Port of `ParParser::FindMainPars`: one representative file name per par2 collection among
+/// Port of `ParParser::FindMainPars`: one representative filename per par2 collection among
 /// `names` (the first encountered), in encounter order.
 pub fn find_main_pars<'a, I>(names: I) -> Vec<&'a [u8]>
 where
@@ -133,7 +147,10 @@ where
         if parse_par_filename(name, true, ascii_lower).is_none() {
             continue;
         }
-        if !out.iter().any(|&existing| same_par_collection(name, existing, true)) {
+        if !out
+            .iter()
+            .any(|&existing| same_par_collection(name, existing, true))
+        {
             out.push(name);
         }
     }
@@ -224,7 +241,7 @@ pub fn volume_range(name: &[u8]) -> Option<(u32, u32)> {
     Some((v as u32, count))
 }
 
-/// Build a `par2cmdline`-style volume file name: `<base>.vol<first>+<count>.par2` with both
+/// Build a `par2cmdline`-style volume filename: `<base>.vol<first>+<count>.par2` with both
 /// numbers zero-padded to `width` digits.
 pub fn volume_filename(base: &str, first: u32, count: u32, width: usize) -> String {
     format!("{base}.vol{first:0width$}+{count:0width$}.par2")
@@ -280,10 +297,15 @@ pub fn calc_completed_volume_blocks(parsed_blocks: i32, disk_size: i64, slice_si
 /// Superfluous volumes are then pruned smallest-first while the remainder still suffices.
 ///
 /// Returns the selected indices (ascending) and the total number of blocks in **all**
-/// available volumes (`block_found`), so callers can report "N needed, M available".
+/// available volumes (`block_found`), so callers can report `N needed, M available`.
 pub fn select_more_pars(sorted_block_counts: &[i32], block_needed: i32) -> (Vec<usize>, i32) {
-    debug_assert!(sorted_block_counts.windows(2).all(|w| w[0] <= w[1]), "input must be sorted ascending");
-    let block_found: i32 = sorted_block_counts.iter().fold(0i32, |a, &b| a.saturating_add(b.max(0)));
+    debug_assert!(
+        sorted_block_counts.windows(2).all(|w| w[0] <= w[1]),
+        "input must be sorted ascending"
+    );
+    let block_found: i32 = sorted_block_counts
+        .iter()
+        .fold(0i32, |a, &b| a.saturating_add(b.max(0)));
     if block_needed <= 0 || sorted_block_counts.is_empty() {
         return (Vec::new(), block_found);
     }
@@ -292,13 +314,17 @@ pub fn select_more_pars(sorted_block_counts: &[i32], block_needed: i32) -> (Vec<
     let mut need = block_needed as i64;
     // Candidates with a positive block count, by ascending index (= ascending count).
     while need > 0 {
-        let smallest_sufficient = (0..n).find(|&i| !taken[i] && sorted_block_counts[i] as i64 >= need);
+        let smallest_sufficient =
+            (0..n).find(|&i| !taken[i] && sorted_block_counts[i] as i64 >= need);
         if let Some(i) = smallest_sufficient {
             taken[i] = true;
             need -= sorted_block_counts[i] as i64;
             break;
         }
-        let Some(largest) = (0..n).rev().find(|&i| !taken[i] && sorted_block_counts[i] > 0) else {
+        let Some(largest) = (0..n)
+            .rev()
+            .find(|&i| !taken[i] && sorted_block_counts[i] > 0)
+        else {
             break;
         };
         taken[largest] = true;
@@ -307,7 +333,10 @@ pub fn select_more_pars(sorted_block_counts: &[i32], block_needed: i32) -> (Vec<
     let mut selected: Vec<usize> = (0..n).filter(|&i| taken[i]).collect();
     if need <= 0 {
         // Prune smallest-first while the remaining selection still covers the need.
-        let mut total: i64 = selected.iter().map(|&i| sorted_block_counts[i] as i64).sum();
+        let mut total: i64 = selected
+            .iter()
+            .map(|&i| sorted_block_counts[i] as i64)
+            .sum();
         let mut i = 0;
         while i < selected.len() {
             let c = sorted_block_counts[selected[i]] as i64;
@@ -328,7 +357,10 @@ pub fn pick_twin_volume(sorted_volume_blocks: &[i32], left: i32) -> Option<usize
     if sorted_volume_blocks.is_empty() {
         return None;
     }
-    sorted_volume_blocks.iter().position(|&c| c >= left).or(Some(sorted_volume_blocks.len() - 1))
+    sorted_volume_blocks
+        .iter()
+        .position(|&c| c >= left)
+        .or(Some(sorted_volume_blocks.len() - 1))
 }
 
 #[cfg(test)]
@@ -341,17 +373,77 @@ mod tests {
 
     #[test]
     fn parse_basic_names() {
-        assert_eq!(p("abc.par2", true), Some(ParName { base_len: 3, blocks: 0 }));
-        assert_eq!(p("abc.PAR2", true), Some(ParName { base_len: 3, blocks: 0 }));
-        assert_eq!(p("abc.vol000+01.par2", true), Some(ParName { base_len: 3, blocks: 1 }));
-        assert_eq!(p("abc.vol07+08.par2", true), Some(ParName { base_len: 3, blocks: 8 }));
-        assert_eq!(p("abc.VOL07+08.PAR2", true), Some(ParName { base_len: 3, blocks: 8 }));
-        assert_eq!(p("abc.vol000-019.par2", true), Some(ParName { base_len: 3, blocks: -1 }));
-        assert_eq!(p("abc.vol.par2", true), Some(ParName { base_len: 7, blocks: 0 }));
-        assert_eq!(p("abc.volume+5.par2", true), Some(ParName { base_len: 3, blocks: 5 }));
-        assert_eq!(p("a.b.c.vol1+2.par2", true), Some(ParName { base_len: 5, blocks: 2 }));
+        assert_eq!(
+            p("abc.par2", true),
+            Some(ParName {
+                base_len: 3,
+                blocks: 0
+            })
+        );
+        assert_eq!(
+            p("abc.PAR2", true),
+            Some(ParName {
+                base_len: 3,
+                blocks: 0
+            })
+        );
+        assert_eq!(
+            p("abc.vol000+01.par2", true),
+            Some(ParName {
+                base_len: 3,
+                blocks: 1
+            })
+        );
+        assert_eq!(
+            p("abc.vol07+08.par2", true),
+            Some(ParName {
+                base_len: 3,
+                blocks: 8
+            })
+        );
+        assert_eq!(
+            p("abc.VOL07+08.PAR2", true),
+            Some(ParName {
+                base_len: 3,
+                blocks: 8
+            })
+        );
+        assert_eq!(
+            p("abc.vol000-019.par2", true),
+            Some(ParName {
+                base_len: 3,
+                blocks: -1
+            })
+        );
+        assert_eq!(
+            p("abc.vol.par2", true),
+            Some(ParName {
+                base_len: 7,
+                blocks: 0
+            })
+        );
+        assert_eq!(
+            p("abc.volume+5.par2", true),
+            Some(ParName {
+                base_len: 3,
+                blocks: 5
+            })
+        );
+        assert_eq!(
+            p("a.b.c.vol1+2.par2", true),
+            Some(ParName {
+                base_len: 5,
+                blocks: 2
+            })
+        );
         assert!(p(".par2", true).is_none());
-        assert_eq!(p("x.par2", true), Some(ParName { base_len: 1, blocks: 0 })); // exactly 6 bytes
+        assert_eq!(
+            p("x.par2", true),
+            Some(ParName {
+                base_len: 1,
+                blocks: 0
+            })
+        ); // exactly 6 bytes
         assert!(p("x.par", true).is_none()); // shorter than 6 bytes
         assert!(p("abc.par", true).is_none());
         assert!(p("abc.rar", true).is_none());
@@ -364,9 +456,27 @@ mod tests {
 
     #[test]
     fn unconfirmed_names_cut_after_last_par2() {
-        assert_eq!(p("abc.par2.1", false), Some(ParName { base_len: 3, blocks: 0 }));
-        assert_eq!(p("abc.vol01+02.par2_dup", false), Some(ParName { base_len: 3, blocks: 2 }));
-        assert_eq!(p("abc.par2.vol01+02.par2.bak", false), Some(ParName { base_len: 8, blocks: 2 }));
+        assert_eq!(
+            p("abc.par2.1", false),
+            Some(ParName {
+                base_len: 3,
+                blocks: 0
+            })
+        );
+        assert_eq!(
+            p("abc.vol01+02.par2_dup", false),
+            Some(ParName {
+                base_len: 3,
+                blocks: 2
+            })
+        );
+        assert_eq!(
+            p("abc.par2.vol01+02.par2.bak", false),
+            Some(ParName {
+                base_len: 8,
+                blocks: 2
+            })
+        );
         assert!(p("abc.rar", false).is_none());
         assert!(p("par2", false).is_none());
         assert!(p("abc.par2", false).is_some());
@@ -377,17 +487,31 @@ mod tests {
         let long = format!("{}.par2", "a".repeat(2000));
         assert!(p(&long, true).is_none()); // ".par2" cut away by truncation
         let fits = format!("{}.par2", "a".repeat(1018));
-        assert_eq!(p(&fits, true), Some(ParName { base_len: 1018, blocks: 0 }));
+        assert_eq!(
+            p(&fits, true),
+            Some(ParName {
+                base_len: 1018,
+                blocks: 0
+            })
+        );
     }
 
     #[test]
     fn same_collection_and_find_main() {
         assert!(same_par_collection(b"abc.par2", b"ABC.vol01+02.par2", true));
-        assert!(same_par_collection(b"abc.par2", b"abc.vol000-019.par2", true));
+        assert!(same_par_collection(
+            b"abc.par2",
+            b"abc.vol000-019.par2",
+            true
+        ));
         assert!(!same_par_collection(b"abc.par2", b"abcd.par2", true));
         assert!(!same_par_collection(b"abc.par2", b"xbc.par2", true));
         assert!(!same_par_collection(b"abc.par2", b"abc.rar", true));
-        assert!(same_par_collection(b"abc.par2.1", b"abc.vol1+1.par2", false));
+        assert!(same_par_collection(
+            b"abc.par2.1",
+            b"abc.vol1+1.par2",
+            false
+        ));
 
         let names: Vec<&[u8]> = vec![
             b"movie.rar",
@@ -411,7 +535,13 @@ mod tests {
         }
         let mut mains = find_main_pars_in_dir(&dir).unwrap();
         mains.sort();
-        assert_eq!(mains, vec![std::ffi::OsString::from("a.vol1+2.par2"), std::ffi::OsString::from("b.par2")]);
+        assert_eq!(
+            mains,
+            vec![
+                std::ffi::OsString::from("a.vol1+2.par2"),
+                std::ffi::OsString::from("b.par2")
+            ]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(os_str_bytes(std::ffi::OsStr::new("ab")), b"ab");
     }
@@ -435,7 +565,10 @@ mod tests {
         assert_eq!(volume_blocks_bytes(b"abc.par2"), None);
         assert_eq!(volume_blocks_bytes(b"abc.vol+.par2"), None);
         assert_eq!(volume_blocks_bytes(b"abc.vol1+2x.par2"), None);
-        assert_eq!(volume_blocks_bytes(b"abc.vol1+99999999999.par2"), Some(u32::MAX));
+        assert_eq!(
+            volume_blocks_bytes(b"abc.vol1+99999999999.par2"),
+            Some(u32::MAX)
+        );
         assert_eq!(volume_blocks_bytes(b"a.rar"), None);
         assert_eq!(volume_blocks_bytes(b"vol1+2.par2"), None);
         assert_eq!(volume_range(b"abc.vol07+08.par2"), Some((7, 8)));
@@ -456,10 +589,19 @@ mod tests {
         assert_eq!(calc_queued_volume_blocks(0, 1_000_000, 1000), 0);
         // 10 slices of 1000 bytes + 68 overhead each, yEnc-inflated by 2 %.
         let encoded = (10 * 1068) as i64 * 102 / 100;
-        assert_eq!(calc_queued_volume_blocks(-1, encoded, 1000), (encoded * 100 / 102 / 1068) as i32);
-        assert_eq!(calc_queued_volume_blocks(-1, 10 * 1068 * 102 / 100 + 100, 1000), 10);
+        assert_eq!(
+            calc_queued_volume_blocks(-1, encoded, 1000),
+            (encoded * 100 / 102 / 1068) as i32
+        );
+        assert_eq!(
+            calc_queued_volume_blocks(-1, 10 * 1068 * 102 / 100 + 100, 1000),
+            10
+        );
         assert_eq!(calc_queued_volume_blocks(-1, 0, 1000), 0);
-        assert_eq!(calc_queued_volume_blocks(-1, 1000, 0), 1000 * 100 / 102 / 68);
+        assert_eq!(
+            calc_queued_volume_blocks(-1, 1000, 0),
+            1000 * 100 / 102 / 68
+        );
         assert_eq!(calc_queued_volume_blocks(-1, 1000, -100), 0);
         assert_eq!(calc_completed_volume_blocks(3, 999, 10), 3);
         assert_eq!(calc_completed_volume_blocks(-1, 10 * 1068 + 500, 1000), 10);
@@ -477,8 +619,14 @@ mod tests {
         assert_eq!(select_more_pars(&[1, 2, 4, 8, 16], 20), (vec![2, 4], 31));
         assert_eq!(select_more_pars(&[1, 2, 4, 8, 16], 24), (vec![3, 4], 31));
         assert_eq!(select_more_pars(&[1, 2, 4, 8, 16], 25), (vec![0, 3, 4], 31));
-        assert_eq!(select_more_pars(&[1, 2, 4, 8, 16], 31), (vec![0, 1, 2, 3, 4], 31));
-        assert_eq!(select_more_pars(&[1, 2, 4, 8, 16], 30), (vec![1, 2, 3, 4], 31));
+        assert_eq!(
+            select_more_pars(&[1, 2, 4, 8, 16], 31),
+            (vec![0, 1, 2, 3, 4], 31)
+        );
+        assert_eq!(
+            select_more_pars(&[1, 2, 4, 8, 16], 30),
+            (vec![1, 2, 3, 4], 31)
+        );
         // Not enough: everything (with blocks) is selected.
         assert_eq!(select_more_pars(&[1, 2, 4], 100), (vec![0, 1, 2], 7));
         assert_eq!(select_more_pars(&[1, 2, 16, 16], 17), (vec![0, 3], 35));

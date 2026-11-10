@@ -1,10 +1,10 @@
 //! Live-download hole tracking, damage projection and zero-read ("ParQuick") verification.
 //!
 //! nzbget knows, for every downloaded file, which yEnc articles (segments) arrived intact and
-//! what their decoded CRC-32s are. That information lets us:
+//! what their decoded CRC-32 values are. That information supports these operations:
 //!
 //! * project how many PAR2 blocks are damaged while the download is still running
-//!   ([`blocks_touched`], [`project_par_damage`]) and abort early when the recovery set can
+//!   ([`blocks_touched`], [`project_par_damage`]) and stop early when the recovery set can
 //!   never cover the damage ([`par_cannot_cover`]);
 //! * verify completely downloaded files with **zero disk I/O** by combining the IFSC
 //!   per-slice CRCs into a whole-file CRC and comparing it with the download CRC
@@ -16,7 +16,7 @@
 //! All offsets are `i64` to match the nzbget data model. Ranges given as `(start, end)` to
 //! the CRC helpers are **inclusive** of `end` (as in `ParChecker::SmartCalcFileRangeCrc`).
 
-use crate::crc::{crc32_combine, crc32_zeros, Crc32, Crc32Combiner};
+use crate::crc::{Crc32, Crc32Combiner, crc32_combine, crc32_zeros};
 use std::fs::File;
 use std::io;
 
@@ -53,11 +53,12 @@ pub fn normalize_ranges(ranges: &[ByteRange]) -> Vec<ByteRange> {
     let mut out: Vec<ByteRange> = Vec::with_capacity(v.len());
     for r in v {
         if let Some(last) = out.last_mut()
-            && r.offset <= last.end() {
-                let end = last.end().max(r.end());
-                last.size = end - last.offset;
-                continue;
-            }
+            && r.offset <= last.end()
+        {
+            let end = last.end().max(r.end());
+            last.size = end - last.offset;
+            continue;
+        }
         out.push(r);
     }
     out
@@ -173,7 +174,7 @@ pub fn par_cannot_cover(damaged_blocks: i32, available_recovery_blocks: i32) -> 
 }
 
 // ---------------------------------------------------------------------------------------------
-// Segments and CRC arithmetic
+// Segments and `CRC` arithmetic
 // ---------------------------------------------------------------------------------------------
 
 /// A downloaded article (yEnc part) as written to the file.
@@ -222,7 +223,9 @@ impl RangeReader for File {
 impl RangeReader for &[u8] {
     fn range_crc(&mut self, start: u64, len: u64) -> io::Result<u32> {
         let s = usize::try_from(start).map_err(|_| io::ErrorKind::UnexpectedEof)?;
-        let e = s.checked_add(len as usize).ok_or(io::ErrorKind::UnexpectedEof)?;
+        let e = s
+            .checked_add(len as usize)
+            .ok_or(io::ErrorKind::UnexpectedEof)?;
         let d = self.get(s..e).ok_or(io::ErrorKind::UnexpectedEof)?;
         Ok(crate::crc::crc32(d))
     }
@@ -234,7 +237,10 @@ pub struct NoDiskAccess;
 
 impl RangeReader for NoDiskAccess {
     fn range_crc(&mut self, _start: u64, _len: u64) -> io::Result<u32> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "disk access disabled"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "disk access disabled",
+        ))
     }
 }
 
@@ -244,20 +250,26 @@ impl RangeReader for NoDiskAccess {
 /// gaps, and failed segments).
 ///
 /// `segments` must be sorted by offset and non-overlapping.
-pub fn smart_calc_range_crc(segments: &[Segment], start: i64, end: i64, reader: &mut dyn RangeReader) -> io::Result<u32> {
+pub fn smart_calc_range_crc(
+    segments: &[Segment],
+    start: i64,
+    end: i64,
+    reader: &mut dyn RangeReader,
+) -> io::Result<u32> {
     if end < start {
         return Ok(0);
     }
     let range_end = end + 1; // exclusive
     let mut crc: u32 = 0;
     let mut cur = start;
-    let read_part = |crc: &mut u32, from: i64, to: i64, reader: &mut dyn RangeReader| -> io::Result<()> {
-        if to > from {
-            let part = reader.range_crc(from as u64, (to - from) as u64)?;
-            *crc = crc32_combine(*crc, part, (to - from) as u64);
-        }
-        Ok(())
-    };
+    let read_part =
+        |crc: &mut u32, from: i64, to: i64, reader: &mut dyn RangeReader| -> io::Result<()> {
+            if to > from {
+                let part = reader.range_crc(from as u64, (to - from) as u64)?;
+                *crc = crc32_combine(*crc, part, (to - from) as u64);
+            }
+            Ok(())
+        };
     for seg in segments {
         if seg.end() <= cur || seg.size <= 0 {
             continue;
@@ -296,9 +308,18 @@ pub fn smart_calc_range_crc(segments: &[Segment], start: i64, end: i64, reader: 
 /// Zero-read verification of a completely downloaded file: compares the download CRC
 /// (extended with zeros to `block_count * slice_size`) with the CRC obtained by combining
 /// the IFSC per-slice CRCs. Port of `ParChecker::VerifySuccessDataFile`.
-pub fn verify_success_file_crc(download_crc: u32, file_size: u64, block_crcs: &[u32], slice_size: u64) -> bool {
+pub fn verify_success_file_crc(
+    download_crc: u32,
+    file_size: u64,
+    block_crcs: &[u32],
+    slice_size: u64,
+) -> bool {
     let total = slice_size.saturating_mul(block_crcs.len() as u64);
-    let padded = if total > file_size { crc32_zeros(download_crc, total - file_size) } else { download_crc };
+    let padded = if total > file_size {
+        crc32_zeros(download_crc, total - file_size)
+    } else {
+        download_crc
+    };
     let par_crc = crate::crc::combine_block_crcs(block_crcs, slice_size);
     par_crc == padded
 }
@@ -307,14 +328,23 @@ pub fn verify_success_file_crc(download_crc: u32, file_size: u64, block_crcs: &[
 /// a block is presumed valid when a contiguous chain of successful segments starts at or
 /// before the block and reaches its end. Port of the first loop of
 /// `ParChecker::VerifyPartialDataFile`.
-pub fn presumed_valid_blocks(segments: &[Segment], file_size: i64, slice_size: i64, block_count: usize) -> Vec<bool> {
+pub fn presumed_valid_blocks(
+    segments: &[Segment],
+    file_size: i64,
+    slice_size: i64,
+    block_count: usize,
+) -> Vec<bool> {
     let mut valid = vec![false; block_count];
     if slice_size <= 0 {
         return valid;
     }
     for (i, slot) in valid.iter_mut().enumerate() {
         let block_start = i as i64 * slice_size;
-        let block_end = if block_start + slice_size < file_size - 1 { block_start + slice_size } else { file_size - 1 };
+        let block_end = if block_start + slice_size < file_size - 1 {
+            block_start + slice_size
+        } else {
+            file_size - 1
+        };
         let mut block_ok = false;
         let mut end_found = false;
         let mut cur = 0i64;
@@ -373,11 +403,12 @@ pub fn verify_partial_file(
         let bytes_start = run_start as i64 * slice_size;
         let bytes_end = run_end as i64 * slice_size + slice_size - 1;
         let clamped_end = bytes_end.min(file_size - 1);
-        let mut download_crc = match smart_calc_range_crc(segments, bytes_start, clamped_end, reader) {
-            Ok(c) => c,
-            Err(e) if e.kind() == io::ErrorKind::Unsupported => return Ok(None),
-            Err(e) => return Err(e),
-        };
+        let mut download_crc =
+            match smart_calc_range_crc(segments, bytes_start, clamped_end, reader) {
+                Ok(c) => c,
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => return Ok(None),
+                Err(e) => return Err(e),
+            };
         if bytes_end > file_size - 1 {
             download_crc = crc32_zeros(download_crc, (bytes_end - (file_size - 1)) as u64);
         }
@@ -419,7 +450,13 @@ pub enum DownloadStatus<'a> {
 
 /// Quick verification entry point combining [`verify_success_file_crc`] and
 /// [`verify_partial_file`]. `file_size` is the size of the file on disk.
-pub fn quick_verify(status: &DownloadStatus<'_>, file_size: u64, block_crcs: &[u32], slice_size: u64, reader: &mut dyn RangeReader) -> io::Result<QuickVerdict> {
+pub fn quick_verify(
+    status: &DownloadStatus<'_>,
+    file_size: u64,
+    block_crcs: &[u32],
+    slice_size: u64,
+    reader: &mut dyn RangeReader,
+) -> io::Result<QuickVerdict> {
     if block_crcs.is_empty() {
         return Ok(QuickVerdict::Complete);
     }
@@ -436,7 +473,13 @@ pub fn quick_verify(status: &DownloadStatus<'_>, file_size: u64, block_crcs: &[u
             }
         }
         DownloadStatus::Partial { segments } => {
-            match verify_partial_file(segments, file_size as i64, block_crcs, slice_size as i64, reader)? {
+            match verify_partial_file(
+                segments,
+                file_size as i64,
+                block_crcs,
+                slice_size as i64,
+                reader,
+            )? {
                 Some(v) if v.iter().all(|&b| b) => Ok(QuickVerdict::Complete),
                 Some(v) => Ok(QuickVerdict::Partial(v)),
                 None => Ok(QuickVerdict::NeedsFullScan),
@@ -462,7 +505,10 @@ mod tests {
         assert!(!x.is_empty());
         assert!(r(0, 0).is_empty());
         assert!(r(0, -1).is_empty());
-        assert_eq!(normalize_ranges(&[r(10, 5), r(0, 3), r(12, 10), r(3, 2), r(50, 0)]), vec![r(0, 5), r(10, 12)]);
+        assert_eq!(
+            normalize_ranges(&[r(10, 5), r(0, 3), r(12, 10), r(3, 2), r(50, 0)]),
+            vec![r(0, 5), r(10, 12)]
+        );
         assert!(normalize_ranges(&[]).is_empty());
     }
 
@@ -507,9 +553,18 @@ mod tests {
         let a = [r(0, 10), r(250, 10)];
         let b: [ByteRange; 0] = [];
         let files = [
-            FileDamage { holes: &a, missing_file_blocks: None },
-            FileDamage { holes: &b, missing_file_blocks: Some(7) },
-            FileDamage { holes: &b, missing_file_blocks: None },
+            FileDamage {
+                holes: &a,
+                missing_file_blocks: None,
+            },
+            FileDamage {
+                holes: &b,
+                missing_file_blocks: Some(7),
+            },
+            FileDamage {
+                holes: &b,
+                missing_file_blocks: None,
+            },
         ];
         assert_eq!(project_par_damage(&files, 100), 2 + 7);
         assert!(par_cannot_cover(9, 8));
@@ -519,7 +574,10 @@ mod tests {
     }
 
     fn make_file(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i as u32).wrapping_mul(2654435761) as u8).map(|b| b ^ 0x5A).collect()
+        (0..len)
+            .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+            .map(|b| b ^ 0x5A)
+            .collect()
     }
 
     fn segments_for(data: &[u8], article: usize, failed: &[usize]) -> Vec<Segment> {
@@ -549,25 +607,47 @@ mod tests {
         let data = make_file(10_000);
         for article in [700usize, 1000, 1024, 333] {
             let segs = segments_for(&data, article, &[3]);
-            for (s, e) in [(0i64, 9999i64), (0, 699), (700, 1399), (500, 2500), (2999, 3000), (9000, 9999), (3000, 3000), (0, 0)] {
+            for (s, e) in [
+                (0i64, 9999i64),
+                (0, 699),
+                (700, 1399),
+                (500, 2500),
+                (2999, 3000),
+                (9000, 9999),
+                (3000, 3000),
+                (0, 0),
+            ] {
                 let mut reader: &[u8] = &data;
                 let got = smart_calc_range_crc(&segs, s, e, &mut reader).unwrap();
-                assert_eq!(got, crc32(&data[s as usize..=e as usize]), "article={article} range={s}..={e}");
+                assert_eq!(
+                    got,
+                    crc32(&data[s as usize..=e as usize]),
+                    "article={article} range={s}..={e}"
+                );
             }
             // Pure in-memory path: aligned range of intact segments needs no reads.
             let mut nodisk = NoDiskAccess;
             let aligned_end = (2 * article - 1) as i64;
-            assert_eq!(smart_calc_range_crc(&segs, 0, aligned_end, &mut nodisk).unwrap(), crc32(&data[..2 * article]));
+            assert_eq!(
+                smart_calc_range_crc(&segs, 0, aligned_end, &mut nodisk).unwrap(),
+                crc32(&data[..2 * article])
+            );
             // Misaligned → needs disk → error propagates.
             assert!(smart_calc_range_crc(&segs, 1, aligned_end, &mut nodisk).is_err());
         }
         let mut reader: &[u8] = &data;
         assert_eq!(smart_calc_range_crc(&[], 5, 4, &mut reader).unwrap(), 0);
         // No segments at all → everything read from disk.
-        assert_eq!(smart_calc_range_crc(&[], 100, 199, &mut reader).unwrap(), crc32(&data[100..200]));
+        assert_eq!(
+            smart_calc_range_crc(&[], 100, 199, &mut reader).unwrap(),
+            crc32(&data[100..200])
+        );
         // Range extends beyond the last segment.
         let segs = segments_for(&data[..5000], 1000, &[]);
-        assert_eq!(smart_calc_range_crc(&segs, 4500, 6000, &mut reader).unwrap(), crc32(&data[4500..=6000]));
+        assert_eq!(
+            smart_calc_range_crc(&segs, 4500, 6000, &mut reader).unwrap(),
+            crc32(&data[4500..=6000])
+        );
     }
 
     #[test]
@@ -575,44 +655,92 @@ mod tests {
         let data = make_file(12_345);
         let crcs = block_crcs_for(&data, 1000);
         assert_eq!(crcs.len(), 13);
-        assert!(verify_success_file_crc(crc32(&data), data.len() as u64, &crcs, 1000));
-        assert!(!verify_success_file_crc(crc32(&data) ^ 1, data.len() as u64, &crcs, 1000));
+        assert!(verify_success_file_crc(
+            crc32(&data),
+            data.len() as u64,
+            &crcs,
+            1000
+        ));
+        assert!(!verify_success_file_crc(
+            crc32(&data) ^ 1,
+            data.len() as u64,
+            &crcs,
+            1000
+        ));
         // Exact multiple: no padding.
         let exact = &data[..12_000];
         let crcs = block_crcs_for(exact, 1000);
         assert!(verify_success_file_crc(crc32(exact), 12_000, &crcs, 1000));
         let mut reader: &[u8] = &data;
         assert_eq!(
-            quick_verify(&DownloadStatus::Success { crc: crc32(exact) }, 12_000, &crcs, 1000, &mut reader).unwrap(),
+            quick_verify(
+                &DownloadStatus::Success { crc: crc32(exact) },
+                12_000,
+                &crcs,
+                1000,
+                &mut reader
+            )
+            .unwrap(),
             QuickVerdict::Complete
         );
         assert_eq!(
-            quick_verify(&DownloadStatus::Success { crc: crc32(exact) }, 12_001, &crcs, 1000, &mut reader).unwrap(),
+            quick_verify(
+                &DownloadStatus::Success { crc: crc32(exact) },
+                12_001,
+                &crcs,
+                1000,
+                &mut reader
+            )
+            .unwrap(),
             QuickVerdict::NeedsFullScan
         );
         assert_eq!(
-            quick_verify(&DownloadStatus::Success { crc: 0 }, 12_000, &crcs, 1000, &mut reader).unwrap(),
+            quick_verify(
+                &DownloadStatus::Success { crc: 0 },
+                12_000,
+                &crcs,
+                1000,
+                &mut reader
+            )
+            .unwrap(),
             QuickVerdict::NeedsFullScan
         );
-        assert_eq!(quick_verify(&DownloadStatus::Failure, 12_000, &crcs, 1000, &mut reader).unwrap(), QuickVerdict::Partial(vec![false; 12]));
-        assert_eq!(quick_verify(&DownloadStatus::Failure, 0, &[], 1000, &mut reader).unwrap(), QuickVerdict::Complete);
+        assert_eq!(
+            quick_verify(&DownloadStatus::Failure, 12_000, &crcs, 1000, &mut reader).unwrap(),
+            QuickVerdict::Partial(vec![false; 12])
+        );
+        assert_eq!(
+            quick_verify(&DownloadStatus::Failure, 0, &[], 1000, &mut reader).unwrap(),
+            QuickVerdict::Complete
+        );
     }
 
     #[test]
     fn presumed_valid_blocks_follow_article_chains() {
         let data = make_file(10_000);
-        // Articles of 750 bytes, blocks of 1000: block i spans articles floor(i*1000/750)..
+        // Articles of 750 bytes, blocks of 1000: block `i` spans articles `floor(i*1000/750)..`.
         let segs = segments_for(&data, 750, &[2]); // bytes 1500..2249 failed → blocks 1 and 2 affected
         let v = presumed_valid_blocks(&segs, 10_000, 1000, 10);
-        assert_eq!(v, vec![true, false, false, true, true, true, true, true, true, true]);
+        assert_eq!(
+            v,
+            vec![true, false, false, true, true, true, true, true, true, true]
+        );
         // Aligned articles, one failure.
         let segs = segments_for(&data, 1000, &[4]);
         let v = presumed_valid_blocks(&segs, 10_000, 1000, 10);
         assert_eq!(v.iter().filter(|&&b| !b).count(), 1);
         assert!(!v[4]);
         // No segments → nothing valid.
-        assert!(presumed_valid_blocks(&[], 10_000, 1000, 10).iter().all(|&b| !b));
-        assert!(presumed_valid_blocks(&segs, 10_000, 0, 10).iter().all(|&b| !b));
+        assert!(
+            presumed_valid_blocks(&[], 10_000, 1000, 10)
+                .iter()
+                .all(|&b| !b)
+        );
+        assert!(
+            presumed_valid_blocks(&segs, 10_000, 0, 10)
+                .iter()
+                .all(|&b| !b)
+        );
     }
 
     #[test]
@@ -629,12 +757,21 @@ mod tests {
             disk[s..e].fill(0);
         }
         let mut reader: &[u8] = &disk;
-        let v = verify_partial_file(&segs, disk.len() as i64, &crcs, 1000, &mut reader).unwrap().unwrap();
+        let v = verify_partial_file(&segs, disk.len() as i64, &crcs, 1000, &mut reader)
+            .unwrap()
+            .unwrap();
         // Article 5 = bytes 3500..4199 → blocks 3,4 damaged; article 12 = 8400..9099 → blocks 8,9.
         let expect: Vec<bool> = (0..13).map(|b| !matches!(b, 3 | 4 | 8 | 9)).collect();
         assert_eq!(v, expect);
         assert_eq!(
-            quick_verify(&DownloadStatus::Partial { segments: &segs }, disk.len() as u64, &crcs, 1000, &mut reader).unwrap(),
+            quick_verify(
+                &DownloadStatus::Partial { segments: &segs },
+                disk.len() as u64,
+                &crcs,
+                1000,
+                &mut reader
+            )
+            .unwrap(),
             QuickVerdict::Partial(expect.clone())
         );
 
@@ -642,27 +779,57 @@ mod tests {
         let mut bad_segs = segs.clone();
         bad_segs[0].crc ^= 1;
         let mut reader: &[u8] = &disk;
-        assert!(verify_partial_file(&bad_segs, disk.len() as i64, &crcs, 1000, &mut reader).unwrap().is_none());
+        assert!(
+            verify_partial_file(&bad_segs, disk.len() as i64, &crcs, 1000, &mut reader)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
-            quick_verify(&DownloadStatus::Partial { segments: &bad_segs }, disk.len() as u64, &crcs, 1000, &mut reader).unwrap(),
+            quick_verify(
+                &DownloadStatus::Partial {
+                    segments: &bad_segs
+                },
+                disk.len() as u64,
+                &crcs,
+                1000,
+                &mut reader
+            )
+            .unwrap(),
             QuickVerdict::NeedsFullScan
         );
 
         // Disk access forbidden and misaligned articles → cannot verify → full scan.
-        assert!(verify_partial_file(&segs, disk.len() as i64, &crcs, 1000, &mut NoDiskAccess).unwrap().is_none());
+        assert!(
+            verify_partial_file(&segs, disk.len() as i64, &crcs, 1000, &mut NoDiskAccess)
+                .unwrap()
+                .is_none()
+        );
 
         // All articles fine → Complete.
         let good = segments_for(&data, 700, &[]);
         let mut reader: &[u8] = &data;
         assert_eq!(
-            quick_verify(&DownloadStatus::Partial { segments: &good }, data.len() as u64, &crcs, 1000, &mut reader).unwrap(),
+            quick_verify(
+                &DownloadStatus::Partial { segments: &good },
+                data.len() as u64,
+                &crcs,
+                1000,
+                &mut reader
+            )
+            .unwrap(),
             QuickVerdict::Complete
         );
         // Aligned articles with no disk access needed at all.
         let aligned = segments_for(&data, 1000, &[2]);
-        let v = verify_partial_file(&aligned, data.len() as i64, &crcs, 1000, &mut NoDiskAccess).unwrap().unwrap();
+        let v = verify_partial_file(&aligned, data.len() as i64, &crcs, 1000, &mut NoDiskAccess)
+            .unwrap()
+            .unwrap();
         assert_eq!(v.iter().filter(|&&b| !b).count(), 1);
-        assert!(verify_partial_file(&aligned, data.len() as i64, &crcs, 0, &mut NoDiskAccess).unwrap().is_none());
+        assert!(
+            verify_partial_file(&aligned, data.len() as i64, &crcs, 0, &mut NoDiskAccess)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

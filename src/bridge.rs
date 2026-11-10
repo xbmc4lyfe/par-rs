@@ -4,12 +4,12 @@
 //! every real name, size, MD5 and (via IFSC) CRC-32. [`Par2Bridge`] maps candidates to files
 //! in four passes, each only applied where the previous one left ambiguity:
 //!
-//! 1. **size chain** — a size that occurs exactly once on both sides is a match;
-//! 2. **16 KiB MD5** — ties by size are broken with the MD5 of the candidate's first 16 KiB
+//! 1. **size chain**—a size that occurs exactly once on both sides is a match;
+//! 2. **16 KiB MD5**—ties by size are broken with the MD5 of the candidate's first 16 KiB
 //!    (available from article 1 alone);
-//! 3. **CRC-32** — the candidate's whole-file CRC (folded from its yEnc part CRCs, see
+//! 3. **CRC-32**—the candidate's whole-file CRC (folded from its yEnc part CRCs, see
 //!    [`crate::gf2::fold_yenc_parts`]) against the IFSC-folded CRC of each file;
-//! 4. **RAR5 volume number** — for same-size `.partNN.rar` volumes, the volume number stored in
+//! 4. **RAR5 volume number**—for same-size `.partNN.rar` volumes, the volume number stored in
 //!    the RAR5 main archive header of the candidate's first bytes picks the part.
 
 use crate::par2::{Inventory, Par2File};
@@ -74,7 +74,9 @@ pub struct Par2Bridge {
 impl Par2Bridge {
     /// Resolver for every file in `inventory`.
     pub fn new(inventory: &Inventory) -> Self {
-        Self { files: inventory.files.clone() }
+        Self {
+            files: inventory.files.clone(),
+        }
     }
 
     /// Resolver for an explicit file list.
@@ -106,23 +108,44 @@ impl Par2Bridge {
             if let ([c], Some([f])) = (cands.as_slice(), by_size_files.get(size).map(Vec::as_slice))
                 && let (Some(slot), Some(taken)) = (cand_done.get_mut(*c), file_taken.get_mut(*f))
             {
-                *slot = Some(Resolution { candidate: *c, file: *f, method: ResolveMethod::SizeChain });
+                *slot = Some(Resolution {
+                    candidate: *c,
+                    file: *f,
+                    method: ResolveMethod::SizeChain,
+                });
                 *taken = true;
             }
         }
 
         // Passes 2-4 per size group with ties.
         for (size, cands) in &by_size_cands {
-            let Some(files) = by_size_files.get(size) else { continue };
+            let Some(files) = by_size_files.get(size) else {
+                continue;
+            };
             // Pass 2: 16 KiB MD5.
             for &c in cands {
                 if cand_done.get(c).is_some_and(Option::is_some) {
                     continue;
                 }
-                let Some(md5) = candidates.get(c).and_then(|x| x.md5_16k) else { continue };
-                let hits: Vec<usize> = files.iter().copied().filter(|&f| !file_taken.get(f).copied().unwrap_or(true) && self.files.get(f).is_some_and(|pf| pf.md5_16k == md5)).collect();
+                let Some(md5) = candidates.get(c).and_then(|x| x.md5_16k) else {
+                    continue;
+                };
+                let hits: Vec<usize> = files
+                    .iter()
+                    .copied()
+                    .filter(|&f| {
+                        !file_taken.get(f).copied().unwrap_or(true)
+                            && self.files.get(f).is_some_and(|pf| pf.md5_16k == md5)
+                    })
+                    .collect();
                 if let [f] = hits.as_slice() {
-                    Self::bind(&mut cand_done, &mut file_taken, c, *f, ResolveMethod::Md5_16k);
+                    Self::bind(
+                        &mut cand_done,
+                        &mut file_taken,
+                        c,
+                        *f,
+                        ResolveMethod::Md5_16k,
+                    );
                 }
             }
             // Pass 3: folded CRC-32.
@@ -130,13 +153,22 @@ impl Par2Bridge {
                 if cand_done.get(c).is_some_and(Option::is_some) {
                     continue;
                 }
-                let Some(crc) = candidates.get(c).and_then(|x| x.crc32) else { continue };
-                let hits: Vec<usize> = files.iter().copied().filter(|&f| !file_taken.get(f).copied().unwrap_or(true) && self.files.get(f).is_some_and(|pf| pf.crc32 == Some(crc))).collect();
+                let Some(crc) = candidates.get(c).and_then(|x| x.crc32) else {
+                    continue;
+                };
+                let hits: Vec<usize> = files
+                    .iter()
+                    .copied()
+                    .filter(|&f| {
+                        !file_taken.get(f).copied().unwrap_or(true)
+                            && self.files.get(f).is_some_and(|pf| pf.crc32 == Some(crc))
+                    })
+                    .collect();
                 if let [f] = hits.as_slice() {
                     Self::bind(&mut cand_done, &mut file_taken, c, *f, ResolveMethod::Crc32);
                 }
             }
-            // Pass 4: RAR5 volume numbers among the remaining same-size files.
+            // Pass 4: `RAR5` volume numbers among the remaining same-size files.
             let remaining_files: Vec<(usize, u64)> = files
                 .iter()
                 .copied()
@@ -151,11 +183,27 @@ impl Par2Bridge {
                 if cand_done.get(c).is_some_and(Option::is_some) {
                     continue;
                 }
-                let Some(vol) = candidates.get(c).and_then(|x| x.head.as_deref()).and_then(rar5_volume_number) else { continue };
+                let Some(vol) = candidates
+                    .get(c)
+                    .and_then(|x| x.head.as_deref())
+                    .and_then(rar5_volume_number)
+                else {
+                    continue;
+                };
                 let want = first_part.saturating_add(vol);
-                let hits: Vec<usize> = remaining_files.iter().filter(|&&(f, p)| p == want && !file_taken.get(f).copied().unwrap_or(true)).map(|&(f, _)| f).collect();
+                let hits: Vec<usize> = remaining_files
+                    .iter()
+                    .filter(|&&(f, p)| p == want && !file_taken.get(f).copied().unwrap_or(true))
+                    .map(|&(f, _)| f)
+                    .collect();
                 if let [f] = hits.as_slice() {
-                    Self::bind(&mut cand_done, &mut file_taken, c, *f, ResolveMethod::Rar5Volume);
+                    Self::bind(
+                        &mut cand_done,
+                        &mut file_taken,
+                        c,
+                        *f,
+                        ResolveMethod::Rar5Volume,
+                    );
                 }
             }
         }
@@ -167,13 +215,28 @@ impl Par2Bridge {
                 None => report.unresolved_candidates.push(c),
             }
         }
-        report.unmatched_files = file_taken.iter().enumerate().filter(|(_, t)| !**t).map(|(f, _)| f).collect();
+        report.unmatched_files = file_taken
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !**t)
+            .map(|(f, _)| f)
+            .collect();
         report
     }
 
-    fn bind(cand_done: &mut [Option<Resolution>], file_taken: &mut [bool], c: usize, f: usize, method: ResolveMethod) {
+    fn bind(
+        cand_done: &mut [Option<Resolution>],
+        file_taken: &mut [bool],
+        c: usize,
+        f: usize,
+        method: ResolveMethod,
+    ) {
         if let (Some(slot), Some(taken)) = (cand_done.get_mut(c), file_taken.get_mut(f)) {
-            *slot = Some(Resolution { candidate: c, file: f, method });
+            *slot = Some(Resolution {
+                candidate: c,
+                file: f,
+                method,
+            });
             *taken = true;
         }
     }
@@ -186,11 +249,15 @@ pub fn rar_part_number(name: &str) -> Option<u64> {
     if let Some(stem) = lower.strip_suffix(".rar") {
         if let Some(p) = stem.rfind(".part") {
             let digits = stem.get(p.saturating_add(5)..)?;
-            return if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) { digits.parse().ok() } else { None };
+            return if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                digits.parse().ok()
+            } else {
+                None
+            };
         }
         return Some(0);
     }
-    // name.r00, name.r01, ...
+    // Names such as `name.r00` and `name.r01`.
     let (_, ext) = lower.rsplit_once('.')?;
     let digits = ext.strip_prefix('r')?;
     if digits.len() == 2 && digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -222,7 +289,7 @@ pub fn rar5_volume_number(head: &[u8]) -> Option<u64> {
     if head.get(..8)? != RAR5_SIGNATURE {
         return None;
     }
-    // Header: CRC32(4), header size(vint), type(vint), flags(vint), [extra size], [data size], archive flags(vint), [volume number].
+    // Header: `CRC32(4)`, header size(vint), type(vint), flags(vint), [extra size], [data size], archive flags(vint), [volume number].
     let mut off = 12usize;
     let (header_size, n) = rar5_vint(head, off)?;
     off = off.checked_add(n)?;
@@ -261,7 +328,16 @@ mod tests {
     use super::*;
 
     fn file(name: &str, size: u64, tag: u8) -> Par2File {
-        Par2File { set_id: [1; 16], file_id: [tag; 16], md5: [tag; 16], md5_16k: [tag.wrapping_add(100); 16], size, name: name.to_owned(), bound: true, crc32: Some(u32::from(tag) * 7) }
+        Par2File {
+            set_id: [1; 16],
+            file_id: [tag; 16],
+            md5: [tag; 16],
+            md5_16k: [tag.wrapping_add(100); 16],
+            size,
+            name: name.to_owned(),
+            bound: true,
+            crc32: Some(u32::from(tag) * 7),
+        }
     }
 
     fn rar5_head(volume: Option<u64>) -> Vec<u8> {
@@ -311,16 +387,52 @@ mod tests {
         ];
         let bridge = Par2Bridge::from_files(files);
         let cands = vec![
-            Candidate { name: "x1".into(), size: 500, ..Default::default() },                                   // size chain
-            Candidate { name: "x2".into(), size: 1000, md5_16k: Some([102; 16]), ..Default::default() },        // md5 -> part02
-            Candidate { name: "x3".into(), size: 1000, crc32: Some(21), ..Default::default() },                 // crc -> part03
-            Candidate { name: "x4".into(), size: 1000, head: Some(rar5_head(None)), ..Default::default() },     // rar5 vol 0 -> part01
-            Candidate { name: "x5".into(), size: 2000, head: Some(rar5_head(Some(1))), ..Default::default() },  // rar5 vol 1 -> b.part02
-            Candidate { name: "x6".into(), size: 2000, ..Default::default() },                                  // ambiguous -> unresolved
-            Candidate { name: "x7".into(), size: 9, ..Default::default() },                                     // no such size
+            Candidate {
+                name: "x1".into(),
+                size: 500,
+                ..Default::default()
+            }, // size chain
+            Candidate {
+                name: "x2".into(),
+                size: 1000,
+                md5_16k: Some([102; 16]),
+                ..Default::default()
+            }, // md5 -> part02
+            Candidate {
+                name: "x3".into(),
+                size: 1000,
+                crc32: Some(21),
+                ..Default::default()
+            }, // crc -> part03
+            Candidate {
+                name: "x4".into(),
+                size: 1000,
+                head: Some(rar5_head(None)),
+                ..Default::default()
+            }, // rar5 vol 0 -> part01
+            Candidate {
+                name: "x5".into(),
+                size: 2000,
+                head: Some(rar5_head(Some(1))),
+                ..Default::default()
+            }, // rar5 vol 1 -> b.part02
+            Candidate {
+                name: "x6".into(),
+                size: 2000,
+                ..Default::default()
+            }, // ambiguous -> unresolved
+            Candidate {
+                name: "x7".into(),
+                size: 9,
+                ..Default::default()
+            }, // no such size
         ];
         let r = bridge.resolve(&cands);
-        let by_cand: HashMap<usize, (usize, ResolveMethod)> = r.resolved.iter().map(|x| (x.candidate, (x.file, x.method))).collect();
+        let by_cand: HashMap<usize, (usize, ResolveMethod)> = r
+            .resolved
+            .iter()
+            .map(|x| (x.candidate, (x.file, x.method)))
+            .collect();
         assert_eq!(by_cand[&0], (3, ResolveMethod::SizeChain));
         assert_eq!(by_cand[&1], (1, ResolveMethod::Md5_16k));
         assert_eq!(by_cand[&2], (2, ResolveMethod::Crc32));

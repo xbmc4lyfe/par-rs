@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """PAR2 benchmark harness: create / verify / repair across tools, warm page cache, best-of-N.
 
-Usage: [RUNS=3] python3 bench/compare.py [tool ...]
-Environment: DATA (directory of input files), WORK (scratch directory), and the tool binaries
-PAR_RS, PARFAST (nzbfast), TURBO (par2cmdline-turbo), PARPAR, PARMESAN. Tools whose binary is
-missing are skipped. Each run copies the data set fresh, warms the page cache and times one
+Usage: `[RUNS=3] python3 bench/compare.py [tool ...]`
+Environment: `DATA` (directory of input files), `WORK` (scratch directory), and the tool binaries
+`PAR_RS`, `PARFAST` (nzbfast), `TURBO` (par2cmdline-turbo), `PARPAR`, and `PARMESAN`. Tools whose binary is
+missing are skipped. Each run copies the data set fresh, warms the page cache, and times one
 process; repairs are checked against the originals' MD5s.
 """
 import os, shutil, subprocess, sys, time, hashlib, glob, json
