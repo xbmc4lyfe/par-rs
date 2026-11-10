@@ -11,7 +11,7 @@
 //! single cache-tiled SIMD pass and then dropped; a recovery slice is XORed into its buffer
 //! whenever it arrives (before, during or after the data). The moment the unknown slices
 //! (damaged *or not yet downloaded*) are no more numerous than the buffers whose recovery slice
-//! has arrived, the whole set is solvable from the bank alone — no byte is read twice, and the
+//! has arrived, the whole set is solvable from the bank alone—no byte is read twice, and the
 //! remaining downloads can be cancelled.
 //!
 //! [`StreamingSliceAssembler`] sits on top: it accepts out-of-order `(file, offset, bytes)`
@@ -337,7 +337,7 @@ pub struct StreamingSliceAssembler {
 
 impl StreamingSliceAssembler {
     /// Assembler over `files` (any order; sorted into `libpar2` file-id order here) tracking `exponents`.
-    /// `max_staging_bytes` bounds the partially-filled slice buffers (0 = unbounded).
+    /// `max_staging_bytes` bounds the partially filled slice buffers (0 = unbounded).
     pub fn new(
         slice_size: usize,
         mut files: Vec<FileLayout>,
@@ -642,7 +642,7 @@ impl StreamingSliceAssembler {
         self.bank.solve_now()
     }
 
-    /// Solve only the given unknown slices (e.g. an archive's header and tail).
+    /// Solve only the given unknown slices (for example, an archive's header and tail).
     pub fn solve_selected_slices(
         &self,
         wanted: &[usize],
@@ -811,7 +811,7 @@ mod tests {
             asm.solve_selected_slices(&[0]),
             Err(RepairError::NotMissing(0))
         ));
-        // Duplicate delivery and late data are harmless.
+        // Duplicate delivery and late arrival of data cause no harm.
         assert!(asm.push_recovery(0, &rec[0]).unwrap().is_empty());
         let ev = asm.push_chunk(&[9; 16], 1000, &b[1000..]).unwrap();
         assert_eq!(ev, vec![StreamEvent::SliceVerified { global: 5 }]);

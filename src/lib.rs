@@ -1,10 +1,10 @@
-//! # par-rs
+//! # `par-rs`
 //!
 //! A general-purpose, SIMD-accelerated PAR2 parity crate: packet parsing and deep
 //! introspection (PAR1 / PAR2 / PAR3), file-name handling and obfuscated-file resolution,
 //! zero-read and sliding-window verification, GF(2^16) Reed-Solomon reconstruction (batch,
 //! surgical and streaming while a download is still in flight), par-renaming and set
-//! creation — everything a downloader (rustyget / nzbget) or an indexer (Atlas) needs from
+//! creation—everything a downloader (rustyget / nzbget) or an indexer (Atlas) needs from
 //! PAR2 in one crate.
 //!
 //! ## Module map
@@ -15,13 +15,13 @@
 //! | [`crc`] | CRC-32 kernels (hardware / slice-by-8), streaming hasher, register-level GF(2) helpers |
 //! | [`hasher`], [`md5simd`], [`parhash`] | fused CRC-32 + MD5 + 16k-MD5 hashing, 16-lane SIMD MD5, all-core slice/file hashing pool |
 //! | [`gf16`], [`gf16::simd`] | GF(2^16) arithmetic, PAR2 input constants, Vandermonde solving, NEON / SSSE3 / AVX2 / AVX-512 kernels |
-//! | [`packet`] | tolerant, resynchronising, lazy PAR2 packet parser and packet encoders |
+//! | [`packet`] | PAR2 packet encoders and a tolerant, resynchronizing parser with lazy decoding |
 //! | [`inspect`] | zero-copy deep introspection of all 12 PAR2 v2.0 packet types, PAR1 / PAR3 headers, creator fingerprinting, `.volNNN+MM.par2` analysis |
 //! | [`par2`] | indexer-facing `Inventory` / `Par2File` summary of a par2 buffer |
 //! | [`bridge`] | obfuscated-file resolution: size chains, 16 KiB MD5, folded CRC vs IFSC, RAR5 volume numbers |
 //! | [`verify`] | in-memory slice verification with rolling-CRC discovery of misplaced slices and repair assessment |
 //! | [`repair`] | in-memory batch / surgical Reed-Solomon repair with the exponent-0 fast path, and multi-file disk repair |
-//! | [`stream`] | streaming syndrome bank, out-of-order yEnc byte-range slice assembler and early-cutoff solver |
+//! | [`stream`] | streaming syndrome bank, out-of-order yEnc byte-range slice assembler and solver with an early cutoff |
 //! | [`filenames`] | `.par2` / `.volXX+YY.par2` parsing, collection grouping, volume selection heuristics |
 //! | [`twin`] | set fingerprinting and twin / near-twin classification |
 //! | [`damage`] | download hole tracking, damage projection, article-CRC based quick verification |

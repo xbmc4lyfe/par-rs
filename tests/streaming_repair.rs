@@ -97,7 +97,7 @@ fn out_of_order_yenc_streaming_with_early_cutoff() {
     assert_eq!(received, 8);
     assert_eq!(asm.bank().ready_syndromes().len(), 8);
 
-    // File a: all articles, scrambled, except two that are lost (damaging the slices they touch).
+    // File a: all articles, scrambled, except two that are lost (damaging the slices they overlap).
     let mut verified_a = 0;
     let lost: Vec<u64> = vec![3 * 7000, 9 * 7000];
     for (off, bytes) in articles(&a, art, 1) {

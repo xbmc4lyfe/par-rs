@@ -1,4 +1,4 @@
-//! Minimal command-line front end, mainly for manual testing and for differential checks
+//! Minimal command-line front end for manual testing and differential checks
 //! against `par2cmdline`.
 //!
 //! ```text
@@ -185,7 +185,7 @@ fn cmd_repair(args: &[String], do_repair: bool) -> ExitCode {
         }
     };
     eprintln!(
-        "loaded {} par2 file(s), {} recovery blocks, block size {}",
+        "loaded {} par2 files, {} recovery blocks, block size {}",
         loaded.len(),
         r.recovery_blocks(),
         r.block_size()
@@ -202,7 +202,7 @@ fn cmd_repair(args: &[String], do_repair: bool) -> ExitCode {
         }
     };
     eprintln!(
-        "verified in {:.2}s: missing {} block(s), {} recovery block(s) available",
+        "verified in {:.2}s: missing {} blocks, {} recovery blocks available",
         t.elapsed().as_secs_f64(),
         v.missing_blocks,
         v.recovery_blocks
@@ -212,7 +212,7 @@ fn cmd_repair(args: &[String], do_repair: bool) -> ExitCode {
             .add_split_fragments(d, &mut obs)
             .and_then(|a| r.add_extra_files_from_dir(d, &mut obs).map(|b| a + b))
         {
-            Ok(n) => eprintln!("extra files in {} supplied {n} block(s)", d.display()),
+            Ok(n) => eprintln!("extra files in {} supplied {n} blocks", d.display()),
             Err(e) => eprintln!("error scanning {}: {e}", d.display()),
         }
     }
@@ -246,7 +246,7 @@ fn cmd_repair(args: &[String], do_repair: bool) -> ExitCode {
                 eprintln!("   leftover: {}", l.display());
             }
             eprintln!(
-                "Repaired {} file(s), {blocks_recovered} block(s) reconstructed in {:.2}s",
+                "Repaired {} files, {blocks_recovered} blocks reconstructed in {:.2}s",
                 files.len(),
                 t.elapsed().as_secs_f64()
             );
@@ -275,7 +275,7 @@ fn cmd_rename(args: &[String]) -> ExitCode {
     }) {
         Ok(rep) => {
             eprintln!(
-                "{} file(s) renamed, {} missing",
+                "{} files renamed, {} missing",
                 rep.renamed_count(),
                 rep.missing.len()
             );
@@ -313,7 +313,7 @@ fn cmd_info(args: &[String]) -> ExitCode {
                 );
             }
             println!(
-                "recovery:    {} slice(s): {:?}",
+                "recovery:    {} slices: {:?}",
                 set.recovery.len(),
                 set.recovery.keys().collect::<Vec<_>>()
             );

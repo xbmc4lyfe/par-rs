@@ -9,7 +9,7 @@
 //! * block sizes are isolated per `set_id`: a file's CRC is only folded with its own set's slice size;
 //! * `UniFileN` packets replace the ASCII name; names are stripped of control / ANSI escape
 //!   characters and path components;
-//! * prefix safety: `inventory(&data[..cut])` never panics and is monotonic in `cut` — every
+//! * prefix safety: `inventory(&data[..cut])` never panics and is monotonic in `cut`—every
 //!   file it reports is reported for every longer prefix.
 
 use crate::bytes::{file_id_key, hex};
@@ -30,9 +30,9 @@ pub struct Par2File {
     pub md5_16k: [u8; 16],
     /// File size.
     pub size: u64,
-    /// Sanitised file name (Unicode name when present).
+    /// Sanitised filename (Unicode name when present).
     pub name: String,
-    /// Listed in its set's `Main` recovery set (i.e. covered by recovery data and bound to the
+    /// Listed in its set's `Main` recovery set (covered by recovery data and bound to the
     /// set's block size).
     pub bound: bool,
     /// Whole-file CRC-32 folded from the IFSC slice checksums (needs the set's block size and
@@ -63,15 +63,15 @@ pub struct Inventory {
     pub sealed: Vec<([u8; 16], [u8; 16])>,
 }
 
-/// A byte that opens a name: whitespace, a quote or an opening bracket. Closing brackets are
+/// A byte that opens a name: whitespace, a quote, or an opening bracket. Closing brackets are
 /// not openers, so `Show (2026).par2` has the stem `Show (2026)` rather than nothing.
 fn name_opener(b: u8) -> bool {
     b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'<' | b'[' | b'(')
 }
 
 /// Does a name end at byte `at` of `subject`: the end of the text, whitespace (ASCII or Unicode,
-/// so the no-break space of a header read as Latin-1 counts, as it did for a `\\s` regex), a quote
-/// or a closing bracket? `at` must be a char boundary (it follows the ASCII `.par2`).
+/// so the no-break space of a header read as Latin-1 counts, as it did for a `\\s` regular expression),
+/// a quote, or a closing bracket? `at` must be a char boundary (it follows the ASCII `.par2`).
 #[inline]
 fn name_ends_at(subject: &str, at: usize) -> bool {
     match subject.as_bytes().get(at) {
@@ -111,7 +111,7 @@ fn is_volume_stem(stem: &[u8]) -> bool {
 }
 
 /// Does a Usenet subject refer to the base `.par2` index file (not a `.volNNN+MM.par2`
-/// volume)? Case-insensitive; quoted and unquoted names are recognised.
+/// volume)? Case-insensitive; quoted and unquoted names are recognized.
 ///
 /// A name ends right after `.par2`: the next character must be the end of the subject, whitespace
 /// (ASCII or Unicode), a quote or a closing bracket, so `a.par2.rar` and `a.par2-1` are not par2 files while

@@ -1,9 +1,9 @@
-//! Fused single-pass hashing: CRC-32, full-file MD5 and the PAR2 "16k" MD5.
+//! Fused single-pass hashing: `CRC-32`, full-file MD5 and the PAR2 "16k" MD5.
 //!
 //! PAR2 identifies files by three digests: the MD5 of the whole file, the MD5 of its first
 //! 16384 bytes (used to match renamed/obfuscated files cheaply) and, per slice, an MD5 plus a
 //! CRC-32. [`FileHasher`] computes all three file-level digests in a single pass over the data
-//! so a verification read never has to touch the bytes twice.
+//! so verification never has to read the bytes twice.
 
 use crate::crc::Crc32;
 use md5::{Digest, Md5};

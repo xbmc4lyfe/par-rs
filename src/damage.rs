@@ -1,10 +1,10 @@
 //! Live-download hole tracking, damage projection and zero-read ("ParQuick") verification.
 //!
 //! nzbget knows, for every downloaded file, which yEnc articles (segments) arrived intact and
-//! what their decoded CRC-32s are. That information lets us:
+//! what their decoded CRC-32 values are. That information supports these operations:
 //!
 //! * project how many PAR2 blocks are damaged while the download is still running
-//!   ([`blocks_touched`], [`project_par_damage`]) and abort early when the recovery set can
+//!   ([`blocks_touched`], [`project_par_damage`]) and stop early when the recovery set can
 //!   never cover the damage ([`par_cannot_cover`]);
 //! * verify completely downloaded files with **zero disk I/O** by combining the IFSC
 //!   per-slice CRCs into a whole-file CRC and comparing it with the download CRC
@@ -174,7 +174,7 @@ pub fn par_cannot_cover(damaged_blocks: i32, available_recovery_blocks: i32) -> 
 }
 
 // ---------------------------------------------------------------------------------------------
-// Segments and CRC arithmetic
+// Segments and `CRC` arithmetic
 // ---------------------------------------------------------------------------------------------
 
 /// A downloaded article (yEnc part) as written to the file.
@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn presumed_valid_blocks_follow_article_chains() {
         let data = make_file(10_000);
-        // Articles of 750 bytes, blocks of 1000: block i spans articles floor(i*1000/750)..
+        // Articles of 750 bytes, blocks of 1000: block `i` spans articles `floor(i*1000/750)..`.
         let segs = segments_for(&data, 750, &[2]); // bytes 1500..2249 failed → blocks 1 and 2 affected
         let v = presumed_valid_blocks(&segs, 10_000, 1000, 10);
         assert_eq!(

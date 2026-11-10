@@ -36,7 +36,7 @@ pub enum VolumeScheme {
     Single,
     /// Fixed number of slices per volume (the last one may be smaller).
     Uniform(u32),
-    /// `par2cmdline`'s default: 1, 2, 4, 8, ... slices per volume, remainder in the last.
+    /// `par2cmdline`'s default: powers of two starting at 1 slice per volume, remainder in the last.
     Exponential,
 }
 
@@ -83,7 +83,7 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
-    /// Source whose PAR2 name is its file name.
+    /// Source whose PAR2 name is its filename.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let name = path

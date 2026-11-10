@@ -176,7 +176,7 @@ fn garbage_shifts_and_bit_flips() {
     );
 
     // Every single-bit flip: never panics; a flipped body shows up as a bad MD5 or a changed
-    // field, a flipped header as truncation / resync — but never as a bogus extra file.
+    // field, a flipped header as truncation / resync, but never as a bogus extra file.
     let mut seen_bad = 0;
     for bit in (0..set.index.len() * 8).step_by(13) {
         let mut d = set.index.clone();

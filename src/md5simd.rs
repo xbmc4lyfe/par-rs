@@ -135,7 +135,7 @@ mod neon {
     impl Lanes for V {
         #[inline(always)]
         fn splat(x: u32) -> Self {
-            // SAFETY: NEON is a baseline AArch64 feature.
+            // SAFETY: `NEON` is a baseline AArch64 feature.
             V(unsafe { vdupq_n_u32(x) })
         }
         #[inline(always)]
@@ -243,7 +243,7 @@ mod sse2 {
     impl Lanes for V {
         #[inline(always)]
         fn splat(x: u32) -> Self {
-            // SAFETY: SSE2 is a baseline x86_64 feature.
+            // SAFETY: `SSE2` is a baseline x86_64 feature.
             V(unsafe { _mm_set1_epi32(x as i32) })
         }
         #[inline(always)]

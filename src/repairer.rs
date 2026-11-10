@@ -4,8 +4,8 @@
 //! Replaces `libpar2`'s `Par2Repairer` as used by nzbget's `ParChecker`:
 //!
 //! * **Loading** reads metadata packets only; recovery slice payloads are indexed by offset
-//!   and their MD5 is verified lazily, just before the slices that will actually be used are
-//!   streamed into the Reed-Solomon engine.
+//!   and their MD5 is verified lazily, just before streaming the selected slices
+//!   into the Reed-Solomon engine.
 //! * **Verification** per source file tries, in order: the host-supplied download status
 //!   (whole-file CRC or per-article CRCs → zero/minimal disk I/O), then a full scan with the
 //!   sliding-window block scanner, which also detects complete-but-misnamed files and blocks
@@ -15,7 +15,7 @@
 //! * **Repair** copies the located blocks of damaged/missing files into fresh target files and
 //!   streams present blocks plus recovery slices through the engine to reconstruct the rest.
 //!   Damaged originals are rotated according to [`BackupPolicy`]; repaired files are
-//!   re-hashed unless disabled.
+//!   re-hashed unless the option is off.
 //!
 //! Source files are kept in Main-packet order (ascending file id), which is also the order of
 //! `libpar2`'s `sourcefilemap`, so hosts iterating the files see the same sequence.
@@ -42,9 +42,9 @@ use std::sync::{Arc, Mutex};
 /// What to do with a damaged target file before the repaired version is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackupPolicy {
-    /// Rename to `<name>.1` (`.2`, ... if taken), as `libpar2` does.
+    /// Rename to `<name>.1`, then `.2` and subsequent numbers if taken, as `libpar2` does.
     RenameNumbered,
-    /// Rename to `<name>.bak` (`.bak.1`, ... if taken).
+    /// Rename to `<name>.bak`, then `.bak.1` and subsequent numbers if taken.
     RenameBak,
     /// Rename as with `RenameNumbered`, then delete the backup once the repaired file verified.
     DeleteAfterRepair,
@@ -69,8 +69,8 @@ pub struct RepairOptions {
     pub scan_buffer: usize,
     /// Files whose damage or absence must not trigger a repair (nzbget's `ParIgnoreExt`); they
     /// are still repaired when a repair runs for other reasons. Each entry is either an
-    /// extension (with the dot, e.g. `.sfv`, `.nfo`, `.nzb`: a case-insensitive suffix match on
-    /// the local name) or, when it contains `*` or `?`, a wildcard mask matched case-insensitively
+    /// extension (with the dot, for example, `.sfv`, `.nfo`, `.nzb`: a case-insensitive suffix
+    /// match on the local name) or, when it contains `*` or `?`, a wildcard mask matched case-insensitively
     /// against the whole local name (`*` any run of bytes, `?` one byte, `#` one digit), as
     /// nzbget's `Util::MatchFileExt` + `WildMask` do. See [`ignore_name_matches`].
     pub ignore_extensions: Vec<String>,
@@ -89,7 +89,7 @@ pub struct RepairOptions {
 /// ASCII digit); any entry also matches as a case-insensitive suffix of it, so `.nfo`, `nfo`,
 /// `*.nfo`, `readme.nfo` and `*` all ignore `release.nfo` or `readme.nfo`, while `clip*` does
 /// not ignore `extras/clip.mkv`. Mirrors nzbget's `Util::MatchFileExt` + `WildMask`, which
-/// see the target file name, directories included.
+/// see the target filename, directories included.
 pub fn ignore_name_matches(local_name: &str, entry: &str) -> bool {
     let name = local_name.as_bytes();
     let pat = entry.as_bytes();
@@ -245,7 +245,7 @@ pub enum QuickInfo {
     Failure,
 }
 
-/// Supplies [`QuickInfo`] per target file name.
+/// Supplies [`QuickInfo`] per target filename.
 pub trait QuickVerifier {
     /// Download status of the file with the given local name, if known.
     fn quick_info(&mut self, target_filename: &str) -> Option<QuickInfo>;
@@ -358,7 +358,7 @@ impl fmt::Display for RepairError {
             } => {
                 write!(
                     f,
-                    "file descriptions missing for {} file(s)",
+                    "files missing descriptions: {}",
                     missing_descriptions.len()
                 )
             }
@@ -670,7 +670,7 @@ impl Par2Repairer {
         Ok(loaded)
     }
 
-    /// Load in-memory par2 data (e.g. a volume kept in RAM). `label` names the source.
+    /// Load in-memory par2 data (for example, a volume kept in RAM). `label` names the source.
     pub fn load_par2_bytes(&mut self, data: Vec<u8>, label: &str) -> Result<usize, RepairError> {
         // Materialise to a temporary file so recovery payloads can be streamed later.
         let tmp = std::env::temp_dir().join(format!(
@@ -778,9 +778,9 @@ impl Par2Repairer {
         self.set_location(block, loc)
     }
 
-    /// Choose recovery slices for the missing blocks, verifying the MD5 of every slice that
-    /// will be used (lazily) and dropping corrupt ones. `allowed` restricts the candidate
-    /// exponents (streaming mode tracks syndromes only for some of them).
+    /// Choose recovery slices for the missing blocks, lazily verifying the MD5 of every
+    /// selected slice and dropping corrupt ones. `allowed` restricts the candidate exponents
+    /// (streaming mode tracks syndromes only for some of them).
     pub(crate) fn plan_with_verified_recovery(
         &mut self,
         logs: &[u16],
@@ -1231,7 +1231,7 @@ impl Par2Repairer {
         {
             let msg = if f.target_exists {
                 format!(
-                    "File {} has {} bad block(s) of total {} block(s) (ignored)",
+                    "File {} has {} bad blocks out of {} total blocks (ignored)",
                     f.target_filename,
                     f.missing_blocks(),
                     f.block_count
@@ -1548,7 +1548,7 @@ impl Par2Repairer {
     }
 
     /// Scan files in `dir` whose names look like split fragments of a target
-    /// (`target.001`, `target.bin.002`, ...). Returns blocks gained.
+    /// such as `target.001` or `target.bin.002`. Returns blocks gained.
     pub fn add_split_fragments(
         &mut self,
         dir: &Path,
@@ -1842,7 +1842,7 @@ impl Par2Repairer {
             let present: Vec<bool> = self.locations.iter().map(|l| l.is_some()).collect();
             let streaming = self.streaming.is_some();
             if streaming {
-                // Fold every located block that has not been accumulated yet (e.g. blocks found
+                // Fold every located block that has not been accumulated yet (for example, blocks found
                 // by `verify` or extra-file scans after streaming started).
                 self.streaming_backfill(observer)?;
             }
@@ -1957,7 +1957,7 @@ impl Par2Repairer {
             observer.message(
                 Level::Info,
                 &format!(
-                    "Reconstructing {} block(s) from {} recovery block(s){}",
+                    "Reconstructing {} blocks from {} recovery blocks{}",
                     plan.missing.len(),
                     plan.used_exponents.len(),
                     if streaming {
@@ -2605,7 +2605,7 @@ mod tests {
     #[test]
     fn corrupt_recovery_packet_is_skipped_and_backup_policies() {
         let fx = fixture("badrec", &[6000], 1000, 4);
-        // Corrupt the payload of recovery block 0 (in vol00+01) — header MD5 will mismatch.
+        // Corrupt the payload of recovery block 0 (in vol00+01) so its header MD5 mismatches.
         let v0 = fx.dir.join("set.vol00+01.par2");
         let mut d = std::fs::read(&v0).unwrap();
         d[68 + 10] ^= 0xFF;

@@ -73,7 +73,7 @@ pub fn atoi(bytes: &[u8]) -> i32 {
 
 /// Port of `ParParser::ParseParFilename`.
 ///
-/// * `confirmed`: the name is known to be a par2 file name; when `false`, everything after the
+/// * `confirmed`: the name is known to be a par2 filename; when `false`, everything after the
 ///   last `.par2` is cut off first (handles names like `file.par2.1` or `file.par2_dup`).
 /// * `fold`: byte case folding applied before matching.
 ///
@@ -136,7 +136,7 @@ pub fn same_par_collection(a: &[u8], b: &[u8], confirmed: bool) -> bool {
         && a[..pa.base_len].eq_ignore_ascii_case(&b[..pb.base_len])
 }
 
-/// Port of `ParParser::FindMainPars`: one representative file name per par2 collection among
+/// Port of `ParParser::FindMainPars`: one representative filename per par2 collection among
 /// `names` (the first encountered), in encounter order.
 pub fn find_main_pars<'a, I>(names: I) -> Vec<&'a [u8]>
 where
@@ -241,7 +241,7 @@ pub fn volume_range(name: &[u8]) -> Option<(u32, u32)> {
     Some((v as u32, count))
 }
 
-/// Build a `par2cmdline`-style volume file name: `<base>.vol<first>+<count>.par2` with both
+/// Build a `par2cmdline`-style volume filename: `<base>.vol<first>+<count>.par2` with both
 /// numbers zero-padded to `width` digits.
 pub fn volume_filename(base: &str, first: u32, count: u32, width: usize) -> String {
     format!("{base}.vol{first:0width$}+{count:0width$}.par2")
@@ -297,7 +297,7 @@ pub fn calc_completed_volume_blocks(parsed_blocks: i32, disk_size: i64, slice_si
 /// Superfluous volumes are then pruned smallest-first while the remainder still suffices.
 ///
 /// Returns the selected indices (ascending) and the total number of blocks in **all**
-/// available volumes (`block_found`), so callers can report "N needed, M available".
+/// available volumes (`block_found`), so callers can report `N needed, M available`.
 pub fn select_more_pars(sorted_block_counts: &[i32], block_needed: i32) -> (Vec<usize>, i32) {
     debug_assert!(
         sorted_block_counts.windows(2).all(|w| w[0] <= w[1]),

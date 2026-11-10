@@ -207,7 +207,7 @@ fn shift_tables_equal_the_multiply() {
             }
         }
     }
-    // Folding past the table threshold gives the brute-force CRC, equal and unequal parts alike.
+    // Folding past the table threshold gives the brute-force CRC for both equal and unequal parts.
     let file = data(150 * 1024 + 123, 42);
     let want = crc32(&file);
     let parts: Vec<(u32, usize)> = file.chunks(1024).map(|c| (crc32(c), c.len())).collect();

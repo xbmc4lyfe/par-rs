@@ -1,4 +1,4 @@
-//! Tolerant, lazy PAR2 packet framing, parsing and serialisation.
+//! Tolerant, lazy PAR2 packet framing, parsing, and serialisation.
 //!
 //! * [`PacketIter`] walks any [`PacketSource`] (in-memory slice or on-disk file) packet by
 //!   packet, validating the 64-byte header and, optionally, the packet MD5. When a header is
@@ -37,7 +37,7 @@ pub const TYPE_RECVSLIC: [u8; 16] = *b"PAR 2.0\0RecvSlic";
 
 /// Largest slice size accepted (256 MiB).
 pub const MAX_SLICE_SIZE: u64 = 256 * 1024 * 1024;
-/// Largest file name accepted in a `FileDesc` packet.
+/// Largest filename accepted in a `FileDesc` packet.
 pub const MAX_FILENAME_LEN: usize = 100_000;
 /// Chunk size used when hashing large packets.
 const HASH_CHUNK: usize = 1 << 20;
@@ -53,8 +53,7 @@ const RESYNC_WINDOW: usize = 256 * 1024;
 pub struct FileId(pub [u8; 16]);
 
 impl FileId {
-    /// Numeric value in `libpar2` / specification order ("treating them as 16-byte unsigned
-    /// integers", little-endian).
+    /// Numeric value in `libpar2` / specification order: a 16-byte unsigned little-endian integer.
     #[inline]
     pub fn as_u128(&self) -> u128 {
         u128::from_le_bytes(self.0)
@@ -95,7 +94,7 @@ impl fmt::Display for FileId {
 pub struct SetId(pub [u8; 16]);
 
 impl SetId {
-    /// Lower-case hex (the form used by `ParRenamer` for set-id based file names).
+    /// Lower-case hex (the form used by `ParRenamer` for set-id based filenames).
     pub fn to_hex(&self) -> String {
         hex(&self.0)
     }
@@ -141,7 +140,7 @@ pub enum PacketType {
     Creator,
     /// `PAR 2.0\0RecvSlic`
     RecoverySlice,
-    /// Any other (application specific or optional) packet type.
+    /// Any other app-specific or optional packet type.
     Unknown,
 }
 
@@ -352,7 +351,7 @@ fn _seek_read_marker(mut f: &File) -> io::Result<u64> {
 pub struct ScanOptions {
     /// Verify the MD5 of metadata packets (Main, FileDesc, IFSC, Creator, unknown).
     pub verify_md5: bool,
-    /// Verify the MD5 of recovery slice packets (streams the whole payload). Disable for
+    /// Verify the MD5 of recovery slice packets (streams the whole payload). Turn off for
     /// metadata-only scans; the repair engine verifies lazily before use.
     pub verify_recovery_md5: bool,
     /// Search forward for the next magic when a header is invalid instead of stopping.
@@ -594,7 +593,7 @@ pub fn verify_packet_md5<S: PacketSource + ?Sized>(
 pub enum PacketError {
     /// Body shorter than the fixed part of the payload.
     Truncated,
-    /// Slice size is zero, not a multiple of 4, or above [`MAX_SLICE_SIZE`].
+    /// Slice size is zero, not a multiple of 4, or greater than [`MAX_SLICE_SIZE`].
     BadSliceSize(u64),
     /// Main packet body is not `12 + 16 * n` bytes.
     BadMainLayout,
@@ -727,7 +726,7 @@ pub struct FileDescPacket {
     pub hash_16k: [u8; 16],
     /// File length.
     pub file_length: u64,
-    /// Raw file name bytes with trailing NUL padding removed.
+    /// Raw filename bytes with trailing NUL padding removed.
     pub name: Vec<u8>,
 }
 
@@ -774,7 +773,7 @@ impl FileDescPacket {
         self.computed_file_id() == self.file_id
     }
 
-    /// Local (sanitised) file name.
+    /// Local (sanitised) filename.
     pub fn local_name(&self) -> String {
         translate_filename_from_par2_to_local(&self.name)
     }
@@ -878,7 +877,7 @@ pub struct RecoverySliceRef {
     pub set_id: SetId,
     /// Recovery exponent.
     pub exponent: u32,
-    /// Caller-defined identifier of the source (e.g. index into a list of par2 files).
+    /// Caller-defined identifier of the source (for example, an index into a list of par2 files).
     pub source_id: usize,
     /// Offset of the packet header within the source.
     pub packet_offset: u64,
@@ -1011,7 +1010,7 @@ pub fn parse_packet<S: PacketSource + ?Sized>(
 }
 
 // ---------------------------------------------------------------------------------------------
-// File name translation
+// Filename translation
 // ---------------------------------------------------------------------------------------------
 
 /// Decode bytes as UTF-8, falling back to Latin-1 (each byte becomes the code point of the
@@ -1173,7 +1172,7 @@ pub fn encode_packet(set_id: &SetId, packet_type: &[u8; 16], body: &[u8]) -> Vec
 }
 
 /// Build the 68-byte prefix (header + exponent) of a recovery slice packet whose payload is
-/// `data`. The MD5 covers set id, type, exponent and payload.
+/// `data`. The MD5 covers set id, type, exponent, and payload.
 pub fn encode_recovery_packet_prefix(
     set_id: &SetId,
     exponent: u32,
@@ -1514,8 +1513,8 @@ impl PacketSet {
         }
     }
 
-    /// Whether the metadata is complete enough for verification/repair: Main present and a
-    /// FileDesc for every recoverable file.
+    /// Whether the metadata is complete enough for verification/repair: a `Main` packet and a
+    /// `FileDesc` packet for every recoverable file.
     pub fn is_complete(&self) -> bool {
         match &self.main {
             Some(m) => m
@@ -1789,8 +1788,8 @@ pub(crate) mod tests {
     fn file_id_ordering_matches_libpar2() {
         let mut a = [0u8; 16];
         let mut b = [0u8; 16];
-        a[0] = 0xFF; // larger in byte 0 ...
-        b[15] = 0x01; // ... but b is larger in byte 15, so b > a.
+        a[0] = 0xFF; // `a` is larger in byte 0.
+        b[15] = 0x01; // `b` is larger in byte 15, so `b > a`.
         assert!(FileId(a) < FileId(b));
         assert!(FileId(b) > FileId(a));
         a[15] = 0x01;
@@ -2005,8 +2004,8 @@ pub(crate) mod tests {
         assert_eq!(coll.primary_set().unwrap().set_id, Some(sid_a));
         assert_eq!(coll.stats.duplicates, 9);
 
-        // Recovery slice with the wrong payload size is dropped once Main is known,
-        // whether it arrives before or after the Main packet.
+        // Drop recovery slices with the wrong payload size once the Main packet arrives,
+        // regardless of arrival order.
         let wrong: Vec<u8> = (0..512).map(|i| i as u8).collect();
         let mut pre = Vec::new();
         pre.extend_from_slice(&encode_recovery_packet_prefix(&sid_a, 9, &wrong));

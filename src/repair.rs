@@ -392,7 +392,7 @@ pub struct DiskFile {
 /// Where a present slice lives on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiskLocation {
-    /// Path of the file holding the slice (the target itself, a backup, a misnamed copy ...).
+    /// Path of the file holding the slice, such as the target itself, a backup, or a misnamed copy.
     pub path: PathBuf,
     /// Byte offset of the slice data.
     pub offset: u64,
@@ -455,8 +455,8 @@ impl Source {
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
             if len > 0
                 // SAFETY: the mapping is private and read-only; the files are inputs the caller
-                // asked us to read, and a concurrent writer would at worst corrupt the data we
-                // verify afterwards, never memory safety here.
+                // supplies for reading. A concurrent writer could corrupt the data that subsequent
+                // verification checks, but cannot compromise memory safety here.
                 && let Ok(m) = unsafe { memmap2::Mmap::map(&f) }
             {
                 return Ok(Source::Map(m));
@@ -710,7 +710,7 @@ mod tests {
             .collect();
         let out = repair_slices(ss, 12, &present1, &recovery[..1], &k).unwrap();
         assert_eq!(out, vec![(7, inputs[7].clone())]);
-        // ... and without exponent 0 it goes through the field.
+        // Without exponent 0, the operation goes through the field.
         let out = repair_slices(ss, 12, &present1, &recovery[3..4], &k).unwrap();
         assert_eq!(out, vec![(7, inputs[7].clone())]);
         // Nothing missing.

@@ -14,7 +14,7 @@
 //! a later successful retry re-verifies them.
 //!
 //! At repair time the present blocks are already folded in, so the engine only has to add the
-//! recovery slices (`S_j + R_{e_j}`) and apply `A⁻¹` — reading `k` recovery slices instead of
+//! recovery slices (`S_j + R_{e_j}`) and apply `A⁻¹`—reading `k` recovery slices instead of
 //! all `n` input slices.
 //!
 //! # What streaming cannot do
@@ -26,26 +26,26 @@
 //!
 //! Recovery volumes often arrive *after* the data files. Syndromes do not need the recovery
 //! packets themselves, only their exponents, so tracking can start from the expected exponents
-//! (e.g. `0..N` from the `.volXX+YY` names) before any volume is loaded.
+//! (for example, `0..N` from the `.volXX+YY` names) before any volume is loaded.
 //!
 //! # Repair-while-downloading session
 //!
 //! [`StreamingParSession`] is the thread-safe (`Send + Sync`, cloneable) integration point for
 //! NZBGet's `ArticleWriter` / `DirectRenamer` / `DirectUnpack` / `StreamRepairController`:
 //!
-//! 1. **Live slice state machine + `.vol` unpause scheduler** — every slice is `Unarrived`,
+//! 1. **Live slice state machine + `.vol` unpause scheduler**—every slice is `Unarrived`,
 //!    `PartiallyArrived`, `VerifiedGood` or `Damaged`; permanent article failures mark slices
 //!    damaged and immediately run the two-stage greedy volume selector over the paused
 //!    `.volXX+YY.par2` files so the exact recovery volumes download concurrently.
-//! 2. **In-flight syndrome accumulator** — completed slices (from the `ArticleCache` bytes or
+//! 2. **In-flight syndrome accumulator**—completed slices (from the `ArticleCache` bytes or
 //!    the target file) are hashed lock-free on the calling thread (with a `crc32_combine`
 //!    pre-check over the article CRCs) and folded into pre-allocated syndrome slots; each slot
 //!    carries a `folded_mask` bitset so slots created when a late volume arrives can be
 //!    back-filled from disk for exactly the slices they lack.
-//! 3. **Mid-download volume repair** — Mode A splices donor/twin bytes into holes slice by slice
+//! 3. **Mid-download volume repair**—Mode A splices donor/twin bytes into holes slice by slice
 //!    (works even when `D + U > R`); Mode B performs an early Reed-Solomon cutover computing only
 //!    the `A⁻¹` rows of the requested files once `D + U <= R`.
-//! 4. **Concurrency** — one bookkeeping mutex (never held during hashing or I/O), one mutex per
+//! 4. **Concurrency**—one bookkeeping mutex (never held during hashing or I/O), one mutex per
 //!    syndrome slot (striped folding) and an optional bounded folder pool that never blocks the
 //!    article writers (full queue → inline fold).
 
@@ -270,7 +270,7 @@ impl Par2Repairer {
             max_memory: opts.max_memory_bytes,
             stats: StreamingStats::default(),
         };
-        // Blocks already located (e.g. by a verify() before enabling) are folded now.
+        // Blocks already located (for example, by a `verify()` before enabling) are folded now.
         let located: Vec<usize> = (0..total)
             .filter(|&g| self.locations[g].is_some())
             .collect();
@@ -339,7 +339,7 @@ impl Par2Repairer {
         })
     }
 
-    /// Track additional recovery exponents (e.g. when more volumes are queued). Already
+    /// Track additional recovery exponents (for example, when more volumes are queued). Already
     /// verified blocks are re-read from disk and folded into the new syndromes. Returns the
     /// number of exponents now tracked.
     pub fn streaming_track_exponents(&mut self, more: &[u32]) -> Result<usize, RepairError> {
@@ -383,7 +383,7 @@ impl Par2Repairer {
 
     /// Report an article written to the target file of `file_index` at `offset`
     /// (`success == false` for a failed article). Blocks that became complete are read from
-    /// the target file, verified and folded. Returns the blocks whose state changed.
+    /// the target file, verified, and folded. Returns the blocks whose state changed.
     pub fn streaming_segment_written(
         &mut self,
         file_index: usize,
@@ -395,8 +395,8 @@ impl Par2Repairer {
     }
 
     /// Report a decoded article held in memory (also assumed to be written to the target file
-    /// at the same offset). Blocks completed purely from staged data are verified without
-    /// touching the disk.
+    /// at the same offset). Blocks completed purely from staged data undergo verification
+    /// without touching the disk.
     pub fn streaming_segment_data(
         &mut self,
         file_index: usize,
@@ -406,7 +406,7 @@ impl Par2Repairer {
         self.streaming_segment(file_index, offset, data.len() as u64, true, Some(data))
     }
 
-    /// Report that a failed article's byte range will not arrive.
+    /// Report that a failed article's byte range cannot arrive.
     pub fn streaming_segment_failed(
         &mut self,
         file_index: usize,
@@ -717,7 +717,7 @@ impl Par2Repairer {
         observer.message(
             Level::Detail,
             &format!(
-                "Folding {} late block(s) into the streamed syndromes",
+                "Folding {} late blocks into the streamed syndromes",
                 todo.len()
             ),
         );
@@ -789,7 +789,7 @@ impl Par2Repairer {
         Ok(buf)
     }
 
-    /// Wipe syndromes and coverage (e.g. when the host restarts a download).
+    /// Wipe syndromes and coverage (for example, when the host restarts a download).
     pub fn disable_streaming(&mut self) {
         self.streaming = None;
     }
@@ -940,7 +940,7 @@ mod tests {
             for si in shuffled(n, 99) {
                 let off = si * article;
                 let end = (off + article).min(data.len());
-                // Every 11th article of part0 fails.
+                // Every eleventh article of part0 fails.
                 let fail = name == "part0.rar" && si % 11 == 3;
                 if fail {
                     failed_total += 1;
@@ -1124,7 +1124,7 @@ mod tests {
         let st = r.streaming_status().unwrap();
         assert_eq!(st.pending_blocks, 6);
         assert!(st.repair_possible_now);
-        // Restore part0 (we only corrupted it to demonstrate the host contract above).
+        // Restore part0 after the preceding host contract demonstration.
         std::fs::write(&p0, &fx.files[0].1).unwrap();
         let _ = fi0;
         let mut obs = Msgs::default();
@@ -1495,7 +1495,7 @@ pub struct UnpauseAction {
 /// A queued recovery volume known to the scheduler.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedVolume {
-    /// Host-defined id (e.g. NZBGet `FileInfo::GetId()`).
+    /// Host-defined id (for example, NZBGet `FileInfo::GetId()`).
     pub id: u64,
     /// Recovery blocks it carries (from the `+YY` name part or an estimate).
     pub blocks: i32,
@@ -1524,7 +1524,7 @@ pub enum VolumeStatus {
 pub struct ArticleOutcome {
     /// Slice transitions caused by the article.
     pub events: Vec<SliceEvent>,
-    /// Volumes to unpause if new damage pushed the need above the available blocks.
+    /// Volumes to unpause if new damage pushed the need beyond the available blocks.
     pub unpause: Option<UnpauseAction>,
 }
 
@@ -1663,7 +1663,7 @@ struct LiveStaged {
     ranges: Vec<ByteRange>,
 }
 
-/// Mutable tracker state (one lock, held only for bookkeeping — never during hashing or I/O).
+/// Mutable tracker state (one lock, held only for bookkeeping—never during hashing or I/O).
 struct Tracker {
     states: Vec<SliceState>,
     counts: [usize; 4],
@@ -1794,7 +1794,7 @@ impl StreamingParSession {
         let total = first;
         let logs = input_constant_logs(total).map_err(|_| RepairError::Singular)?;
         // Exponents for the pre-allocated slots: loaded recovery exponents first, then the
-        // canonical sequence 0, 1, 2, ...
+        // canonical sequence of nonnegative integers.
         let mut exps: Vec<u32> = set.recovery.keys().copied().collect();
         let mut e = 0u32;
         while exps.len()
@@ -1910,7 +1910,7 @@ impl StreamingParSession {
     // 1. LiveParTracker
     // -----------------------------------------------------------------------------------------
 
-    /// File id for a file name (raw PAR2 bytes or local name; exact, then ASCII case-insensitive),
+    /// File id for a filename (raw PAR2 bytes or local name; exact, then ASCII case-insensitive),
     /// in `libpar2` order for ties.
     pub fn file_id_by_name(&self, name: &[u8]) -> Option<FileId> {
         let files = &self.inner.files;
@@ -1943,7 +1943,7 @@ impl StreamingParSession {
             .map(|f| f.file_id)
     }
 
-    /// [`on_article_finished`](Self::on_article_finished) keyed by file name.
+    /// [`on_article_finished`](Self::on_article_finished) keyed by filename.
     pub fn on_article_finished_by_name(
         &self,
         name: &[u8],
@@ -1958,7 +1958,7 @@ impl StreamingParSession {
         self.on_article_finished(&id, offset, size, crc32, bytes)
     }
 
-    /// [`on_article_failed_permanently`](Self::on_article_failed_permanently) keyed by file name.
+    /// [`on_article_failed_permanently`](Self::on_article_failed_permanently) keyed by filename.
     pub fn on_article_failed_permanently_by_name(
         &self,
         name: &[u8],
@@ -2367,7 +2367,7 @@ impl StreamingParSession {
                 }
                 for (lane, tx) in pool.txs.iter().enumerate() {
                     if tx.try_send(Arc::clone(&job)).is_err() {
-                        // Queue full: never block the article writer — fold this lane inline.
+                        // Queue full: never block the article writer—fold this lane inline.
                         fold_lane(&self.inner.opts.kernel, &self.inner.slots, &job, lane, n);
                         self.inner.inline_folds.fetch_add(1, Ordering::Relaxed);
                         let (m, cv) = &*pool.pending;
@@ -2569,10 +2569,10 @@ impl StreamingParSession {
     // 3. Mid-download volume repair
     // -----------------------------------------------------------------------------------------
 
-    /// Mode A — live donor / twin splicing. `candidate_bytes` cover `hole_range` of the file
+    /// Mode A—live donor / twin splicing. `candidate_bytes` cover `hole_range` of the file
     /// (from a duplicate posting or twin set); they are combined in RAM with the on-disk bytes
     /// of every touched slice and verified against IFSC. Matching slices are written to
-    /// `disk_file`, marked verified and folded. Returns the healed slice indices.
+    /// `disk_file`, marked verified, and folded. Returns the healed slice indices.
     pub fn try_splice_live_slice(
         &self,
         file_id: &FileId,
@@ -2658,7 +2658,7 @@ impl StreamingParSession {
         self.verify_slice_bytes(fi, b, Some(data), None)
     }
 
-    /// Mode B — early Reed-Solomon cutover. When `D + U <= R`, treat every non-verified slice
+    /// Mode B—early Reed-Solomon cutover. When `D + U <= R`, treat every non-verified slice
     /// as an erasure, invert the `K×K` recovery matrix and compute **only** the rows for the
     /// non-verified slices of `target_file_ids`, patching them into the target files on disk.
     /// Each target's whole-file MD5 is checked afterwards.
@@ -3449,7 +3449,7 @@ mod live_tests {
 
     #[test]
     fn live_donor_splicing_mode_a() {
-        // D + U > R: Reed-Solomon impossible, but a twin posting supplies the missing bytes.
+        // `D + U > R` prevents Reed-Solomon recovery, but a twin posting supplies the missing bytes.
         let fx = fixture("splice", &[20_000, 50_000], 1000, 2, VolumeScheme::Single);
         let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
         let f0 = fid(&fx, "part00.rar");
@@ -3609,7 +3609,7 @@ mod live_tests {
             }
         }
         assert_eq!(s.status().damaged, 4);
-        assert_eq!(s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(), 5); // 6th exceeds the cap
+        assert_eq!(s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(), 5); // The sixth exceeds the cap.
         let st = s.status();
         assert_eq!(st.syndrome_slots, 5);
         assert_eq!(st.ready_recovery, 5);

@@ -163,7 +163,7 @@ fn we_verify_and_repair_par2cmdline_sets() {
     let v = r.verify(None, &mut NullObserver).unwrap();
     assert!(v.all_complete, "{:?}", r.source_files());
 
-    // Damage within par2cmdline's recovery capacity and repair with our engine.
+    // Damage within par2cmdline's recovery capacity and repair with the par-rs engine.
     let p0 = dir.join("data0.bin");
     let mut d0 = std::fs::read(&p0).unwrap();
     for b in [1usize, 2, 30, 37] {

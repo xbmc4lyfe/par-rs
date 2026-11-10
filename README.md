@@ -1,4 +1,4 @@
-# par-rs
+# `par-rs`
 
 A general-purpose, SIMD-accelerated PAR2 parity crate in Rust, for downloaders that verify and
 repair while files arrive (rustyget / nzbget) and for indexers that need to understand par2
@@ -68,10 +68,11 @@ produced correct output (verified by MD5 against the originals). Harness: `bench
 (`fpar2` produced no output on this machine and was dropped.)
 
 Where the time goes, and why create and repair cannot be *much* faster than nzbfast or ParPar
-on this hardware: both phases are bound by GF(2^16) multiply-accumulate, which on NEON is a
-nibble-table-lookup kernel at ~0.5 instructions per byte. The three engines are within 1.4x of
-each other on that kernel; nothing algorithmic (NTT, bitsliced "four Russians", `pmull`) beats it
-at these set sizes — a bitsliced prototype measured 1.25x the shuffle kernel at best and lost
+on this hardware: both phases are bound by GF(2^16) multiplication and accumulation. On NEON,
+this uses a nibble-table-lookup kernel at ~0.5 instructions per byte. The three engines are
+within 1.4x of each other on that kernel; nothing algorithmic (NTT, the bitsliced four Russians
+method, `pmull`) beats it
+at these set sizes—a bitsliced prototype measured 1.25x the shuffle kernel at best and lost
 badly for small recovery counts, and nzbfast's own NTT only pays off past ~250 recovery blocks.
 
 ```
@@ -188,7 +189,7 @@ syndrome slot plus an optional bounded folder pool (full queue ⇒ inline fold, 
 writer), and each slot keeps a `folded_mask` bitset so slots allocated when a late volume arrives
 are back-filled from disk for exactly the slices they lack.
 
-CLI front end for manual use:
+Command-line tool for manual use:
 
 ```sh
 cargo build --release --example par-rs
@@ -197,12 +198,26 @@ cargo build --release --example par-rs
 
 Or run through Cargo: `cargo run --release --example par-rs -- {create|verify|repair|rename|info} ...`
 
+## Development
+
+Install Rust 1.99.1 with the `clippy` and `rustfmt` components, `just` 1.59.0, and Vale 3.26.0.
+Run these commands from the repository root:
+
+| Command | Purpose |
+|---|---|
+| `just run [args]` | Build and run the release example with optional command-line arguments. |
+| `just build-release` | Build the release example. |
+| `just build-debug` | Build the debug example. |
+| `just fmt` | Format Rust code and lint prose with the Google style rules. |
+| `just test` | Run tests and Clippy. |
+| `just ci` | Check formatting and prose, run tests and Clippy, and build the release example. |
+
 ## Testing
 
-* `cargo test` — 136 unit tests, 2 doctests and 20 integration tests in six suites (`gf2_algebra`, `packet_resilience` — truncation sweeps, bit flips, torn headers, garbage; `bridge_and_verify`; `reed_solomon_repair` — SIMD vs scalar bit identity over sizes and alignments, batch / surgical / disk repair from real volumes; `streaming_repair` — scrambled 7000-byte articles into 8 KiB slices with early cutoff; `indexer_and_checker_requests` — the optimistic inventory scan against the resynchronising scanner over every prefix and bit flip, the subject rule, wildcard ignore masks, collection loading) (every kernel is checked against the scalar reference on every
+* `cargo test`—136 unit tests, 2 doctests and 20 integration tests in six suites (`gf2_algebra`, `packet_resilience`—truncation sweeps, bit flips, torn headers, garbage; `bridge_and_verify`; `reed_solomon_repair`—SIMD vs scalar bit identity over sizes and alignments, batch / surgical / disk repair from real volumes; `streaming_repair`—scrambled 7000-byte articles into 8 KiB slices with early cutoff; `indexer_and_checker_requests`—the optimistic inventory scan against the resynchronising scanner over every prefix and bit flip, the subject rule, wildcard ignore masks, collection loading) (every kernel is checked against the scalar reference on every
   supported ISA of the host; packet parser against corrupt/shifted/duplicated streams; damage,
   scanner, engine, repairer and renamer end-to-end on temporary directories).
-* `tests/par2cmdline.rs` — differential tests against the `par2` binary when present: sets
+* `tests/par2cmdline.rs`—differential tests against the `par2` binary when present: sets
   created here verify and repair with `par2`; sets created by `par2 create` are verified and
   repaired here (including 250 missing of 1000 blocks) and then re-verified by `par2`.
 * `cargo clippy --all-targets -- -D warnings` is clean.
@@ -249,7 +264,7 @@ Or run through Cargo: `cargo run --release --example par-rs -- {create|verify|re
 * `RepairOptions::ignore_extensions` entries containing `*` or `?` are wildcard masks over the whole
   local name (nzbget `ParIgnoreExt=*`; inside a mask `#` is one digit, as in nzbget's `WildMask`),
   matched by `repairer::ignore_name_matches`; every entry is also a case-insensitive suffix, so a
-  literal file name works too.
+  literal filename works too.
 * `packet::load_par2_collection(main_path, opts)` loads an index and its sibling volumes into a
   `PacketSet` without a `Par2Repairer`.
 * `docs/PARITY_LIBRARY.md` is the integration brief exchanged with the RustyGet project.
@@ -263,4 +278,4 @@ Or run through Cargo: `cargo run --release --example par-rs -- {create|verify|re
 * `BackupPolicy::RenameNumbered` reproduces `libpar2`'s `file.1` behaviour so
   `ParChecker::DeleteLeftovers` semantics carry over.
 * `RepairOptions::rename_misnamed` moves complete copies found under other names into place
-  (as `libpar2` does); disable it when scanning dupe sources that must stay untouched.
+  (as `libpar2` does); turn it off when scanning dupe sources that must stay untouched.

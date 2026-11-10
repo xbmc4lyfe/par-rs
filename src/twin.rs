@@ -1,7 +1,7 @@
 //! Recovery-set fingerprinting and twin / near-twin / alternative set classification.
 //!
 //! When several NZBs describe the same release, their PAR2 sets may be *twins* (identical
-//! files and names), *near twins* (same file contents under different names — usable for
+//! files and names), *near twins* (same file contents under different names—usable for
 //! renaming and for borrowing recovery blocks) or *unrelated* (different contents). The
 //! fingerprint is a 64-bit FNV-1a hash over the sorted, de-duplicated `"<md5>:<length>\n"`
 //! lines of the file descriptions, formatted as `"{hash:016x}-{count}"`.
@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 /// Identity of one described file.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileSig {
-    /// Raw PAR2 file name bytes.
+    /// Raw PAR2 filename bytes.
     pub name: Vec<u8>,
     /// MD5 of the whole file.
     pub md5: [u8; 16],
@@ -43,7 +43,7 @@ pub fn sigs_of_set(set: &PacketSet) -> Vec<FileSig> {
 
 /// Extract file signatures from in-memory PAR2 data.
 ///
-/// Returns the signatures and whether a valid Main packet was found (i.e. the data is a
+/// Returns the signatures and whether a valid Main packet was found (the data is a
 /// complete, usable set description rather than just surviving `FileDesc` packets).
 pub fn par2_set(data: &[u8]) -> (Vec<FileSig>, bool) {
     match load_par2_bytes(data, ScanOptions::METADATA) {
@@ -72,7 +72,7 @@ pub fn block_size_of_set(set: &PacketSet) -> u64 {
     if let Some(ss) = set.slice_size() {
         return ss;
     }
-    let mut lower: u64 = 4; // slice size must be > (len-1)/n ... and a multiple of 4
+    let mut lower: u64 = 4; // Slice size must exceed `(len - 1) / n` and be a multiple of 4.
     let mut upper: u64 = u64::MAX;
     let mut any = false;
     for (id, fd) in &set.file_descs {
@@ -137,7 +137,7 @@ impl TwinRelation {
     }
 }
 
-/// Compare our own set (names, MD5s and precomputed fingerprint) with candidate twin data.
+/// Compare the source set (names, MD5s and precomputed fingerprint) with candidate twin data.
 ///
 /// `own_names[i]` and `own_md5s[i]` describe the same file. Returns
 /// [`TwinRelation::Twin`] (0), [`TwinRelation::DescribesOtherFiles`] (1) or
@@ -169,14 +169,14 @@ pub fn compare_twin_par2_data(
     }
 }
 
-/// Convenience over [`compare_twin_par2_data`] taking our own signatures.
+/// Convenience over [`compare_twin_par2_data`] taking the source signatures.
 pub fn compare_twin_sets(own: &[FileSig], twin_data: &[u8]) -> TwinRelation {
     let names: Vec<&[u8]> = own.iter().map(|s| s.name.as_slice()).collect();
     let md5s: Vec<[u8; 16]> = own.iter().map(|s| s.md5).collect();
     compare_twin_par2_data(&names, &md5s, &fingerprint(own), twin_data)
 }
 
-/// Map from a twin's names to our names for files with identical content (for renaming
+/// Map from a twin's names to the source names for files with identical content (for renaming
 /// obfuscated downloads using an alternative set). Only unambiguous MD5 matches are returned.
 pub fn name_mapping(own: &[FileSig], twin: &[FileSig]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut by_md5: std::collections::BTreeMap<[u8; 16], Vec<&FileSig>> = Default::default();

@@ -21,7 +21,7 @@
 //!
 //! [`Engine::run`] processes the slices in chunks that fit the memory budget. For every chunk
 //! a reader thread streams batches of input chunks (de-interleaved into split planes) while
-//! worker threads multiply-accumulate them into the output buffers, each worker owning a
+//! worker threads multiply and accumulate them into the output buffers, each worker owning a
 //! disjoint range of words of every output and iterating in L2-sized tiles so that an input
 //! tile is read once per group of up to eight outputs.
 
@@ -88,11 +88,11 @@ impl From<io::Error> for RsError {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Dense GF(2^16) matrix
+// Dense `GF(2^16)` matrix
 // ---------------------------------------------------------------------------------------------
 
 /// Row-major dense matrix over GF(2^16), stored as little-endian `u16` bytes so that row
-/// operations can use the SIMD multiply-accumulate kernels.
+/// operations can use the SIMD kernels for multiplication and accumulation.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Matrix {
     rows: usize,
@@ -403,7 +403,7 @@ impl<F: FnMut(usize, u64, &[u8]) -> io::Result<()>> OutputSink for F {
 /// Engine configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct EngineConfig {
-    /// Worker threads for the multiply-accumulate phase (0 = available parallelism).
+    /// Worker threads for the multiplication and accumulation phase (0 = available parallelism).
     pub num_threads: usize,
     /// Memory budget for buffers in bytes (clamped to at least 16 MiB).
     pub mem_limit_bytes: u64,
@@ -466,8 +466,8 @@ pub struct Engine<'a> {
     pub output_exponents: &'a [u32],
     /// Optional `r×k` matrix (`k` = number of output exponents, `r <= k`) applied after the
     /// streaming phase: final output `m` is `Σ_j M[m][j] · S_j`. With `r < k` only the
-    /// requested rows are produced (e.g. the damaged slices of selected files). When `None`
-    /// the syndromes themselves are the outputs.
+    /// requested rows are produced (for example, the damaged slices of selected files).
+    /// When `None`, the syndromes themselves are the outputs.
     pub post_transform: Option<&'a Matrix>,
     /// Configuration.
     pub config: EngineConfig,
@@ -546,7 +546,7 @@ fn tile_bounds(t: usize, tile: usize, words: usize) -> Option<(usize, usize)> {
     (t0 < words).then(|| (t0, (t0 + tile).min(words)))
 }
 
-/// Multiply-accumulate one batch into tile `[t0, t1)` of every output.
+/// Multiply and accumulate one batch into tile `[t0, t1)` of every output.
 ///
 /// `scratch` receives the de-interleaved input tiles (one split buffer of `2 * (t1 - t0)` bytes
 /// per input).

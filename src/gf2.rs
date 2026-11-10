@@ -233,7 +233,7 @@ impl Crc32Shift {
             ^ self.tables[3][b3 as usize]
     }
 
-    /// [`crc32_combine`] with `len2 == self.len()`: CRC of `crc1`'s data followed by
+    /// [`crc32_combine`] with `len2 == self.len()`: `CRC` of `crc1`'s data followed by
     /// `crc2`'s data.
     #[inline]
     pub fn combine(&self, crc1: u32, crc2: u32) -> u32 {
@@ -545,7 +545,7 @@ pub fn lcm(a: u64, b: u64) -> Option<u64> {
 }
 
 /// LCM of several article sizes: the grid on which every size's article boundaries coincide
-/// (e.g. `LCM(716_800, 768_000) = 10_752_000`, i.e. 15 articles of the first size and 14 of
+/// (for example, `LCM(716_800, 768_000) = 10_752_000`, that is, 15 articles of the first size and 14 of
 /// the second).
 pub fn lcm_grid(sizes: &[u64]) -> Option<u64> {
     let mut it = sizes.iter();

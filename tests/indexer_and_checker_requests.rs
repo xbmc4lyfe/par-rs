@@ -220,7 +220,7 @@ fn ignore_extensions_accept_wildcard_masks() {
         ("aaab", "*ab", true),
         ("aaab", "*a?b", true),
         ("aaab", "a*c", false),
-        // nzbget's WildMask: `#` is one digit inside a mask; a literal file name is a suffix match.
+        // nzbget's WildMask: `#` is one digit inside a mask; a literal filename is a suffix match.
         ("sample01.nfo", "sample##.*", true),
         ("sample1.nfo", "sample##.*", false),
         ("sampleAB.nfo", "sample##.*", false),
@@ -236,7 +236,7 @@ fn ignore_extensions_accept_wildcard_masks() {
         );
     }
 
-    // RustyGet's test: ParIgnoreExt=* with a damaged .dat and an intact .nfo: nothing to repair,
+    // RustyGet's test: `ParIgnoreExt=*` with a damaged .dat and an intact .nfo: nothing to repair,
     // and only the intact file is complete.
     let dat = data(20_000, 5);
     let nfo = data(900, 6);

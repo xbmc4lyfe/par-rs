@@ -567,7 +567,7 @@ pub fn is_split_fragment(filename: &[u8], correct_name: &[u8]) -> bool {
 }
 
 /// Port of `ParChecker::MaybeSplittedFragement`: `filename1` looks like a split fragment of
-/// `filename2` — either `filename2` plus a numeric extension, or both share a stem and have
+/// `filename2`—either `filename2` plus a numeric extension, or both share a stem and have
 /// three-digit numeric extensions.
 pub fn maybe_split_fragment(filename1: &[u8], filename2: &[u8]) -> bool {
     let len = filename2.len();
@@ -903,7 +903,7 @@ mod tests {
         let (bytes, _) =
             create_in_memory(&[(b"good.bin", &a)], 1024, &[0], Kernel::detect()).unwrap();
         let (index, vols) = split_set(&bytes);
-        // Main par2 truncated to garbage (loads nothing), volume intact and loadable.
+        // The main par2 file contains only truncated garbage. The volume remains intact and loadable.
         std::fs::write(dir.join("set.par2"), &index[..40]).unwrap();
         std::fs::write(dir.join("set.vol00+01.par2"), &vols[0]).unwrap();
         std::fs::write(dir.join("renamed_data"), &a).unwrap();

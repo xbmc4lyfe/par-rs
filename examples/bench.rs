@@ -110,7 +110,7 @@ fn main() {
     let el = t.elapsed().as_secs_f64();
     let work = (inputs * outputs * slice) as f64;
     println!(
-        "engine encode: {inputs} inputs x {outputs} outputs x {slice} B in {el:.3}s = {:.2} GB/s of multiply-accumulate ({:.2} GB/s input)",
+        "engine encode: {inputs} inputs x {outputs} outputs x {slice} B in {el:.3}s = {:.2} GB/s of multiply and accumulate operations ({:.2} GB/s input)",
         work / el / 1e9,
         (inputs * slice) as f64 / el / 1e9
     );

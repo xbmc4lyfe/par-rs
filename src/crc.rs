@@ -88,7 +88,7 @@ pub fn update_slice8_raw(mut crc: u32, data: &[u8]) -> u32 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// GF(2)[x] / P(x) arithmetic on reflected 32-bit registers
+// `GF(2)[x] / P(x)` arithmetic on reflected 32-bit registers
 // ---------------------------------------------------------------------------------------------
 
 /// Multiply two polynomials modulo P(x), both in reflected representation
@@ -161,7 +161,7 @@ pub fn crc32_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
 }
 
 /// Precomputed combiner for repeatedly appending blocks of a fixed length
-/// (e.g. folding the IFSC per-slice CRCs of a whole file).
+/// (for example, folding the IFSC per-slice CRCs of a whole file).
 #[derive(Clone, Copy, Debug)]
 pub struct Crc32Combiner {
     op: u32,

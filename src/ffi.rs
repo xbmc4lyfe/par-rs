@@ -1,7 +1,7 @@
 //! C ABI for hosts that embed the engine from C/C++ (or from Rust through a stable boundary).
 //!
 //! Every function is `extern "C"`, panics are caught at the boundary (with `panic = "abort"`
-//! builds they abort as configured), and all strings are NUL-terminated UTF-8 (file names
+//! builds they stop the process as configured), and all strings are NUL-terminated UTF-8 (file names
 //! that are not valid UTF-8 are lossily converted). Objects are opaque handles freed with
 //! their `*_free` function. Status codes are [`NzbParStatus`]; the last error message of a
 //! repairer is available through [`nzbpar_repairer_last_error`].
@@ -199,7 +199,7 @@ impl RepairObserver for Callbacks {
                 Level::Warning => 2,
                 Level::Error => 3,
             };
-            // SAFETY: as above.
+            // SAFETY: caller-provided callback with caller-provided context.
             unsafe { cb(self.ctx, lv, c.as_ptr()) }
         }
     }
@@ -715,7 +715,7 @@ pub extern "C" fn nzbpar_crc32_zeros(crc: u32, n: u64) -> u32 {
     crate::crc::crc32_zeros(crc, n)
 }
 
-/// Parse a par2 file name: returns 1 if it is a par2 name and fills `out_base_len` and
+/// Parse a par2 filename: returns 1 if it is a par2 name and fills `out_base_len` and
 /// `out_blocks` (0 main, >0 volume block count, -1 unknown).
 ///
 /// # Safety
@@ -730,7 +730,7 @@ pub unsafe extern "C" fn nzbpar_parse_par_filename(
     if name.is_null() {
         return 0;
     }
-    // SAFETY: NUL-terminated string.
+    // SAFETY: `NUL`-terminated string.
     let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
     match crate::filenames::parse_par_filename(bytes, confirmed != 0, crate::filenames::ascii_lower)
     {

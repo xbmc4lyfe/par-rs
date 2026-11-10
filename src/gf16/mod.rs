@@ -6,11 +6,11 @@
 //!
 //! Besides the basic operations this module provides:
 //!
-//! * [`input_constants`] — the per-input-slice constants mandated by the PAR2 specification
+//! * [`input_constants`]—the per-input-slice constants mandated by the PAR2 specification
 //!   (powers of two whose exponent is coprime with 65535),
-//! * [`MulTables`] — two 256-entry tables that multiply any word by a fixed coefficient with
+//! * [`MulTables`]—two 256-entry tables that multiply any word by a fixed coefficient with
 //!   two lookups (the scalar kernel used for tails and as the reference implementation),
-//! * [`ShuffleTables`] — the eight 16-byte nibble tables consumed by the SIMD kernels in
+//! * [`ShuffleTables`]—the eight 16-byte nibble tables consumed by the SIMD kernels in
 //!   [`crate::gf16::simd`].
 
 pub mod simd;
@@ -203,7 +203,7 @@ pub fn rs_coefficient(logbase: u16, exponent: u32) -> u16 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Multiply-by-constant tables
+// Tables for multiplication by a constant
 // ---------------------------------------------------------------------------------------------
 
 /// Byte-split multiplication tables for a fixed coefficient:
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn par2_input_constants() {
-        // From the PAR2 specification: 2, 4, 16, 128, 256, 2048, 8192, 16384, 4107, 32856, 17132 ...
+        // First 11 constants from the PAR2 specification: 2, 4, 16, 128, 256, 2048, 8192, 16384, 4107, 32856, 17132.
         let c = input_constants(11).unwrap();
         assert_eq!(
             c,

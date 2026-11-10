@@ -2,7 +2,7 @@
 //!
 //! [`inspect_par2`] walks a byte buffer (typically the decoded articles of a `.par2` file or the
 //! head of a `.volNNN+MM.par2` volume) and classifies every packet of the twelve PAR2 v2.0
-//! packet types, resynchronising on the `PAR2\0PKT` magic after garbage, truncation or a
+//! packet types, resynchronising on the `PAR2\0PKT` magic after garbage, truncation, or a
 //! corrupt header. Nothing is copied out of the buffer except the small decoded fields; slice
 //! payloads are reported as `(offset, length)` ranges. Every field is bounds checked: a
 //! truncated or adversarial buffer yields a partial report, never a panic.
@@ -38,11 +38,11 @@ pub enum PacketKind {
     RecvSlic,
     /// `Creator`: client string.
     Creator,
-    /// `UniFileN`: UTF-16LE file name.
+    /// `UniFileN`: `UTF-16LE` filename.
     UniFileN,
-    /// `CommASCI`: ASCII comment.
+    /// `CommASCI`: `ASCII` comment.
     CommAsci,
-    /// `CommUni`: UTF-16LE comment.
+    /// `CommUni`: `UTF-16LE` comment.
     CommUni,
     /// `FileSlic`: an input file slice stored inside the par2 set.
     FileSlic,
@@ -243,9 +243,9 @@ pub struct CreatorInfo {
     pub raw: String,
     /// Classified tool.
     pub tool: CreatorTool,
-    /// Version token (e.g. `0.8.1`, `1.5.0`), if present.
+    /// Version token (for example, `0.8.1`, `1.5.0`), if present.
     pub version: Option<String>,
-    /// Architecture / platform token (e.g. `x86_64`, `aarch64`, `win64`), if present.
+    /// Architecture / platform token (for example, `x86_64`, `aarch64`, `win64`), if present.
     pub arch: Option<String>,
 }
 
@@ -311,7 +311,7 @@ impl CreatorInfo {
     }
 }
 
-/// Analysis of a PAR2 file name.
+/// Analysis of a PAR2 filename.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Par2FileName {
     /// Name without the `.par2` / `.volNNN+MM.par2` suffix.
@@ -397,9 +397,9 @@ pub struct MainInfo {
     pub non_recovery_set: Vec<[u8; 16]>,
     /// The body was shorter than its file count claimed.
     pub truncated: bool,
-    /// `MD5(body) == set_id`: PAR2 derives the set id from the Main packet body, so when this
-    /// holds the file lists above are exactly the ones the set id was made from (nobody added a
-    /// file to the set afterwards).
+    /// `MD5(body) == set_id`: `PAR2` derives the set id from the Main packet body, so when this
+    /// holds the `recovery_set` and `non_recovery_set` lists are exactly the ones the set id was
+    /// made from (nobody added a file to the set afterwards).
     pub body_hashes_to_set_id: bool,
 }
 
@@ -543,11 +543,11 @@ fn shaped(length: u64) -> bool {
     length >= HEADER_LEN as u64 && length.is_multiple_of(4)
 }
 
-/// Decode a PAR2 name: UTF-8 (lossily) with control characters, ANSI escape sequences and
+/// Decode a PAR2 name: `UTF-8` (lossily) with control characters, ANSI escape sequences, and
 /// path components removed. An empty result becomes `"_"`.
 pub fn sanitize_name(raw: &[u8]) -> String {
     let s = String::from_utf8_lossy(trim_nul(raw));
-    // Drop ESC [ ... <final byte> sequences, then every other control character.
+    // Drop `ESC [ ... <final byte>` sequences, then every other control character.
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -762,7 +762,7 @@ pub fn inspect_par2_with(data: &[u8], verify: VerifyMode) -> Par2Inspection {
             break;
         };
         if !shaped(length) {
-            // Corrupt header: resynchronise after the magic.
+            // Corrupt header: resynchronize after the magic.
             pos = off.saturating_add(8);
             continue;
         }
@@ -878,7 +878,7 @@ pub fn inspect_par2_with(data: &[u8], verify: VerifyMode) -> Par2Inspection {
                     });
                 }
                 PacketKind::CommUni => {
-                    // 16 bytes: MD5 of the ASCII comment packet, then UTF-16LE text.
+                    // 16 bytes: `MD5` of the ASCII comment packet, then UTF-16LE text.
                     let text_bytes = body.get(16..).unwrap_or(&[]);
                     let units: Vec<u16> = text_bytes
                         .as_chunks::<2>()

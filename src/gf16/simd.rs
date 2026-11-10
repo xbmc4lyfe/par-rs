@@ -1,4 +1,4 @@
-//! SIMD multiply-accumulate kernels for GF(2^16) regions.
+//! SIMD kernels that multiply and accumulate GF(2^16) regions.
 //!
 //! # Layouts
 //!
@@ -660,7 +660,7 @@ unsafe fn simd_group_dyn<S: Simd>(dsts: &mut [PlaneMut], src: Plane, tables: &[S
 }
 
 // ---------------------------------------------------------------------------------------------
-// AArch64 NEON
+// `AArch64 NEON`
 // ---------------------------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
@@ -733,7 +733,7 @@ mod arch {
         let vec_end = n - n % 16;
         let mut i = 0;
         while i < vec_end {
-            // SAFETY: bounds as above.
+            // SAFETY: 16 bytes per plane and 32 destination bytes are in bounds.
             unsafe {
                 let a = vld1q_u8(lo.as_ptr().add(i));
                 let b = vld1q_u8(hi.as_ptr().add(i));
@@ -746,7 +746,7 @@ mod arch {
 }
 
 // ---------------------------------------------------------------------------------------------
-// x86_64 SSSE3 / AVX2 / AVX-512BW
+// `x86_64 SSSE3 / AVX2 / AVX-512BW`
 // ---------------------------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -920,7 +920,7 @@ mod arch {
         let vec_end = n - n % 16;
         let mut i = 0;
         while i < vec_end {
-            // SAFETY: bounds as above.
+            // SAFETY: 16 bytes per plane and 32 destination bytes are in bounds.
             unsafe {
                 let a = _mm_loadu_si128(lo.as_ptr().add(i) as *const __m128i);
                 let b = _mm_loadu_si128(hi.as_ptr().add(i) as *const __m128i);
@@ -975,7 +975,7 @@ mod arch {
         let vec_end = n - n % 32;
         let mut i = 0;
         while i < vec_end {
-            // SAFETY: bounds as above.
+            // SAFETY: 32 bytes per plane and 64 destination bytes are in bounds.
             unsafe {
                 // Reorder qwords (0,2,1,3) so that each 128-bit lane holds consecutive words.
                 let a = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_loadu_si256(

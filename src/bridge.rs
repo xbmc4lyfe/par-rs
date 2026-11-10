@@ -4,12 +4,12 @@
 //! every real name, size, MD5 and (via IFSC) CRC-32. [`Par2Bridge`] maps candidates to files
 //! in four passes, each only applied where the previous one left ambiguity:
 //!
-//! 1. **size chain** — a size that occurs exactly once on both sides is a match;
-//! 2. **16 KiB MD5** — ties by size are broken with the MD5 of the candidate's first 16 KiB
+//! 1. **size chain**—a size that occurs exactly once on both sides is a match;
+//! 2. **16 KiB MD5**—ties by size are broken with the MD5 of the candidate's first 16 KiB
 //!    (available from article 1 alone);
-//! 3. **CRC-32** — the candidate's whole-file CRC (folded from its yEnc part CRCs, see
+//! 3. **CRC-32**—the candidate's whole-file CRC (folded from its yEnc part CRCs, see
 //!    [`crate::gf2::fold_yenc_parts`]) against the IFSC-folded CRC of each file;
-//! 4. **RAR5 volume number** — for same-size `.partNN.rar` volumes, the volume number stored in
+//! 4. **RAR5 volume number**—for same-size `.partNN.rar` volumes, the volume number stored in
 //!    the RAR5 main archive header of the candidate's first bytes picks the part.
 
 use crate::par2::{Inventory, Par2File};
@@ -168,7 +168,7 @@ impl Par2Bridge {
                     Self::bind(&mut cand_done, &mut file_taken, c, *f, ResolveMethod::Crc32);
                 }
             }
-            // Pass 4: RAR5 volume numbers among the remaining same-size files.
+            // Pass 4: `RAR5` volume numbers among the remaining same-size files.
             let remaining_files: Vec<(usize, u64)> = files
                 .iter()
                 .copied()
@@ -257,7 +257,7 @@ pub fn rar_part_number(name: &str) -> Option<u64> {
         }
         return Some(0);
     }
-    // name.r00, name.r01, ...
+    // Names such as `name.r00` and `name.r01`.
     let (_, ext) = lower.rsplit_once('.')?;
     let digits = ext.strip_prefix('r')?;
     if digits.len() == 2 && digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -289,7 +289,7 @@ pub fn rar5_volume_number(head: &[u8]) -> Option<u64> {
     if head.get(..8)? != RAR5_SIGNATURE {
         return None;
     }
-    // Header: CRC32(4), header size(vint), type(vint), flags(vint), [extra size], [data size], archive flags(vint), [volume number].
+    // Header: `CRC32(4)`, header size(vint), type(vint), flags(vint), [extra size], [data size], archive flags(vint), [volume number].
     let mut off = 12usize;
     let (header_size, n) = rar5_vint(head, off)?;
     off = off.checked_add(n)?;

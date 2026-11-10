@@ -44,7 +44,7 @@ fn opts(ss: usize) -> SetOptions {
 
 #[test]
 fn bridge_resolves_obfuscated_rar_set() {
-    // Four same-size RAR volumes with RAR5 headers, a smaller last volume and an nfo.
+    // Four same-size RAR volumes with RAR5 headers, a smaller last volume, and an nfo.
     let v1 = rar5(None, &data(50_000 - 20, 1));
     let v2 = rar5(Some(1), &data(50_000 - 21, 2));
     let v3 = rar5(Some(2), &data(50_000 - 21, 3));
