@@ -85,7 +85,7 @@ def prepare(scenario, stem, slice_size, volumes):
         subprocess.run(["/bin/cp", "-c", parity, WORK / parity.name], check=True)
     return touched
 
-def measure(command, log_path):
+def measure(command, log_path, sample_interval=0.05):
     usage = Usage()
     samples = []
     peak_rss_sample = (0, 0.0)
@@ -104,7 +104,7 @@ def measure(command, log_path):
             if pid:
                 child.returncode = os.waitstatus_to_exitcode(status)
                 break
-            time.sleep(0.05)
+            time.sleep(sample_interval)
     return dict(returncode=child.returncode, wall_s=time.monotonic() - start,
                 cpu_s=result.ru_utime + result.ru_stime, user_s=result.ru_utime,
                 system_s=result.ru_stime, rss_bytes=result.ru_maxrss,

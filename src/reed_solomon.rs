@@ -628,7 +628,8 @@ impl<'a> Engine<'a> {
         // (readers + 1) and the one being processed.
         let readers = self.config.reader_threads(self.config.threads()) as u64;
         let denom = k * (1 + post) + (2 * readers + 2) * b;
-        let mut chunk = (mem / denom).min(self.slice_size);
+        // Small chunks keep the reader pipeline and output working set cache-friendly.
+        let mut chunk = (mem / denom).min(self.slice_size).min(256 << 10);
         chunk = chunk / 4096 * 4096;
         if chunk == 0 {
             chunk = self.slice_size.min(4096);

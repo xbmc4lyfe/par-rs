@@ -56,7 +56,7 @@ fn large_slices_use_bounded_buffers() {
     let hash_allocation = LARGEST.load(Ordering::Relaxed);
     std::fs::remove_file(&path).unwrap();
     assert!(
-        hash_allocation <= 32 << 20,
+        hash_allocation <= 1 << 20,
         "hash allocation {hash_allocation}"
     );
 
@@ -123,13 +123,14 @@ fn large_slices_use_bounded_buffers() {
     .unwrap();
     assert_eq!(report.found.len(), 1);
     assert_eq!(report.file_hashes.unwrap().md5_full, expected.1);
-    assert!(PEAK.load(Ordering::Relaxed) - baseline <= 10 << 20);
+    assert!(PEAK.load(Ordering::Relaxed) - baseline <= 1 << 20);
     let scan_allocation = LARGEST.load(Ordering::Relaxed);
     assert!(
-        scan_allocation <= 8 << 20,
+        scan_allocation <= 1 << 20,
         "scan allocation {scan_allocation}"
     );
     many_files_release_descriptors();
+    verification_obeys_small_budget_with_many_workers();
 }
 
 fn many_files_release_descriptors() {
@@ -167,5 +168,107 @@ fn many_files_release_descriptors() {
         );
     }
     assert!(peak_fds < 32, "open descriptors {peak_fds}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn verification_obeys_small_budget_with_many_workers() {
+    use par_rs::create::{CreateOptions, SourceFile, create};
+    use par_rs::{NullObserver, Par2Repairer, RepairOptions};
+    let dir = std::env::temp_dir().join(format!("par-rs-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut data = vec![0x5a; 1 << 20];
+    let sources: Vec<_> = (1..=64)
+        .map(|i| {
+            let path = dir.join(format!("part{i}.bin"));
+            data[0] = i;
+            std::fs::write(&path, &data).unwrap();
+            SourceFile::new(path)
+        })
+        .collect();
+    let options = CreateOptions {
+        recovery_blocks: 10,
+        ..CreateOptions::default()
+    };
+    create(&sources, &dir, "set", &options, None, &mut |_, _, _| {}).unwrap();
+    let mut repairer = Par2Repairer::new(
+        &dir,
+        RepairOptions {
+            num_threads: 64,
+            mem_limit_bytes: 16 << 20,
+            full_file_md5: true,
+            ..RepairOptions::default()
+        },
+    );
+    repairer.load_par2_set(&dir.join("set.par2")).unwrap();
+    repairer.finalize().unwrap();
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+    assert!(
+        repairer
+            .verify(None, &mut NullObserver)
+            .unwrap()
+            .all_complete
+    );
+    let allocated = PEAK.load(Ordering::Relaxed) - baseline;
+    assert!(allocated < 12 << 20, "verification allocated {allocated}");
+
+    data[0] = 0;
+    for source in &sources {
+        std::fs::write(&source.path, &data).unwrap();
+    }
+    let mut repairer = Par2Repairer::new(
+        &dir,
+        RepairOptions {
+            num_threads: 64,
+            mem_limit_bytes: 16 << 20,
+            full_file_md5: true,
+            ..RepairOptions::default()
+        },
+    );
+    repairer.load_par2_set(&dir.join("set.par2")).unwrap();
+    repairer.finalize().unwrap();
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+    let result = repairer.verify(None, &mut NullObserver).unwrap();
+    assert_eq!(result.missing_blocks, 64);
+    let allocated = PEAK.load(Ordering::Relaxed) - baseline;
+    assert!(allocated < 12 << 20, "damaged scan allocated {allocated}");
+
+    for (i, source) in sources.iter().enumerate() {
+        if i < 8 {
+            std::fs::remove_file(&source.path).unwrap();
+        } else {
+            data[0] = (i + 1) as u8;
+            std::fs::write(&source.path, &data).unwrap();
+        }
+    }
+    let mut repairer = Par2Repairer::new(
+        &dir,
+        RepairOptions {
+            num_threads: 10,
+            ..RepairOptions::default()
+        },
+    );
+    repairer.load_par2_set(&dir.join("set.par2")).unwrap();
+    repairer.finalize().unwrap();
+    assert_eq!(
+        repairer
+            .verify(None, &mut NullObserver)
+            .unwrap()
+            .missing_blocks,
+        8
+    );
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+    repairer.repair(&mut NullObserver).unwrap();
+    let allocated = PEAK.load(Ordering::Relaxed) - baseline;
+    assert!(
+        allocated < 48 << 20,
+        "repair pipeline allocated {allocated}"
+    );
+    for (i, source) in sources.iter().take(8).enumerate() {
+        data[0] = (i + 1) as u8;
+        assert_eq!(std::fs::read(&source.path).unwrap(), data);
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }

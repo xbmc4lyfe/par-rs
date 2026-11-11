@@ -24,7 +24,9 @@ use crate::damage::{self, DownloadStatus, QuickVerdict, Segment};
 use crate::gf16::input_constant_logs;
 use crate::gf16::simd::Kernel;
 use crate::packet::{FileId, PacketSet, RecoverySliceRef, ScanOptions, SetId, read_exact_at};
-use crate::parhash::{HashRange, file_hashes_parallel, hash_ranges_parallel, slice_ranges};
+use crate::parhash::{
+    HashRange, file_hashes_parallel, hash_ranges_parallel_with_budget, slice_ranges,
+};
 use crate::reed_solomon::{
     Engine, EngineConfig, InputKind, InputReader, InputSpec, OutputSink, RsError, plan_recovery,
 };
@@ -55,7 +57,8 @@ pub enum BackupPolicy {
 pub struct RepairOptions {
     /// Worker threads for the Reed-Solomon engine (0 = all cores).
     pub num_threads: usize,
-    /// Memory budget for engine buffers (minimum 16 MiB).
+    /// Buffer budget per verification or repair phase (minimum 16 MiB).
+    /// Metadata, matrices, thread stacks, and allocator overhead are additional.
     pub mem_limit_bytes: u64,
     /// Handling of damaged originals.
     pub backup: BackupPolicy,
@@ -904,10 +907,11 @@ impl Par2Repairer {
                 None => expected.push(None),
             }
         }
-        let digests = hash_ranges_parallel(
+        let digests = hash_ranges_parallel_with_budget(
             &paths,
             &ranges,
             self.options.num_threads,
+            self.verification_memory(),
             Some(&self.cancel),
             &mut |_| {},
         )
@@ -1147,10 +1151,11 @@ impl Par2Repairer {
                 ranges.extend(slice_ranges(k, size, ss, self.files[fi].block_count as u64));
             }
             let total_bytes = sizes.iter().sum::<u64>().max(1);
-            let results = hash_ranges_parallel(
+            let results = hash_ranges_parallel_with_budget(
                 &paths,
                 &ranges,
                 self.options.num_threads,
+                self.verification_memory(),
                 Some(&self.cancel),
                 &mut |done| {
                     observer.progress(
@@ -1162,7 +1167,7 @@ impl Par2Repairer {
             .map_err(hash_err)?;
             let full = if self.options.full_file_md5 {
                 Some(
-                    file_hashes_parallel(&paths, self.options.num_threads, Some(&self.cancel))
+                    file_hashes_parallel(&paths, self.file_hash_threads(), Some(&self.cancel))
                         .map_err(hash_err)?,
                 )
             } else {
@@ -1246,6 +1251,33 @@ impl Par2Repairer {
         Ok(self.verify_result())
     }
 
+    fn verification_memory(&self) -> u64 {
+        self.options
+            .mem_limit_bytes
+            .max(crate::reed_solomon::MIN_MEM_LIMIT)
+            .min(crate::parhash::WORKING_MEMORY_BYTES)
+    }
+
+    fn file_hash_threads(&self) -> usize {
+        let threads = crate::parhash::thread_count(self.options.num_threads);
+        (threads as u64).min(self.verification_memory() / crate::hasher::READ_CHUNK as u64) as usize
+    }
+
+    fn scan_resources(&self, files: usize) -> (usize, usize) {
+        // Allow for incoming, outgoing, and candidate buffers in every scanner.
+        let budget = self.verification_memory();
+        let threads = crate::parhash::thread_count(self.options.num_threads).clamp(1, files.max(1));
+        let threads =
+            (threads as u64).min(budget / (3 * crate::scanner::MIN_BUFFER) as u64) as usize;
+        let buffer = (budget / threads as u64 / 3)
+            .min(self.options.scan_buffer as u64)
+            .clamp(
+                crate::scanner::MIN_BUFFER as u64,
+                crate::scanner::MAX_BUFFER as u64,
+            ) as usize;
+        (threads, buffer)
+    }
+
     /// Scan several files (sliding window) on up to `num_threads` threads; `known` is the
     /// slice-level verdict of an earlier aligned pass. Reports come back in input order.
     fn scan_many(
@@ -1256,7 +1288,7 @@ impl Par2Repairer {
         let Some(index) = self.index.as_ref() else {
             return Err(RepairError::NotFinalized);
         };
-        let threads = crate::parhash::thread_count(self.options.num_threads).clamp(1, items.len());
+        let (threads, buffer_size) = self.scan_resources(items.len());
         let next = AtomicUsize::new(0);
         let cancel = &self.cancel;
         let results: Mutex<Vec<Option<io::Result<ScanReport>>>> =
@@ -1271,7 +1303,7 @@ impl Par2Repairer {
             // another source file, so its whole-file hash is not needed.
             let hash_file = !known.as_ref().is_some_and(|k| k.iter().any(|&b| b));
             let cfg = ScanConfig {
-                buffer_size: self.options.scan_buffer,
+                buffer_size,
                 known_aligned: known.as_deref(),
                 hash_file,
                 ..ScanConfig::default()
@@ -1357,7 +1389,7 @@ impl Par2Repairer {
         };
         let exp_entries = expected.and_then(|fi| self.checksums[fi].as_deref());
         let cfg = ScanConfig {
-            buffer_size: self.options.scan_buffer,
+            buffer_size: self.scan_resources(1).1,
             ..ScanConfig::default()
         };
         let cancel = self.cancel.clone();
@@ -2025,10 +2057,11 @@ impl Par2Repairer {
                 }
             }
             let total_bytes = sizes.iter().sum::<u64>().max(1);
-            let results = hash_ranges_parallel(
+            let results = hash_ranges_parallel_with_budget(
                 &paths,
                 &ranges,
                 self.options.num_threads,
+                self.verification_memory(),
                 Some(&self.cancel),
                 &mut |done| {
                     observer.progress(
@@ -2040,7 +2073,7 @@ impl Par2Repairer {
             .map_err(hash_err)?;
             let full_paths: Vec<&Path> = full_idx.iter().map(|&k| paths[k]).collect();
             let full =
-                file_hashes_parallel(&full_paths, self.options.num_threads, Some(&self.cancel))
+                file_hashes_parallel(&full_paths, self.file_hash_threads(), Some(&self.cancel))
                     .map_err(hash_err)?;
             let mut cursor = 0usize;
             for (k, &fi) in to_rebuild.iter().enumerate() {

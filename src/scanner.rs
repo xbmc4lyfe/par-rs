@@ -45,6 +45,8 @@ pub struct ChecksumEntry {
 }
 
 const EMPTY: u32 = u32::MAX;
+pub(crate) const MIN_BUFFER: usize = 64 << 10;
+pub(crate) const MAX_BUFFER: usize = 256 << 10;
 
 /// Hash index of every known slice CRC with an MD5 confirmation step.
 #[derive(Clone, Debug)]
@@ -214,7 +216,7 @@ impl ScanReport {
 pub struct ScanConfig<'a> {
     /// Only probe aligned offsets (no sliding); used for rename-only passes.
     pub aligned_only: bool,
-    /// Preferred read buffer size (bytes), clamped to 64 KiB through 8 MiB.
+    /// Preferred read buffer size (bytes), clamped to 64 KiB through 256 KiB.
     pub buffer_size: usize,
     /// Also compute the fused file hashes while scanning.
     pub hash_file: bool,
@@ -345,7 +347,9 @@ impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
     fn finish_hash(mut self) -> Option<FileHashes> {
         // Hash any trailing bytes never made resident (cannot happen when scan reaches EOF,
         // but cancellation may stop early).
-        if let Some(h) = &mut self.hasher {
+        if let Some(h) = &mut self.hasher
+            && self.hashed_to < self.file_len
+        {
             let mut pos = self.hashed_to;
             let mut tmp = vec![0u8; 1 << 20];
             while pos < self.file_len {
@@ -376,7 +380,7 @@ pub fn scan_source<S: PacketSource + ?Sized>(
     let ss = index.slice_size();
     let file_len = src.source_len();
     let mut report = ScanReport::default();
-    let cap = config.buffer_size.clamp(64 << 10, 8 << 20);
+    let cap = config.buffer_size.clamp(MIN_BUFFER, MAX_BUFFER);
     let mut win = Window::new(src, cap, config.hash_file);
     let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
 

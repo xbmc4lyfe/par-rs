@@ -323,7 +323,7 @@ mod sse2 {
     }
 }
 
-const INIT: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+pub(crate) const INIT: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
 
 /// One MD5 compression of `G` interleaved lane groups.
 #[inline(always)]
@@ -499,6 +499,65 @@ fn run<L: Lanes, const G: usize>(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
                         digest[4 * j..4 * j + 4].copy_from_slice(&s.to_words()[l].to_le_bytes());
                     }
                     out[batch[lane]] = digest;
+                }
+            }
+        }
+    }
+}
+
+/// Compress complete blocks into independently resumable message states.
+/// The caller supplies the MD5 padding in the final blocks.
+pub(crate) fn compress_blocks(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
+    assert_eq!(states.len(), blocks.len());
+    assert!(states.len() <= LANES);
+    assert!(blocks.iter().all(|b| b.len().is_multiple_of(64)));
+    #[cfg(target_arch = "aarch64")]
+    stream_dispatch::<neon::V>(states, blocks);
+    #[cfg(target_arch = "x86_64")]
+    stream_dispatch::<sse2::V>(states, blocks);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    stream_dispatch::<[u32; 4]>(states, blocks);
+}
+
+fn stream_dispatch<L: Lanes>(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
+    match states.len() {
+        0 => {}
+        1..=4 => stream_blocks::<L, 1>(states, blocks),
+        5..=8 => stream_blocks::<L, 2>(states, blocks),
+        _ => stream_blocks::<L, GROUPS>(states, blocks),
+    }
+}
+
+fn stream_blocks<L: Lanes, const G: usize>(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
+    let mut st = [[L::splat(0); 4]; G];
+    for (g, group) in st.iter_mut().enumerate() {
+        for (word, state) in group.iter_mut().enumerate() {
+            let lanes = std::array::from_fn(|lane| {
+                states.get(g * 4 + lane).map_or(INIT[word], |s| s[word])
+            });
+            *state = L::from_words(&lanes);
+        }
+    }
+    let count = blocks.iter().map(|b| b.len() / 64).max().unwrap_or(0);
+    let mut words = [[0u32; 16]; 4];
+    let mut messages = [[L::splat(0); 16]; G];
+    for block in 0..count {
+        for (g, message) in messages.iter_mut().enumerate() {
+            for (lane, words) in words.iter_mut().enumerate() {
+                block_words(
+                    blocks.get(g * 4 + lane).copied().unwrap_or(&[]),
+                    block,
+                    0,
+                    words,
+                );
+            }
+            *message = L::transpose(&words);
+        }
+        compress::<L, G>(&mut st, &messages);
+        for (lane, bytes) in blocks.iter().enumerate() {
+            if bytes.len() / 64 == block + 1 {
+                for (word, state) in st[lane / 4].iter().enumerate() {
+                    states[lane][word] = state.to_words()[lane % 4];
                 }
             }
         }
