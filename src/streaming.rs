@@ -1583,7 +1583,8 @@ pub struct SessionOptions {
     pub fold_queue_depth: usize,
     /// Threads for the Reed-Solomon solve.
     pub solve_threads: usize,
-    /// Memory budget for the solve.
+    /// Buffer budget for the solve and separate cap for recovery-matrix planning
+    /// (minimum 16 MiB each). Resident syndromes and reconstructed slices are additional.
     pub solve_mem_limit_bytes: u64,
     /// SIMD kernel.
     pub kernel: Kernel,
@@ -2713,6 +2714,10 @@ impl StreamingParSession {
             }
             return Ok(report);
         }
+        crate::repairer::check_recovery_matrix_memory(
+            k as u64,
+            self.inner.opts.solve_mem_limit_bytes,
+        )?;
         let plan = plan_recovery(
             &self.inner.logs,
             &present,
@@ -3334,6 +3339,45 @@ mod live_tests {
         assert_eq!(
             std::fs::read(fx.dir.join("part00.rar")).unwrap(),
             fx.files[0].1
+        );
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn early_cutover_rejects_oversized_matrix_before_target_creation() {
+        let fx = fixture("matrix_budget", &[1449 * 4], 4, 1449, VolumeScheme::Single);
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                solve_mem_limit_bytes: 16 << 20,
+                max_syndrome_slots: 1449,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(),
+            1449
+        );
+        let id = fid(&fx, "part00.rar");
+        assert!(matches!(
+            s.repair_available_targets_now(&[id]),
+            Err(RepairError::RecoveryMemoryLimit {
+                missing_blocks: 1449,
+                ..
+            })
+        ));
+        assert!(!fx.dir.join("part00.rar").exists());
+        // A refused solve leaves the ready syndromes available for another attempt.
+        assert_eq!(s.status().ready_recovery, 1449);
+        assert!(
+            s.inner
+                .slots
+                .read()
+                .unwrap()
+                .iter()
+                .all(|slot| slot.lock().unwrap().data.len() == 4)
         );
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }

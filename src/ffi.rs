@@ -44,6 +44,8 @@ pub enum NzbParStatus {
     RepairNotNeeded = 11,
     /// Internal panic.
     Panic = 12,
+    /// Recovery-matrix planning exceeds the configured memory cap.
+    RecoveryMemoryLimit = 13,
 }
 
 impl From<&RepairError> for NzbParStatus {
@@ -54,6 +56,7 @@ impl From<&RepairError> for NzbParStatus {
             RepairError::NotFinalized => NzbParStatus::NotFinalized,
             RepairError::WrongSet { .. } => NzbParStatus::WrongSet,
             RepairError::NotEnoughRecovery { .. } => NzbParStatus::NotEnoughRecovery,
+            RepairError::RecoveryMemoryLimit { .. } => NzbParStatus::RecoveryMemoryLimit,
             RepairError::Singular => NzbParStatus::Singular,
             RepairError::VerificationFailed { .. } => NzbParStatus::VerificationFailed,
             RepairError::Io { .. } => NzbParStatus::Io,

@@ -58,7 +58,8 @@ pub struct RepairOptions {
     /// Worker threads for the Reed-Solomon engine (0 = all cores).
     pub num_threads: usize,
     /// Buffer budget per verification or repair phase (minimum 16 MiB).
-    /// Metadata, matrices, thread stacks, and allocator overhead are additional.
+    /// Recovery-matrix planning has a separate cap of the same size. Metadata,
+    /// retained inverse matrices, thread stacks, and allocator overhead are additional.
     pub mem_limit_bytes: u64,
     /// Handling of damaged originals.
     pub backup: BackupPolicy,
@@ -330,6 +331,15 @@ pub enum RepairError {
         /// Recovery blocks available.
         available: u64,
     },
+    /// Recovery-matrix planning would exceed its memory cap.
+    RecoveryMemoryLimit {
+        /// Number of missing slices used to size the matrices.
+        missing_blocks: u64,
+        /// Peak matrix bytes needed during inversion.
+        required_bytes: u64,
+        /// Effective matrix cap, including the minimum budget.
+        limit_bytes: u64,
+    },
     /// Recovery matrix singular even after trying all recovery slices.
     Singular,
     /// Repaired files failed verification.
@@ -375,6 +385,14 @@ impl fmt::Display for RepairError {
                     "not enough recovery blocks: {needed} needed, {available} available"
                 )
             }
+            RepairError::RecoveryMemoryLimit {
+                missing_blocks,
+                required_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "recovery matrix memory limit exceeded: {missing_blocks} missing blocks need {required_bytes} bytes, limit is {limit_bytes} bytes"
+            ),
             RepairError::Singular => f.write_str("recovery matrix is singular"),
             RepairError::VerificationFailed { files } => write!(
                 f,
@@ -411,6 +429,25 @@ pub(crate) fn io_ctx(context: impl Into<String>) -> impl FnOnce(io::Error) -> Re
         context: context.into(),
         source,
     }
+}
+
+/// Bound the simultaneously live input, augmented, and inverse matrices (8*k*k bytes).
+pub(crate) fn check_recovery_matrix_memory(
+    missing_blocks: u64,
+    budget: u64,
+) -> Result<(), RepairError> {
+    let limit_bytes = budget.max(crate::reed_solomon::MIN_MEM_LIMIT);
+    let required = missing_blocks
+        .checked_mul(missing_blocks)
+        .and_then(|n| n.checked_mul(8));
+    if required.is_none_or(|bytes| bytes > limit_bytes) {
+        return Err(RepairError::RecoveryMemoryLimit {
+            missing_blocks,
+            required_bytes: required.unwrap_or(u64::MAX),
+            limit_bytes,
+        });
+    }
+    Ok(())
 }
 
 /// Outcome of [`Par2Repairer::verify`].
@@ -800,6 +837,10 @@ impl Par2Repairer {
         let mut usable: BTreeMap<u32, RecoverySliceRef> = self.packets.recovery.clone();
         if let Some(a) = allowed {
             usable.retain(|e, _| a.contains(e));
+        }
+        let missing = present.iter().filter(|&&available| !available).count() as u64;
+        if usable.len() as u64 >= missing {
+            check_recovery_matrix_memory(missing, self.options.mem_limit_bytes)?;
         }
         let mut verified_ok: HashSet<u32> = HashSet::new();
         loop {
@@ -1694,6 +1735,8 @@ impl Par2Repairer {
                 available: recovery_total,
             });
         }
+        // Reject before backups, renames, or target creation change the filesystem.
+        check_recovery_matrix_memory(missing_total, self.options.mem_limit_bytes)?;
         observer.stage(Stage::Repairing);
         let t_start = std::time::Instant::now();
         let lap = |observer: &mut dyn RepairObserver, what: &str| {
@@ -2894,6 +2937,62 @@ mod tests {
             }
         ));
         check_all(&fx);
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_matrix_memory_boundaries() {
+        for (missing, budget) in [(0, 0), (160, 0), (1448, 0), (5792, 256 << 20)] {
+            check_recovery_matrix_memory(missing, budget).unwrap();
+        }
+        for (missing, budget) in [(1449, 0), (5793, 256 << 20), (u64::MAX, u64::MAX)] {
+            assert!(matches!(
+                check_recovery_matrix_memory(missing, budget),
+                Err(RepairError::RecoveryMemoryLimit { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn oversized_recovery_matrix_rejected_before_file_changes() {
+        let fx = fixture("matrix_budget", &[1448 * 4, 4], 4, 1449);
+        let missing = fx.dir.join("file0.bin");
+        let damaged = fx.dir.join("file1.bin");
+        std::fs::remove_file(&missing).unwrap();
+        std::fs::write(&damaged, [0u8; 4]).unwrap();
+        let mut r = repairer(&fx);
+        r.options.mem_limit_bytes = 16 << 20;
+        assert_eq!(
+            r.verify(None, &mut NullObserver).unwrap().missing_blocks,
+            1449
+        );
+        // Stop an unguarded implementation before it attempts the expensive inversion.
+        struct StopAtRepair(Arc<AtomicBool>);
+        impl RepairObserver for StopAtRepair {
+            fn stage(&mut self, stage: Stage) {
+                if stage == Stage::Repairing {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        let error = r.repair(&mut StopAtRepair(r.cancel_token())).unwrap_err();
+        assert!(matches!(
+            error,
+            RepairError::RecoveryMemoryLimit {
+                missing_blocks: 1449,
+                required_bytes: 16_796_808,
+                limit_bytes: 16_777_216
+            }
+        ));
+        assert!(!r.cancel.load(Ordering::Relaxed));
+        let logs = input_constant_logs(1449).unwrap();
+        assert!(matches!(
+            r.plan_with_verified_recovery(&logs, &vec![false; 1449], None, &mut NullObserver),
+            Err(RepairError::RecoveryMemoryLimit { .. })
+        ));
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read(&damaged).unwrap(), [0u8; 4]);
+        assert!(!fx.dir.join("file1.bin.1").exists());
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
 

@@ -73,6 +73,11 @@ the missing 500 MiB file in 258.3 seconds with 24.4 MiB peak RAM.
 Methodology, damage layouts, resource limits, earlier measurements, and
 reproduction commands are in [PERFORMANCE.md](PERFORMANCE.md).
 
+Oversized recovery matrices now fail with a memory-limit error before disk
+repair changes files. The cap depends on missing slices, not total archive size.
+See [resource limits](PERFORMANCE.md#recovery-matrix-limit) for the budget,
+streaming API limits, and memory outside the repair buffers.
+
 ### Streaming buffers with 1 MiB slices
 
 On 10 × 100 MiB files, with a 256 MiB budget and ten requested compute threads,
