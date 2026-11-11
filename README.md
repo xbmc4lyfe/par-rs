@@ -78,6 +78,14 @@ repair changes files. The cap depends on missing slices, not total archive size.
 See [resource limits](PERFORMANCE.md#recovery-matrix-limit) for the budget,
 streaming API limits, and memory outside the repair buffers.
 
+Download-time `StreamingParSession` now caps resident syndromes and working
+buffers by bytes, rejects oversized slices before allocation, and avoids cloning
+syndromes during early repair. See [streaming memory limits](PERFORMANCE.md#download-time-streaming-memory)
+for defaults, concurrency limits, and the separate disk-repair path. A 16 MiB
+article allocation probe reduced additional live heap from 17 MiB to 2 MiB;
+four concurrent callers used 4 MiB versus 7 MiB before the fix. These are heap
+measurements, separate from the disk-repair RSS figures.
+
 ### Streaming buffers with 1 MiB slices
 
 On 10 × 100 MiB files, with a 256 MiB budget and ten requested compute threads,

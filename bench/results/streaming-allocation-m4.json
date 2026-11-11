@@ -1,0 +1,47 @@
+{
+  "baseline_commit": "3128796",
+  "implementation_source_sha256": {
+    "src/streaming.rs": "deed903d25c49544335cc3c8b9ef96fdfc9ef1e857696bd919044beeedcf7832",
+    "src/repairer.rs": "bf76c1d413a01326f95c04e20d4d5b6cb6b774211c3827867aca09e549730b45",
+    "src/ffi.rs": "20bbabcf60b84ee0d746bb90e82714fb97c7ff10d83578e2adef87a731f83c17",
+    "tests/resource_bounds.rs": "4f9b60e0d9d2ca6f0c30b6736c8b932e5e75023f1de8a529cd5cb27f4a0cbbd7"
+  },
+  "host": "Apple M4, 32 GiB RAM, macOS",
+  "method": "One GlobalAlloc profiling run per implementation, Rust test profile. Additional live requested heap above pre-call baseline; not RSS or throughput. Input article and resident syndrome buffers are already allocated at baseline. Concurrent scheduling can change peak overlap.",
+  "fixture": {
+    "article_bytes": 16777216,
+    "slice_bytes": 1048576,
+    "resident_slots": 2,
+    "staging_cap_bytes": 1048576,
+    "working_cap_bytes_current": 4194304,
+    "requested_folder_threads": 4,
+    "requested_queue_depth": 64,
+    "baseline_note": "Baseline predates byte caps; max_syndrome_slots=2 and max_staging_bytes=1MiB set explicitly. Current working cap limits effective folder concurrency."
+  },
+  "runs": [
+    {
+      "implementation": "baseline",
+      "scenario": "bulk-article",
+      "additional_peak_heap_bytes": 17827522,
+      "correct": true
+    },
+    {
+      "implementation": "baseline",
+      "scenario": "four-callers",
+      "additional_peak_heap_bytes": 7342311,
+      "correct": true
+    },
+    {
+      "implementation": "current",
+      "scenario": "bulk-article",
+      "additional_peak_heap_bytes": 2099695,
+      "correct": true
+    },
+    {
+      "implementation": "current",
+      "scenario": "four-callers",
+      "additional_peak_heap_bytes": 4196407,
+      "correct": true
+    }
+  ]
+}
