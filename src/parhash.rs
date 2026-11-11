@@ -6,10 +6,11 @@
 //! slices is hashed in lockstep lanes, and jobs are spread over all cores. The whole-file MD5
 //! chains (file description digests) cannot be split, so they run one file per thread.
 
-use crate::crc::crc32;
+use crate::crc::{Crc32, crc32};
 use crate::hasher::{FileHasher, FileHashes, READ_CHUNK};
 use crate::md5simd::{LANES, md5_many_into};
 use crate::packet::read_exact_at;
+use md5::{Digest, Md5};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
@@ -50,10 +51,15 @@ fn plan_jobs(ranges: &[HashRange]) -> Vec<std::ops::Range<usize>> {
     let mut start = 0usize;
     let mut bytes = 0u64;
     for (i, r) in ranges.iter().enumerate() {
-        bytes += r.pad_to.max(1);
+        if i > start && r.pad_to.max(1) > JOB_BYTES.saturating_sub(bytes) {
+            jobs.push(start..i);
+            start = i;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(r.pad_to.max(1));
         let count = i + 1 - start;
         let full = bytes >= JOB_BYTES
-            && (count.is_multiple_of(LANES) || r.pad_to.max(1) * LANES as u64 > JOB_BYTES);
+            && (count.is_multiple_of(LANES) || r.pad_to.max(1) > JOB_BYTES / LANES as u64);
         if full {
             jobs.push(start..i + 1);
             start = i + 1;
@@ -94,7 +100,7 @@ impl Pool<'_> {
 
     /// Run jobs until none are left; `on_job` is called after each job with the bytes done so far.
     fn work(&self, on_job: &mut dyn FnMut(u64)) {
-        let mut files: Vec<Option<File>> = (0..self.paths.len()).map(|_| None).collect();
+        let mut file: Option<(usize, File)> = None;
         let mut buf: Vec<u8> = Vec::new();
         let mut digests: Vec<[u8; 16]> = Vec::new();
         loop {
@@ -106,24 +112,70 @@ impl Pool<'_> {
                 return;
             };
             let rs = &self.ranges[job.clone()];
+            if rs[0].pad_to > JOB_BYTES {
+                let r = rs[0];
+                let result = (|| -> io::Result<(u32, [u8; 16])> {
+                    let f = if r.len > 0 {
+                        Some(File::open(self.paths[r.file])?)
+                    } else {
+                        None
+                    };
+                    buf.resize(READ_CHUNK, 0);
+                    let mut crc = Crc32::new();
+                    let mut md5 = Md5::new();
+                    let mut pos = 0;
+                    while pos < r.pad_to {
+                        if self.stopped() {
+                            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+                        }
+                        let n = (r.pad_to - pos).min(buf.len() as u64) as usize;
+                        let read = r.len.saturating_sub(pos).min(n as u64) as usize;
+                        if let Some(f) = &f
+                            && read > 0
+                        {
+                            read_exact_at(f, r.offset + pos, &mut buf[..read])?;
+                        }
+                        buf[read..n].fill(0);
+                        crc.update(&buf[..n]);
+                        md5.update(&buf[..n]);
+                        pos += n as u64;
+                    }
+                    Ok((crc.finish(), md5.finalize().into()))
+                })();
+                match result {
+                    Ok(digest) => {
+                        self.out.lock().unwrap_or_else(|p| p.into_inner())[job.start] = digest
+                    }
+                    Err(e) => {
+                        self.fail(e);
+                        return;
+                    }
+                }
+                let done = self.bytes_done.fetch_add(r.len, Ordering::Relaxed) + r.len;
+                on_job(done);
+                continue;
+            }
             let total: usize = rs.iter().map(|r| r.pad_to as usize).sum();
             buf.clear();
+            buf.reserve_exact(total);
             buf.resize(total, 0);
             let mut off = 0usize;
             let mut read_bytes = 0u64;
             for r in rs {
                 let n = r.len as usize;
                 if n > 0 {
-                    let f = match &files[r.file] {
-                        Some(f) => f,
-                        None => match File::open(self.paths[r.file]) {
-                            Ok(f) => files[r.file].insert(f),
+                    if file.as_ref().map(|(i, _)| *i) != Some(r.file) {
+                        // Close the previous file before opening another one.
+                        drop(file.take());
+                        match File::open(self.paths[r.file]) {
+                            Ok(f) => file = Some((r.file, f)),
                             Err(e) => {
                                 self.fail(e);
                                 return;
                             }
-                        },
-                    };
+                        }
+                    }
+                    let f = &file.as_ref().unwrap().1;
                     if let Err(e) = read_exact_at(f, r.offset, &mut buf[off..off + n]) {
                         self.fail(e);
                         return;
@@ -167,6 +219,15 @@ pub fn hash_ranges_parallel(
 ) -> io::Result<Vec<(u32, [u8; 16])>> {
     if ranges.is_empty() {
         return Ok(Vec::new());
+    }
+    if ranges
+        .iter()
+        .any(|r| r.file >= paths.len() || r.len > r.pad_to || r.offset.checked_add(r.len).is_none())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid hash range",
+        ));
     }
     let jobs = plan_jobs(ranges);
     let threads = thread_count(threads).clamp(1, jobs.len());

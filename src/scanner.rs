@@ -15,11 +15,12 @@
 //!    slices are found too.
 //!
 //! The scanner also produces the fused file hashes (CRC-32, MD5, 16k MD5) of the data it
-//! streams, so a verification pass reads every byte exactly once.
+//! streams. Bounded read buffers also support slices larger than available memory.
 
 use crate::crc::{self, INIT, WindowTable};
-use crate::hasher::{FileHasher, FileHashes, md5};
+use crate::hasher::{FileHasher, FileHashes};
 use crate::packet::PacketSource;
+use md5::{Digest, Md5};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -190,7 +191,7 @@ pub struct ScanReport {
     pub sliding_hits: u64,
     /// Bytes examined by the sliding window.
     pub slid_bytes: u64,
-    /// Fused hashes of the whole file.
+    /// Fused hashes of the whole file. Absent if cancellation leaves bytes unread.
     pub file_hashes: Option<FileHashes>,
     /// Whether the scan was cancelled.
     pub cancelled: bool,
@@ -213,7 +214,7 @@ impl ScanReport {
 pub struct ScanConfig<'a> {
     /// Only probe aligned offsets (no sliding); used for rename-only passes.
     pub aligned_only: bool,
-    /// Preferred buffer size (bytes). Raised automatically to hold at least one window.
+    /// Preferred read buffer size (bytes), clamped to 64 KiB through 8 MiB.
     pub buffer_size: usize,
     /// Also compute the fused file hashes while scanning.
     pub hash_file: bool,
@@ -239,6 +240,7 @@ struct Window<'a, S: PacketSource + ?Sized> {
     src: &'a S,
     file_len: u64,
     buf: Vec<u8>,
+    cap: usize,
     base: u64,
     len: usize,
     hasher: Option<FileHasher>,
@@ -250,7 +252,8 @@ impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
         Self {
             src,
             file_len: src.source_len(),
-            buf: vec![0u8; cap],
+            buf: Vec::new(),
+            cap,
             base: 0,
             len: 0,
             hasher: hash.then(FileHasher::new),
@@ -264,24 +267,10 @@ impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
         if pos >= self.base && end <= self.base + self.len as u64 {
             return Ok(());
         }
-        // Reload starting at `pos` (keep whatever overlaps to avoid re-reading it).
-        let keep_from = pos.max(self.base);
-        let keep_to = (self.base + self.len as u64).min(pos + self.buf.len() as u64);
-        let mut filled = 0usize;
-        if keep_from == pos && keep_to > keep_from {
-            let s = (keep_from - self.base) as usize;
-            let e = (keep_to - self.base) as usize;
-            self.buf.copy_within(s..e, 0);
-            filled = e - s;
-        }
+        self.buf.resize(self.cap, 0);
         self.base = pos;
-        let want = ((self.file_len - pos) as usize).min(self.buf.len());
-        if want > filled {
-            let (head, tail) = self.buf.split_at_mut(filled);
-            let _ = head;
-            self.src
-                .read_at(pos + filled as u64, &mut tail[..want - filled])?;
-        }
+        let want = (self.file_len - pos).min(self.buf.len() as u64) as usize;
+        self.src.read_at(pos, &mut self.buf[..want])?;
         self.len = want;
         if let Some(h) = &mut self.hasher {
             let abs_end = self.base + self.len as u64;
@@ -294,11 +283,58 @@ impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
         Ok(())
     }
 
-    /// Resident bytes `[pos, pos + n)`; caller guarantees residency.
-    #[inline]
-    fn bytes(&self, pos: u64, n: usize) -> &[u8] {
-        let s = (pos - self.base) as usize;
-        &self.buf[s..s + n]
+    /// Hash a padded slice using bounded reads.
+    fn checksums(
+        &mut self,
+        pos: u64,
+        size: u64,
+        want_digest: impl FnOnce(u32) -> bool,
+        cancel: Option<&AtomicBool>,
+    ) -> io::Result<Option<(u32, [u8; 16])>> {
+        let available = self.file_len.saturating_sub(pos).min(size);
+        let mut done = 0;
+        let mut raw = INIT;
+        let mut digest = Md5::new();
+        while done < available {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Ok(None);
+            }
+            self.ensure(pos + done, 1)?;
+            let start = (pos + done - self.base) as usize;
+            let n = (available - done).min((self.len - start) as u64) as usize;
+            let bytes = &self.buf[start..start + n];
+            raw = crc::update_raw(raw, bytes);
+            digest.update(bytes);
+            done += n as u64;
+        }
+        let mut padding = size - available;
+        raw = crc::crc32_shift_raw(raw, padding);
+        if !want_digest(raw ^ INIT) {
+            return Ok(Some((raw ^ INIT, [0; 16])));
+        }
+        let zeros = [0u8; 4096];
+        while padding > 0 {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Ok(None);
+            }
+            let n = padding.min(zeros.len() as u64) as usize;
+            digest.update(&zeros[..n]);
+            padding -= n as u64;
+        }
+        Ok(Some((raw ^ INIT, digest.finalize().into())))
+    }
+
+    /// Advance the fused file hash without repeating slice checksums.
+    fn hash_until(&mut self, end: u64, cancel: Option<&AtomicBool>) -> io::Result<bool> {
+        if self.hasher.is_some() {
+            while self.hashed_to < end.min(self.file_len) {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return Ok(false);
+                }
+                self.ensure(self.hashed_to, 1)?;
+            }
+        }
+        Ok(true)
     }
 
     #[inline]
@@ -338,14 +374,9 @@ pub fn scan_source<S: PacketSource + ?Sized>(
     progress: &mut dyn FnMut(u64),
 ) -> io::Result<ScanReport> {
     let ss = index.slice_size();
-    let ss_us = usize::try_from(ss)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "slice size too large"))?;
     let file_len = src.source_len();
     let mut report = ScanReport::default();
-    let cap = config
-        .buffer_size
-        .max(ss_us + (64 << 10))
-        .max(2 * ss_us.min(64 << 20));
+    let cap = config.buffer_size.clamp(64 << 10, 8 << 20);
     let mut win = Window::new(src, cap, config.hash_file);
     let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
 
@@ -354,31 +385,19 @@ pub fn scan_source<S: PacketSource + ?Sized>(
         return Ok(report);
     }
 
-    let mut scratch: Vec<u8> = Vec::new();
+    let mut outgoing = Window::new(src, cap, false);
+    let mut candidate = Window::new(src, cap, false);
     // Confirm candidates at `pos` whose CRC is `crc_final`; returns true if any matched.
     let confirm = |pos: u64,
                    crc_final: u32,
-                   win: &Window<'_, S>,
+                   digest: [u8; 16],
                    report: &mut ScanReport,
-                   scratch: &mut Vec<u8>,
                    aligned: bool|
      -> bool {
-        let mut digest: Option<[u8; 16]> = None;
         let mut any = false;
         for e in index.lookup(crc_final) {
             report.crc_hits += 1;
-            let d = *digest.get_or_insert_with(|| {
-                let avail = ((file_len - pos) as usize).min(ss_us);
-                if avail == ss_us {
-                    md5(win.bytes(pos, ss_us))
-                } else {
-                    scratch.clear();
-                    scratch.extend_from_slice(win.bytes(pos, avail));
-                    scratch.resize(ss_us, 0);
-                    md5(scratch)
-                }
-            });
-            if d == e.md5 {
+            if digest == e.md5 {
                 report.found.push(FoundBlock {
                     offset: pos,
                     block: e.block,
@@ -396,17 +415,6 @@ pub fn scan_source<S: PacketSource + ?Sized>(
             }
         }
         any
-    };
-
-    // Fresh CRC of the (zero padded) window at `pos`.
-    let window_crc_raw = |pos: u64, win: &Window<'_, S>| -> u32 {
-        let avail = ((file_len - pos) as usize).min(ss_us);
-        let raw = crc::update_raw(INIT, win.bytes(pos, avail));
-        if avail < ss_us {
-            crc::crc32_shift_raw(raw, (ss_us - avail) as u64)
-        } else {
-            raw
-        }
     };
 
     // ---- Aligned fast path against the expected file ------------------------------------
@@ -429,20 +437,12 @@ pub fn scan_source<S: PacketSource + ?Sized>(
                     report.cancelled = true;
                     break;
                 }
-                win.ensure(p, ss)?;
-                let crc = window_crc_raw(p, &win) ^ INIT;
-                let ok = crc == e.crc32 && {
-                    let avail = ((file_len - p) as usize).min(ss_us);
-                    let d = if avail == ss_us {
-                        md5(win.bytes(p, ss_us))
-                    } else {
-                        scratch.clear();
-                        scratch.extend_from_slice(win.bytes(p, avail));
-                        scratch.resize(ss_us, 0);
-                        md5(&scratch)
-                    };
-                    d == e.md5
+                let Some((crc, digest)) = win.checksums(p, ss, |crc| crc == e.crc32, cancel)?
+                else {
+                    report.cancelled = true;
+                    break;
                 };
+                let ok = crc == e.crc32 && digest == e.md5;
                 aligned_ok.push(ok);
                 if ok {
                     report.found.push(FoundBlock {
@@ -485,8 +485,11 @@ pub fn scan_source<S: PacketSource + ?Sized>(
             report.cancelled = true;
             break;
         }
-        win.ensure(pos, ss)?;
         if let Some(e) = reuse_aligned(pos) {
+            if !win.hash_until(pos.saturating_add(ss), cancel)? {
+                report.cancelled = true;
+                break;
+            }
             report.found.push(FoundBlock {
                 offset: pos,
                 block: e.block,
@@ -496,18 +499,16 @@ pub fn scan_source<S: PacketSource + ?Sized>(
             progress(pos.min(file_len));
             continue;
         }
-        let mut raw = window_crc_raw(pos, &win);
+        let Some((final_crc, digest)) =
+            win.checksums(pos, ss, |crc| index.lookup(crc).next().is_some(), cancel)?
+        else {
+            report.cancelled = true;
+            break;
+        };
+        let mut raw = final_crc ^ INIT;
         let aligned_here = pos.is_multiple_of(ss);
-        let final_crc = raw ^ INIT;
         if index.might_contain(final_crc)
-            && confirm(
-                pos,
-                final_crc,
-                &win,
-                &mut report,
-                &mut scratch,
-                aligned_here,
-            )
+            && confirm(pos, final_crc, digest, &mut report, aligned_here)
         {
             pos += ss;
             progress(pos.min(file_len));
@@ -523,23 +524,33 @@ pub fn scan_source<S: PacketSource + ?Sized>(
         let mut matched = false;
         while pos + 1 < file_len {
             let new_pos = pos + 1;
-            let new_end = new_pos + ss;
-            if new_end <= file_len {
-                // Need bytes up to new_end resident.
-                if new_end > win.base + win.len as u64 {
-                    win.ensure(pos, ss + 1)?;
+            let new_end = new_pos.saturating_add(ss);
+            if new_end <= file_len
+                && (new_end > win.base + win.len as u64 || new_end - 1 < win.base)
+            {
+                win.ensure(new_end - 1, 1)?;
+                if is_cancelled() {
+                    report.cancelled = true;
+                    break;
+                }
+            }
+            let old_byte = if pos >= win.base && pos < win.base + win.len as u64 {
+                win.byte(pos)
+            } else {
+                if pos < outgoing.base || pos >= outgoing.base + outgoing.len as u64 {
+                    outgoing.ensure(pos, 1)?;
                     if is_cancelled() {
                         report.cancelled = true;
                         break;
                     }
                 }
-            }
+                outgoing.byte(pos)
+            };
             let new_byte = if new_end <= file_len {
                 win.byte(new_end - 1)
             } else {
                 0
             };
-            let old_byte = win.byte(pos);
             raw = wt.slide_raw(raw, new_byte, old_byte);
             pos = new_pos;
             report.slid_bytes += 1;
@@ -548,16 +559,15 @@ pub fn scan_source<S: PacketSource + ?Sized>(
                 if pos.is_multiple_of(1024) {
                     progress(pos);
                 }
-                if confirm(
-                    pos,
-                    final_crc,
-                    &win,
-                    &mut report,
-                    &mut scratch,
-                    pos.is_multiple_of(ss),
-                ) {
-                    matched = true;
-                    break;
+                if index.lookup(final_crc).next().is_some() {
+                    let Some((_, digest)) = candidate.checksums(pos, ss, |_| true, cancel)? else {
+                        report.cancelled = true;
+                        break;
+                    };
+                    if confirm(pos, final_crc, digest, &mut report, pos.is_multiple_of(ss)) {
+                        matched = true;
+                        break;
+                    }
                 }
             }
         }
@@ -575,7 +585,9 @@ pub fn scan_source<S: PacketSource + ?Sized>(
     if !report.cancelled {
         report.bytes_scanned = file_len;
     }
-    report.file_hashes = win.finish_hash();
+    if !report.cancelled || win.hashed_to == file_len {
+        report.file_hashes = win.finish_hash();
+    }
     Ok(report)
 }
 
@@ -649,6 +661,117 @@ mod tests {
 
     fn no_progress() -> impl FnMut(u64) {
         |_| {}
+    }
+
+    #[test]
+    fn bounded_reads_find_shifted_large_slices_and_padded_tail() {
+        use std::cell::Cell;
+        struct Counted<'a> {
+            data: &'a [u8],
+            read: Cell<usize>,
+        }
+        impl PacketSource for Counted<'_> {
+            fn source_len(&self) -> u64 {
+                self.data.len() as u64
+            }
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+                assert!(buf.len() <= 64 << 10);
+                self.read.set(self.read.get() + buf.len());
+                self.data.read_at(offset, buf)
+            }
+        }
+        let ss = 2 << 20;
+        let data = rnd(ss * 2 + 12345, 85);
+        let es = entries(0, &data, ss);
+        let index = ChecksumIndex::new(ss as u64, es);
+        let mut shifted = rnd(65537, 82);
+        shifted.extend_from_slice(&data);
+        let source = Counted {
+            data: &shifted,
+            read: Cell::new(0),
+        };
+        let config = ScanConfig {
+            buffer_size: 64 << 10,
+            ..ScanConfig::default()
+        };
+        let report = scan_source(&source, &index, None, &config, None, &mut |_| {}).unwrap();
+        assert_eq!(report.found.len(), 3);
+        for (i, found) in report.found.iter().enumerate() {
+            assert_eq!(found.offset, (65537 + i * ss) as u64);
+            assert_eq!(found.block.block_index, i as u32);
+        }
+        assert_eq!(
+            report.file_hashes.unwrap().md5_full,
+            crate::hasher::md5(&shifted)
+        );
+        assert!(
+            source.read.get() <= shifted.len() * 4,
+            "bytes read {}",
+            source.read.get()
+        );
+    }
+
+    #[test]
+    fn huge_padding_rejects_crc_without_allocating_or_hashing_the_slice() {
+        let index = ChecksumIndex::new(
+            1 << 40,
+            vec![ChecksumEntry {
+                crc32: 1,
+                md5: [0; 16],
+                block: BlockRef {
+                    file_index: 0,
+                    block_index: 0,
+                },
+            }],
+        );
+        let report = scan_source(
+            &[0u8][..],
+            &index,
+            None,
+            &ScanConfig::default(),
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(report.found.is_empty());
+        assert_eq!(report.bytes_scanned, 1);
+    }
+
+    #[test]
+    fn cancellation_during_large_slice_read_stops_without_finishing_file_hash() {
+        struct Cancelling<'a> {
+            cancel: &'a AtomicBool,
+            reads: std::cell::Cell<usize>,
+        }
+        impl PacketSource for Cancelling<'_> {
+            fn source_len(&self) -> u64 {
+                100 << 20
+            }
+            fn read_at(&self, _: u64, buf: &mut [u8]) -> io::Result<()> {
+                self.reads.set(self.reads.get() + 1);
+                buf.fill(0);
+                self.cancel.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let cancel = AtomicBool::new(false);
+        let source = Cancelling {
+            cancel: &cancel,
+            reads: std::cell::Cell::new(0),
+        };
+        let index = ChecksumIndex::new(100 << 20, vec![]);
+        let report = scan_source(
+            &source,
+            &index,
+            None,
+            &ScanConfig::default(),
+            Some(&cancel),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(report.cancelled);
+        assert!(report.file_hashes.is_none());
+        assert_eq!(source.reads.get(), 1);
     }
 
     #[test]
