@@ -331,6 +331,15 @@ pub enum RepairError {
         /// Recovery blocks available.
         available: u64,
     },
+    /// A streaming slice cannot fit a configured byte cap.
+    StreamingMemoryLimit {
+        /// Buffer whose size exceeds the cap.
+        context: &'static str,
+        /// Required bytes.
+        required_bytes: u64,
+        /// Configured byte cap.
+        limit_bytes: u64,
+    },
     /// Recovery-matrix planning would exceed its memory cap.
     RecoveryMemoryLimit {
         /// Number of missing slices used to size the matrices.
@@ -385,6 +394,14 @@ impl fmt::Display for RepairError {
                     "not enough recovery blocks: {needed} needed, {available} available"
                 )
             }
+            RepairError::StreamingMemoryLimit {
+                context,
+                required_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "streaming memory limit exceeded for {context}: need {required_bytes} bytes, limit is {limit_bytes} bytes; use disk repair or configure a larger streaming budget"
+            ),
             RepairError::RecoveryMemoryLimit {
                 missing_blocks,
                 required_bytes,

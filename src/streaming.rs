@@ -45,7 +45,8 @@
 //! 3. **Mid-download volume repair**—Mode A splices donor/twin bytes into holes slice by slice
 //!    (works even when `D + U > R`); Mode B performs an early Reed-Solomon cutover computing only
 //!    the `A⁻¹` rows of the requested files once `D + U <= R`.
-//! 4. **Concurrency**—one bookkeeping mutex (never held during hashing or I/O), one mutex per
+//! 4. **Concurrency**—bounded admission for payload work, one bookkeeping mutex
+//!    (never held during hashing or I/O), one mutex per
 //!    syndrome slot (striped folding) and an optional bounded folder pool that never blocks the
 //!    article writers (full queue → inline fold).
 
@@ -1573,7 +1574,12 @@ pub struct LiveStatus {
 pub struct SessionOptions {
     /// Syndrome slots allocated up front (exponents from the loaded set or canonical `0..n`).
     pub preallocated_syndrome_slots: usize,
-    /// Hard cap on slots (memory = `slots × slice_size`).
+    /// Byte cap for resident syndrome payloads and reconstructed output payloads separately.
+    pub max_syndrome_bytes: u64,
+    /// Byte cap applied separately to staging, folding payloads, and per-call scratch.
+    /// Concurrent calls and queued jobs share bounded admission; metadata and engine buffers are additional.
+    pub max_working_bytes: u64,
+    /// Hard cap on slots, also limited by `max_syndrome_bytes / slice_size`.
     pub max_syndrome_slots: usize,
     /// Memory for in-RAM slice reassembly before falling back to reading the target file.
     pub max_staging_bytes: u64,
@@ -1594,6 +1600,8 @@ impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             preallocated_syndrome_slots: 32,
+            max_syndrome_bytes: 64 << 20,
+            max_working_bytes: 64 << 20,
             max_syndrome_slots: 512,
             max_staging_bytes: 256 << 20,
             fold_threads: 0,
@@ -1602,6 +1610,51 @@ impl Default for SessionOptions {
             solve_mem_limit_bytes: 256 << 20,
             kernel: Kernel::detect(),
         }
+    }
+}
+
+impl SessionOptions {
+    fn bounded(mut self, slice_size: u64) -> Result<Self, RepairError> {
+        if slice_size == 0 || !slice_size.is_multiple_of(4) || usize::try_from(slice_size).is_err()
+        {
+            return Err(io_ctx("streaming slice size")(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid slice size",
+            )));
+        }
+        let scratch = slice_size
+            .checked_mul(2)
+            .map(|bytes| bytes.max(crate::hasher::READ_CHUNK as u64))
+            .and_then(|bytes| bytes.checked_add(crate::packet::RESYNC_WINDOW as u64));
+        if scratch.is_none_or(|bytes| bytes > self.max_working_bytes) {
+            return Err(RepairError::StreamingMemoryLimit {
+                context: "slice scratch",
+                required_bytes: scratch.unwrap_or(u64::MAX),
+                limit_bytes: self.max_working_bytes,
+            });
+        }
+        if self.max_syndrome_slots > 0 && slice_size > self.max_syndrome_bytes {
+            return Err(RepairError::StreamingMemoryLimit {
+                context: "syndrome slice",
+                required_bytes: slice_size,
+                limit_bytes: self.max_syndrome_bytes,
+            });
+        }
+        let capacity = usize::try_from(self.max_syndrome_bytes / slice_size).unwrap_or(usize::MAX);
+        self.max_syndrome_slots = self.max_syndrome_slots.min(capacity);
+        self.preallocated_syndrome_slots = self
+            .preallocated_syndrome_slots
+            .min(self.max_syndrome_slots);
+        self.max_staging_bytes = self.max_staging_bytes.min(self.max_working_bytes);
+        // Bound every lane's queued and active jobs plus one payload per admitted
+        // producer. Arcs shared by lanes only reduce the actual live bytes.
+        let jobs = usize::try_from(self.max_working_bytes / slice_size).unwrap_or(usize::MAX);
+        let queue_jobs = jobs - jobs / 2;
+        self.fold_threads = self.fold_threads.min(queue_jobs / 2);
+        if let Some(per_lane) = queue_jobs.checked_div(self.fold_threads) {
+            self.fold_queue_depth = self.fold_queue_depth.max(1).min(per_lane - 1);
+        }
+        Ok(self)
     }
 }
 
@@ -1693,6 +1746,33 @@ struct SyndromeSlot {
 
 type SlotList = Arc<RwLock<Vec<Arc<Mutex<SyndromeSlot>>>>>;
 
+struct StagingCharges<'a> {
+    tracker: &'a Mutex<Tracker>,
+    bytes: u64,
+}
+
+impl Drop for StagingCharges<'_> {
+    fn drop(&mut self) {
+        self.tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .staging_bytes -= self.bytes;
+    }
+}
+
+struct TakenSyndromes {
+    slots: Vec<Arc<Mutex<SyndromeSlot>>>,
+    data: Vec<Vec<u8>>,
+}
+
+impl Drop for TakenSyndromes {
+    fn drop(&mut self) {
+        for (slot, data) in self.slots.iter().zip(self.data.drain(..)) {
+            slot.lock().unwrap_or_else(|e| e.into_inner()).data = data;
+        }
+    }
+}
+
 struct FoldJob {
     slice: usize,
     logbase: u16,
@@ -1724,6 +1804,9 @@ fn fold_lane(kernel: &Kernel, slots: &SlotList, job: &FoldJob, lane: usize, stri
 }
 
 struct SessionInner {
+    payload_gate: RwLock<()>,
+    active_payloads: Mutex<usize>,
+    payload_available: Condvar,
     opts: SessionOptions,
     set_id: SetId,
     slice_size: usize,
@@ -1736,6 +1819,38 @@ struct SessionInner {
     /// Slices folded (counter for statistics).
     folds: AtomicU64,
     inline_folds: AtomicUsize,
+}
+
+struct PayloadPermit<'a>(&'a SessionInner);
+
+impl Drop for PayloadPermit<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .0
+            .active_payloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *active -= 1;
+        self.0.payload_available.notify_one();
+    }
+}
+
+impl SessionInner {
+    fn admit_payload(&self) -> PayloadPermit<'_> {
+        let cap = self.opts.max_working_bytes / (2 * self.slice_size as u64);
+        let mut active = self
+            .active_payloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while *active as u64 >= cap {
+            active = self
+                .payload_available
+                .wait(active)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+        PayloadPermit(self)
+    }
 }
 
 /// Thread-safe repair-while-downloading session (`Send + Sync`; clone freely).
@@ -1765,6 +1880,7 @@ impl StreamingParSession {
                 missing_descriptions: missing,
             });
         }
+        let opts = opts.bounded(main.slice_size)?;
         let ss = main.slice_size as usize;
         let mut files = Vec::new();
         let mut file_index = HashMap::new();
@@ -1850,6 +1966,9 @@ impl StreamingParSession {
             FoldPool { txs, pending }
         });
         let inner = SessionInner {
+            payload_gate: RwLock::new(()),
+            active_payloads: Mutex::new(0),
+            payload_available: Condvar::new(),
             set_id: set.set_id.unwrap_or(SetId([0; 16])),
             slice_size: ss,
             tracker: Mutex::new(Tracker {
@@ -2145,6 +2264,12 @@ impl StreamingParSession {
         crc32: u32,
         bytes: Option<&[u8]>,
     ) -> Result<ArticleOutcome, RepairError> {
+        let _payload = self
+            .inner
+            .payload_gate
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let _permit = self.inner.admit_payload();
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
@@ -2155,6 +2280,10 @@ impl StreamingParSession {
         let end = (offset + size).min(f.length);
         let (b0, b1) = ((offset / ss) as usize, ((end - 1) / ss) as usize);
         // Phase 1 (locked): coverage, staging, ParQuick CRC bookkeeping; collect completed slices.
+        let mut completed_charges = StagingCharges {
+            tracker: &self.inner.tracker,
+            bytes: 0,
+        };
         let mut completed: Vec<(usize, Option<Vec<u8>>, Option<u32>)> = Vec::new();
         {
             let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -2200,10 +2329,11 @@ impl StreamingParSession {
                     // Complete: hand the bytes (if fully staged) to the unlocked phase.
                     let staged = match t.staging.remove(&g) {
                         Some(st) => {
-                            t.staging_bytes -= st.buf.len() as u64;
                             if range_covered(&normalize_ranges(&st.ranges), 0, slen as i64) {
+                                completed_charges.bytes += st.buf.len() as u64;
                                 Some(st.buf)
                             } else {
+                                t.staging_bytes -= st.buf.len() as u64;
                                 None
                             }
                         }
@@ -2251,6 +2381,19 @@ impl StreamingParSession {
         let mut damaged_any = false;
         for (g, staged, quick) in completed {
             let b = g - f.first_slice;
+            // A large article can supply whole slices without retaining copies of
+            // all of them in staging or rereading bytes that the caller supplied.
+            let staged = staged.or_else(|| {
+                let start = b as u64 * ss;
+                let stop = (start + ss).min(f.length);
+                if offset <= start && end >= stop {
+                    bytes.map(|data| {
+                        data[(start - offset) as usize..(stop - offset) as usize].to_vec()
+                    })
+                } else {
+                    None
+                }
+            });
             let verdict = self.verify_slice_bytes(fi, b, staged, quick)?;
             let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
             if t.states[g] == SliceState::VerifiedGood {
@@ -2287,7 +2430,7 @@ impl StreamingParSession {
 
     /// Verify slice `b` of file `fi`: `staged` bytes if available, otherwise read from the
     /// target file. `quick` is the pre-combined article CRC (ParQuick). Returns the slice data
-    /// (unpadded) when valid. Runs lock-free.
+    /// (unpadded) when valid. Does not hold the tracker lock.
     fn verify_slice_bytes(
         &self,
         fi: usize,
@@ -2324,8 +2467,8 @@ impl StreamingParSession {
             let (c, m) = slice_checksums(&data);
             c == entry.crc32 && m == entry.md5
         } else {
-            let mut padded = data.clone();
-            padded.resize(ss as usize, 0);
+            let mut padded = vec![0; ss as usize];
+            padded[..data.len()].copy_from_slice(&data);
             let (c, m) = slice_checksums(&padded);
             c == entry.crc32 && m == entry.md5
         };
@@ -2486,31 +2629,56 @@ impl StreamingParSession {
         path: &Path,
         queued_id: Option<u64>,
     ) -> Result<usize, RepairError> {
-        let mut set = PacketSet::for_set(self.inner.set_id);
-        set.load_file(path, 0, ScanOptions::FULL)
-            .map_err(io_ctx(format!("loading {}", path.display())))?;
+        let _payload = self
+            .inner
+            .payload_gate
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let src = FileSource::open(path).map_err(io_ctx(format!("opening {}", path.display())))?;
         let ss = self.inner.slice_size;
         let mut absorbed = 0usize;
         let mut need_backfill = false;
-        for (e, r) in &set.recovery {
-            if r.slice_size != ss as u64 {
+        // Keep every framed candidate until its hash is known. PacketSet would
+        // deduplicate exponents before a corrupt candidate can be rejected.
+        let mut packets = crate::packet::PacketIter::new(&src, ScanOptions::METADATA);
+        while let Some(raw) = packets.next() {
+            let raw = raw.map_err(io_ctx(format!("loading {}", path.display())))?;
+            if raw.header.kind() != crate::packet::PacketType::RecoverySlice {
                 continue;
             }
-            {
-                let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
-                if t.ready_exponents.contains(e) {
-                    continue;
-                }
+            if raw.header.set_id != self.inner.set_id {
+                packets
+                    .reject_frame(&raw)
+                    .map_err(io_ctx("resynchronizing recovery packets"))?;
+                continue;
             }
-            let mut data = vec![0u8; ss];
-            r.read_data(&src, 0, &mut data)
-                .map_err(io_ctx("reading recovery slice"))?;
-            // Split layout for XOR into the slot.
-            let mut split = vec![0u8; ss];
-            {
-                let (lo, hi) = split.split_at_mut(ss / 2);
-                self.inner.opts.kernel.deinterleave(&data, lo, hi);
+            let Ok(r) = crate::packet::RecoverySliceRef::from_raw(&src, &raw, 0)
+                .map_err(io_ctx("reading recovery packet"))?
+            else {
+                packets
+                    .reject_frame(&raw)
+                    .map_err(io_ctx("resynchronizing recovery packets"))?;
+                continue;
+            };
+            let e = &r.exponent;
+            if r.slice_size != ss as u64 {
+                packets
+                    .reject_frame(&raw)
+                    .map_err(io_ctx("resynchronizing recovery packets"))?;
+                continue;
+            }
+            let ready = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ready_exponents
+                .contains(e);
+            if ready {
+                packets
+                    .reject_frame(&raw)
+                    .map_err(io_ctx("resynchronizing recovery packets"))?;
+                continue;
             }
             let slot = {
                 let list = self.inner.slots.read().unwrap_or_else(|e| e.into_inner());
@@ -2518,13 +2686,32 @@ impl StreamingParSession {
                     .find(|s| s.lock().unwrap_or_else(|e| e.into_inner()).exponent == *e)
                     .cloned()
             };
+            if slot.is_none()
+                && self
+                    .inner
+                    .slots
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len()
+                    >= self.inner.opts.max_syndrome_slots
+            {
+                packets
+                    .reject_frame(&raw)
+                    .map_err(io_ctx("resynchronizing recovery packets"))?;
+                continue;
+            }
+            // Hash only admitted payloads, and do not spend a slot on corrupt parity.
+            if !r.verify(&src).map_err(io_ctx("verifying recovery slice"))? {
+                packets
+                    .reject_frame(&raw)
+                    .map_err(io_ctx("resynchronizing recovery packets"))?;
+                continue;
+            }
             let slot = match slot {
                 Some(s) => s,
                 None => {
                     let mut list = self.inner.slots.write().unwrap_or_else(|e| e.into_inner());
-                    if list.len() >= self.inner.opts.max_syndrome_slots {
-                        continue;
-                    }
+                    // The exclusive payload gate keeps the admitted slot count stable.
                     let total = self.inner.logs.len();
                     let s = Arc::new(Mutex::new(SyndromeSlot {
                         exponent: *e,
@@ -2537,6 +2724,15 @@ impl StreamingParSession {
                     s
                 }
             };
+            let mut data = vec![0u8; ss];
+            r.read_data(&src, 0, &mut data)
+                .map_err(io_ctx("reading recovery slice"))?;
+            // Split layout for XOR into the slot.
+            let mut split = vec![0u8; ss];
+            {
+                let (lo, hi) = split.split_at_mut(ss / 2);
+                self.inner.opts.kernel.deinterleave(&data, lo, hi);
+            }
             {
                 let mut s = slot.lock().unwrap_or_else(|e| e.into_inner());
                 if !s.recovery_added {
@@ -2581,6 +2777,12 @@ impl StreamingParSession {
         candidate_bytes: &[u8],
         disk_file: &Path,
     ) -> Result<Vec<usize>, RepairError> {
+        let _payload = self
+            .inner
+            .payload_gate
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let _permit = self.inner.admit_payload();
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
@@ -2667,6 +2869,11 @@ impl StreamingParSession {
         &self,
         target_file_ids: &[FileId],
     ) -> Result<EarlyRepairReport, RepairError> {
+        let _payload = self
+            .inner
+            .payload_gate
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         for id in target_file_ids {
             self.file(id)?;
         }
@@ -2754,7 +2961,10 @@ impl StreamingParSession {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut taken: Vec<(Arc<Mutex<SyndromeSlot>>, Vec<u8>)> = Vec::with_capacity(k);
+        let mut taken = TakenSyndromes {
+            slots: Vec::with_capacity(k),
+            data: Vec::with_capacity(k),
+        };
         for &e in &plan.used_exponents {
             let slot = slots
                 .iter()
@@ -2762,9 +2972,9 @@ impl StreamingParSession {
                 .expect("ready exponent has a slot")
                 .clone();
             let data = std::mem::take(&mut slot.lock().unwrap_or_else(|e| e.into_inner()).data);
-            taken.push((slot, data));
+            taken.slots.push(slot);
+            taken.data.push(data);
         }
-        let mem: Vec<Vec<u8>> = taken.iter().map(|(_, d)| d.clone()).collect();
         let specs: Vec<InputSpec> = (0..k)
             .map(|j| InputSpec {
                 kind: InputKind::Recovery { output: j },
@@ -2775,7 +2985,7 @@ impl StreamingParSession {
             files: Vec::new(),
             by_path: HashMap::new(),
             slices: (0..k).map(SliceSrc::Mem).collect(),
-            mem: &mem,
+            mem: &taken.data,
             kernel: self.inner.opts.kernel,
         };
         // Outputs: rows → (file, offset, len); patch directly into the target files.
@@ -2810,13 +3020,10 @@ impl StreamingParSession {
             let off = (g - f.first_slice) as u64 * ss as u64;
             out_map.push((fi, off, (f.length - off).min(ss as u64)));
         }
-        let mut recon: Vec<Vec<u8>> = rows.iter().map(|_| Vec::new()).collect();
+        let mut recon: Vec<Vec<u8>> = rows.iter().map(|_| vec![0; ss]).collect();
         let mut sink = |output: usize, offset: u64, data: &[u8]| -> io::Result<()> {
             let (fi, block_off, block_len) = out_map[output];
             let buf = &mut recon[output];
-            if buf.len() < (offset as usize + data.len()) {
-                buf.resize(offset as usize + data.len(), 0);
-            }
             buf[offset as usize..offset as usize + data.len()].copy_from_slice(data);
             if offset < block_len {
                 let n = ((block_len - offset) as usize).min(data.len());
@@ -2844,9 +3051,7 @@ impl StreamingParSession {
             &mut |_, _, _, _| {},
         );
         // Return the syndromes to their slots before handling the result.
-        for (slot, data) in taken {
-            slot.lock().unwrap_or_else(|e| e.into_inner()).data = data;
-        }
+        drop(taken);
         run.map_err(|e| match e {
             crate::reed_solomon::RsError::Io(e) => RepairError::Io {
                 context: "early repair".into(),
@@ -3340,6 +3545,305 @@ mod live_tests {
             std::fs::read(fx.dir.join("part00.rar")).unwrap(),
             fx.files[0].1
         );
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn session_memory_reserves_parser_and_hash_scratch_together() {
+        let opts = SessionOptions {
+            max_working_bytes: 1 << 20,
+            ..Default::default()
+        };
+        assert!(matches!(
+            opts.bounded(4096),
+            Err(RepairError::StreamingMemoryLimit {
+                required_bytes: 1_310_720,
+                ..
+            })
+        ));
+        SessionOptions {
+            max_working_bytes: 1_310_720,
+            ..Default::default()
+        }
+        .bounded(4096)
+        .unwrap();
+    }
+
+    #[test]
+    fn session_memory_rejects_huge_slices_before_allocation() {
+        let mut fx = fixture("session_huge", &[4096], 4096, 0, VolumeScheme::Single);
+        fx.set.main.as_mut().unwrap().slice_size = 1 << 40;
+        assert!(matches!(
+            StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()),
+            Err(RepairError::StreamingMemoryLimit { .. })
+        ));
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn session_memory_caps_growth_and_folder_backlog() {
+        let fx = fixture(
+            "session_growth",
+            &[4 * 65536],
+            65536,
+            4,
+            VolumeScheme::Uniform(1),
+        );
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                preallocated_syndrome_slots: 1,
+                max_syndrome_bytes: 2 * 65536,
+                max_working_bytes: (1 << 20) + (256 << 10),
+                fold_threads: 128,
+                fold_queue_depth: 128,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let o = &s.inner.opts;
+        assert!(
+            (o.fold_threads * (o.fold_queue_depth + 1)) as u64 * 65536
+                + (o.max_working_bytes / (2 * 65536)) * 65536
+                <= o.max_working_bytes
+        );
+        assert!(o.max_staging_bytes <= o.max_working_bytes);
+        let absorbed: usize = fx
+            .vols
+            .iter()
+            .map(|v| s.on_recovery_volume_arrived(v, None).unwrap())
+            .sum();
+        assert_eq!(absorbed, 2);
+        assert_eq!(s.status().syndrome_slots, 2);
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn session_memory_unadmitted_frame_cannot_hide_valid_parity() {
+        let fx = fixture("session_overlap", &[4096], 4096, 1, VolumeScheme::Single);
+        let parity = load_par2_file(&fx.vols[0], ScanOptions::FULL).unwrap();
+        let r = parity.recovery.values().next().unwrap();
+        let original = std::fs::read(&fx.vols[0]).unwrap();
+        let start = r.packet_offset as usize;
+        let valid = &original[start..start + r.header_length() as usize];
+        let mut overlap = valid[..68].to_vec();
+        overlap[64..68].copy_from_slice(&1u32.to_le_bytes());
+        overlap.resize(2000, 0x55);
+        overlap.extend_from_slice(valid);
+        std::fs::write(&fx.vols[0], overlap).unwrap();
+        // Only exponent zero has a slot; the fake exponent-one frame overlaps it.
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                max_syndrome_slots: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(), 1);
+        let id = fid(&fx, "part00.rar");
+        s.repair_available_targets_now(&[id]).unwrap();
+        assert_eq!(
+            std::fs::read(fx.dir.join("part00.rar")).unwrap(),
+            fx.files[0].1
+        );
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn session_memory_resynchronizes_corrupt_recovery_length() {
+        for foreign in [false, true] {
+            let fx = fixture("session_length", &[4096], 4096, 1, VolumeScheme::Single);
+            let parity = load_par2_file(&fx.vols[0], ScanOptions::FULL).unwrap();
+            let r = parity.recovery.values().next().unwrap();
+            let original = std::fs::read(&fx.vols[0]).unwrap();
+            let start = r.packet_offset as usize;
+            let mut prefixed = original[start..start + r.header_length() as usize].to_vec();
+            let wrong_length = (prefixed.len() + original.len()) as u64;
+            prefixed[8..16].copy_from_slice(&wrong_length.to_le_bytes());
+            if foreign {
+                prefixed[32] ^= 1;
+            }
+            prefixed.extend_from_slice(&original);
+            std::fs::write(&fx.vols[0], prefixed).unwrap();
+            let s = StreamingParSession::new(
+                &fx.set,
+                &fx.dir,
+                SessionOptions {
+                    max_syndrome_slots: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(), 1);
+            let id = fid(&fx, "part00.rar");
+            s.repair_available_targets_now(&[id]).unwrap();
+            assert_eq!(
+                std::fs::read(fx.dir.join("part00.rar")).unwrap(),
+                fx.files[0].1
+            );
+            std::fs::remove_dir_all(&fx.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn session_memory_valid_duplicate_survives_corrupt_packet() {
+        let fx = fixture("session_duplicate", &[4096], 4096, 1, VolumeScheme::Single);
+        let parity = load_par2_file(&fx.vols[0], ScanOptions::FULL).unwrap();
+        let r = parity.recovery.values().next().unwrap();
+        let original = std::fs::read(&fx.vols[0]).unwrap();
+        let start = r.packet_offset as usize;
+        let mut prefixed = original[start..start + r.header_length() as usize].to_vec();
+        prefixed[(r.data_offset - r.packet_offset) as usize] ^= 1;
+        prefixed.extend_from_slice(&original);
+        std::fs::write(&fx.vols[0], prefixed).unwrap();
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                max_syndrome_slots: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(), 1);
+        let id = fid(&fx, "part00.rar");
+        s.repair_available_targets_now(&[id]).unwrap();
+        assert_eq!(
+            std::fs::read(fx.dir.join("part00.rar")).unwrap(),
+            fx.files[0].1
+        );
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn session_memory_corrupt_parity_does_not_consume_a_slot() {
+        let fx = fixture(
+            "session_corrupt",
+            &[8192],
+            4096,
+            2,
+            VolumeScheme::Uniform(1),
+        );
+        let parity = load_par2_file(&fx.vols[0], ScanOptions::FULL).unwrap();
+        let r = parity.recovery.values().next().unwrap();
+        let mut data = std::fs::read(&fx.vols[0]).unwrap();
+        data[r.data_offset as usize] ^= 1;
+        std::fs::write(&fx.vols[0], data).unwrap();
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                preallocated_syndrome_slots: 0,
+                max_syndrome_bytes: 4096,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(), 0);
+        assert_eq!(s.status().syndrome_slots, 0);
+        assert_eq!(s.on_recovery_volume_arrived(&fx.vols[1], None).unwrap(), 1);
+        assert_eq!(s.status().ready_recovery, 1);
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn session_memory_bulk_article_does_not_reread_supplied_bytes() {
+        let fx = fixture("session_bulk_bytes", &[8192], 4096, 0, VolumeScheme::Single);
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                max_staging_bytes: 4096,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let id = fid(&fx, "part00.rar");
+        let data = &fx.files[0].1;
+        assert!(!fx.dir.join("part00.rar").exists());
+        s.on_article_finished(&id, 0, data.len() as u64, crc32(data), Some(data))
+            .unwrap();
+        assert_eq!(s.status().verified, 2);
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn session_memory_releases_completed_staging_on_error() {
+        let fx = fixture("session_staging", &[8192], 4096, 0, VolumeScheme::Single);
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                max_staging_bytes: 4096,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let id = fid(&fx, "part00.rar");
+        let data = &fx.files[0].1;
+        // Complete a previously reported tail with an article that cannot supply
+        // all bytes of the second slice; that slice must read the missing file.
+        s.on_article_finished(&id, 6144, 2048, crc32(&data[6144..]), None)
+            .unwrap();
+        assert!(matches!(
+            s.on_article_finished(&id, 0, 6144, crc32(&data[..6144]), Some(&data[..6144])),
+            Err(RepairError::Io { .. })
+        ));
+        assert_eq!(s.inner.tracker.lock().unwrap().staging_bytes, 0);
+        std::fs::write(fx.dir.join("part00.rar"), data).unwrap();
+        s.on_article_finished(&id, 0, data.len() as u64, crc32(data), None)
+            .unwrap();
+        assert_eq!(s.status().verified, 2);
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn session_memory_caps_default_preallocation() {
+        let fx = fixture("session_bytes", &[4096], 4 << 20, 0, VolumeScheme::Single);
+        let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+        assert!(
+            s.status().syndrome_slots <= 16,
+            "{} slots",
+            s.status().syndrome_slots
+        );
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn session_memory_restores_syndromes_after_target_open_error() {
+        let fx = fixture("session_restore", &[8192], 4096, 2, VolumeScheme::Single);
+        let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+        s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap();
+        let before: Vec<Vec<u8>> = s
+            .inner
+            .slots
+            .read()
+            .unwrap()
+            .iter()
+            .map(|slot| slot.lock().unwrap().data.clone())
+            .collect();
+        let target = fx.dir.join("part00.rar");
+        std::fs::create_dir(&target).unwrap();
+        let id = fid(&fx, "part00.rar");
+        assert!(matches!(
+            s.repair_available_targets_now(&[id]),
+            Err(RepairError::Io { .. })
+        ));
+        let after: Vec<Vec<u8>> = s
+            .inner
+            .slots
+            .read()
+            .unwrap()
+            .iter()
+            .map(|slot| slot.lock().unwrap().data.clone())
+            .collect();
+        assert_eq!(after, before, "failed repair lost syndrome contents");
+        std::fs::remove_dir(&target).unwrap();
+        s.repair_available_targets_now(&[id]).unwrap();
+        assert_eq!(std::fs::read(target).unwrap(), fx.files[0].1);
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
 

@@ -58,6 +58,71 @@ come from the preceding streamed-buffer implementation. CI checks both limit
 boundaries, overflow, file preservation, streaming-syndrome preservation, and
 successful reconstruction within the limit.
 
+## Download-time streaming memory
+
+`StreamingParSession` now has `max_syndrome_bytes` and `max_working_bytes`,
+both defaulting to 64 MiB. The syndrome cap limits resident slot payloads and
+reconstructed output payloads separately. The working cap applies separately
+to staging, queued and active folding payloads, and per-call scratch. The
+existing count settings remain upper limits and are reduced to fit these caps.
+Working memory must fit the larger of two slices or the 1 MiB hash buffer,
+plus the 256 KiB packet-search buffer (a minimum of 1.25 MiB);
+construction returns `StreamingMemoryLimit` if it cannot. C status 14 represents
+this error. Explicit `SessionOptions` struct literals must include the new
+fields or use `..Default::default()`.
+
+For example, 32 slots of 250 MiB previously requested about 7.8 GiB at session
+creation. Default settings now reject that slice size before allocating payloads.
+Use `Par2Repairer` disk repair for these layouts, or explicitly configure larger
+streaming budgets. The 97.656 GiB disk-repair results below remain applicable.
+
+Article and donor processing use bounded concurrent admission. Parity ingestion
+and early cutover exclude other payload operations while they change shared
+syndromes. Folder threads and queue depth are capped together, including active
+producers. This can reduce concurrency with tight budgets. Completed article
+buffers stay charged to staging until released, and whole slices supplied in
+an article are processed without unnecessary disk reads when staging is full.
+
+Early repair borrows the existing syndrome buffers instead of cloning them.
+A guard restores them on every exit, including target-open failures. Reconstructed
+buffers and tail-padding scratch allocate their final sizes to avoid geometric
+capacity growth. Parity packets that cannot fit a slot are skipped before payload
+hashing or scratch allocation; admitted packets still require valid MD5 hashes.
+Duplicate exponents remain separate candidates until verification, so a corrupt
+packet cannot hide a later valid packet with the same exponent. Unverified
+recovery frame lengths never determine where scanning resumes. A bounded
+search scans skipped or rejected payloads for later packets without hashing
+or allocating whole slices, preserving recovery after header corruption.
+
+The allocation regression uses a 16 MiB article, 1 MiB slices, a 1 MiB staging
+limit, a 4 MiB working cap, and two resident slots. It checks both bulk delivery
+and four concurrent callers, requiring less than 8 MiB of additional live heap.
+It also checks near-full tail padding and refusal of extra parity without
+slice-sized allocations. Other tests cover huge metadata-only slice sizes,
+slot growth, corrupt parity, error cleanup, and retry after failed early repair.
+
+A single allocator-profile run of the same fixture compared with `3128796`
+recorded the following additional live requested heap. Caller-owned article
+bytes and the two resident slots were allocated before the measurement. These
+are heap-allocation measurements, not RSS or timing results; concurrent job
+overlap can change the peak. Requested folder threads and depth were four and
+64; the current working cap reduces the effective folder concurrency.
+
+| Delivery | Before MiB | Current MiB |
+| --- | ---: | ---: |
+| One bulk article | 17.0 | 2.0 |
+| Four concurrent callers | 7.0 | 4.0 |
+
+The [allocation results](bench/results/streaming-allocation-m4.json) record the
+source fingerprints, byte counts, and settings. The fixture and allocation
+tracker are in `tests/resource_bounds.rs`; ordinary CI enforces the bounds.
+
+These are component caps. Engine buffers, recovery matrices, metadata, thread
+stacks, allocator retention, and caller-owned article bytes also consume memory.
+The older low-level in-memory APIs retain their documented caller-managed
+storage contracts. This change makes no new throughput claim for download-time
+streaming; the Turbo comparisons below measure disk repair.
+
 ## Small archive comparison
 
 The streaming SIMD implementation in `d8eeea4` was compared with `d10eb91`

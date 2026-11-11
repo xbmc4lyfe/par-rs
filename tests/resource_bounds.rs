@@ -131,6 +131,7 @@ fn large_slices_use_bounded_buffers() {
     );
     many_files_release_descriptors();
     verification_obeys_small_budget_with_many_workers();
+    streaming_payloads_obey_byte_caps();
 }
 
 fn many_files_release_descriptors() {
@@ -270,5 +271,154 @@ fn verification_obeys_small_budget_with_many_workers() {
         data[0] = (i + 1) as u8;
         assert_eq!(std::fs::read(&source.path).unwrap(), data);
     }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn streaming_payloads_obey_byte_caps() {
+    use par_rs::create::{CreateOptions, SourceFile, VolumeScheme, create};
+    use par_rs::packet::{ScanOptions, load_par2_file};
+    use par_rs::streaming::{SessionOptions, StreamingParSession};
+    let dir = std::env::temp_dir().join(format!("par-rs-live-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = vec![0x3c; 16 << 20];
+    let path = dir.join("part.bin");
+    std::fs::write(&path, &data).unwrap();
+    let created = create(
+        &[SourceFile::new(path)],
+        &dir,
+        "set",
+        &CreateOptions {
+            slice_size: 1 << 20,
+            recovery_blocks: 4,
+            volumes: VolumeScheme::Uniform(1),
+            ..Default::default()
+        },
+        None,
+        &mut |_, _, _| {},
+    )
+    .unwrap();
+    let set = load_par2_file(&created.files[0], ScanOptions::FULL).unwrap();
+    let session = StreamingParSession::new(
+        &set,
+        &dir,
+        SessionOptions {
+            max_syndrome_bytes: 2 << 20,
+            max_working_bytes: 4 << 20,
+            max_staging_bytes: 1 << 20,
+            fold_threads: 4,
+            fold_queue_depth: 64,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let id = session.file_id_by_name(b"part.bin").unwrap();
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+    session
+        .on_article_finished(
+            &id,
+            0,
+            data.len() as u64,
+            par_rs::crc::crc32(&data),
+            Some(&data),
+        )
+        .unwrap();
+    session.flush();
+    let peak = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
+    assert!(peak < 8 << 20, "streaming bulk article peak {peak}");
+    assert_eq!(session.status().verified, 16);
+    // Exponents 0 and 1 already have slots. A different exponent is refused
+    // before either full-slice input or split scratch is allocated.
+    LARGEST.store(0, Ordering::Relaxed);
+    assert_eq!(
+        session
+            .on_recovery_volume_arrived(&created.files[3], None)
+            .unwrap(),
+        0
+    );
+    assert!(LARGEST.load(Ordering::Relaxed) < 1 << 20);
+    drop(session);
+    let session = StreamingParSession::new(
+        &set,
+        &dir,
+        SessionOptions {
+            max_syndrome_bytes: 2 << 20,
+            max_working_bytes: 4 << 20,
+            max_staging_bytes: 1 << 20,
+            fold_threads: 4,
+            fold_queue_depth: 64,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+    std::thread::scope(|scope| {
+        for lane in 0..4 {
+            let session = &session;
+            let data = &data;
+            scope.spawn(move || {
+                for block in (lane..16).step_by(4) {
+                    let bytes = &data[block << 20..(block + 1) << 20];
+                    session
+                        .on_article_finished(
+                            &id,
+                            (block << 20) as u64,
+                            1 << 20,
+                            par_rs::crc::crc32(bytes),
+                            Some(bytes),
+                        )
+                        .unwrap();
+                }
+            });
+        }
+    });
+    session.flush();
+    let peak = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
+    assert!(peak < 8 << 20, "streaming concurrent peak {peak}");
+    assert_eq!(session.status().verified, 16);
+    drop(session);
+    let tail = &data[..(1 << 20) - 1];
+    let path = dir.join("tail.bin");
+    std::fs::write(&path, tail).unwrap();
+    let created = create(
+        &[SourceFile::new(path)],
+        &dir,
+        "tail",
+        &CreateOptions {
+            slice_size: 1 << 20,
+            recovery_blocks: 0,
+            ..Default::default()
+        },
+        None,
+        &mut |_, _, _| {},
+    )
+    .unwrap();
+    let set = load_par2_file(&created.files[0], ScanOptions::FULL).unwrap();
+    let session = StreamingParSession::new(
+        &set,
+        &dir,
+        SessionOptions {
+            max_syndrome_bytes: 2 << 20,
+            max_working_bytes: 4 << 20,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let id = session.file_id_by_name(b"tail.bin").unwrap();
+    LARGEST.store(0, Ordering::Relaxed);
+    session
+        .on_article_finished(
+            &id,
+            0,
+            tail.len() as u64,
+            par_rs::crc::crc32(tail),
+            Some(tail),
+        )
+        .unwrap();
+    assert!(
+        LARGEST.load(Ordering::Relaxed) <= 1 << 20,
+        "tail padding grew beyond one slice"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }

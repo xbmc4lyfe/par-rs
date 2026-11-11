@@ -42,7 +42,7 @@ pub const MAX_FILENAME_LEN: usize = 100_000;
 /// Chunk size used when hashing large packets.
 const HASH_CHUNK: usize = 1 << 20;
 /// Window used when searching for the next magic during resynchronisation.
-const RESYNC_WINDOW: usize = 256 * 1024;
+pub(crate) const RESYNC_WINDOW: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------------------------
 // Identifiers
@@ -443,6 +443,15 @@ impl<'a, S: PacketSource + ?Sized> PacketIter<'a, S> {
             done: false,
             window: Vec::new(),
         }
+    }
+
+    /// Resume searching after the start of a frame rejected by lazy validation.
+    /// Its unverified length must not hide a later valid packet.
+    pub(crate) fn reject_frame(&mut self, raw: &RawPacket) -> io::Result<()> {
+        self.pos = raw.offset;
+        self.done = false;
+        self.advance_invalid(raw.offset + 1)?;
+        Ok(())
     }
 
     /// Scan statistics so far.

@@ -46,6 +46,8 @@ pub enum NzbParStatus {
     Panic = 12,
     /// Recovery-matrix planning exceeds the configured memory cap.
     RecoveryMemoryLimit = 13,
+    /// Streaming buffers exceed a configured byte cap.
+    StreamingMemoryLimit = 14,
 }
 
 impl From<&RepairError> for NzbParStatus {
@@ -56,6 +58,7 @@ impl From<&RepairError> for NzbParStatus {
             RepairError::NotFinalized => NzbParStatus::NotFinalized,
             RepairError::WrongSet { .. } => NzbParStatus::WrongSet,
             RepairError::NotEnoughRecovery { .. } => NzbParStatus::NotEnoughRecovery,
+            RepairError::StreamingMemoryLimit { .. } => NzbParStatus::StreamingMemoryLimit,
             RepairError::RecoveryMemoryLimit { .. } => NzbParStatus::RecoveryMemoryLimit,
             RepairError::Singular => NzbParStatus::Singular,
             RepairError::VerificationFailed { .. } => NzbParStatus::VerificationFailed,
