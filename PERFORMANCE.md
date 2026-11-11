@@ -87,6 +87,8 @@ A guard restores them on every exit, including target-open failures. Reconstruct
 buffers and tail-padding scratch allocate their final sizes to avoid geometric
 capacity growth. Parity packets that cannot fit a slot are skipped before payload
 hashing or scratch allocation; admitted packets still require valid MD5 hashes.
+Duplicate exponents remain separate candidates until verification, so a corrupt
+packet cannot hide a later valid packet with the same exponent.
 
 The allocation regression uses a 16 MiB article, 1 MiB slices, a 1 MiB staging
 limit, a 4 MiB working cap, and two resident slots. It checks both bulk delivery

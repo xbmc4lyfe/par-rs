@@ -2633,14 +2633,25 @@ impl StreamingParSession {
             .payload_gate
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        let mut set = PacketSet::for_set(self.inner.set_id);
-        set.load_file(path, 0, ScanOptions::METADATA)
-            .map_err(io_ctx(format!("loading {}", path.display())))?;
         let src = FileSource::open(path).map_err(io_ctx(format!("opening {}", path.display())))?;
         let ss = self.inner.slice_size;
         let mut absorbed = 0usize;
         let mut need_backfill = false;
-        for (e, r) in &set.recovery {
+        // Keep every framed candidate until its hash is known. PacketSet would
+        // deduplicate exponents before a corrupt candidate can be rejected.
+        for raw in crate::packet::PacketIter::new(&src, ScanOptions::METADATA) {
+            let raw = raw.map_err(io_ctx(format!("loading {}", path.display())))?;
+            if raw.header.set_id != self.inner.set_id
+                || raw.header.kind() != crate::packet::PacketType::RecoverySlice
+            {
+                continue;
+            }
+            let Ok(r) = crate::packet::RecoverySliceRef::from_raw(&src, &raw, 0)
+                .map_err(io_ctx("reading recovery packet"))?
+            else {
+                continue;
+            };
+            let e = &r.exponent;
             if r.slice_size != ss as u64 {
                 continue;
             }
@@ -3561,6 +3572,36 @@ mod live_tests {
             .sum();
         assert_eq!(absorbed, 2);
         assert_eq!(s.status().syndrome_slots, 2);
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn session_memory_valid_duplicate_survives_corrupt_packet() {
+        let fx = fixture("session_duplicate", &[4096], 4096, 1, VolumeScheme::Single);
+        let parity = load_par2_file(&fx.vols[0], ScanOptions::FULL).unwrap();
+        let r = parity.recovery.values().next().unwrap();
+        let original = std::fs::read(&fx.vols[0]).unwrap();
+        let start = r.packet_offset as usize;
+        let mut prefixed = original[start..start + r.header_length() as usize].to_vec();
+        prefixed[(r.data_offset - r.packet_offset) as usize] ^= 1;
+        prefixed.extend_from_slice(&original);
+        std::fs::write(&fx.vols[0], prefixed).unwrap();
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                max_syndrome_slots: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(), 1);
+        let id = fid(&fx, "part00.rar");
+        s.repair_available_targets_now(&[id]).unwrap();
+        assert_eq!(
+            std::fs::read(fx.dir.join("part00.rar")).unwrap(),
+            fx.files[0].1
+        );
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
 
