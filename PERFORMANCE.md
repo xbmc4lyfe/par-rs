@@ -28,6 +28,36 @@ Allocators can retain freed buffers between phases. These measurements cover
 `Par2Repairer` and the repair command-line tool. APIs that accept or retain
 complete slices have different memory requirements.
 
+## Recovery-matrix limit
+
+Disk repair and the high-level streaming repair planners now check matrix
+memory before inversion. For `k` missing slices, the input matrix, augmented
+matrix, and returned inverse can coexist and require `8 × k²` bytes. The
+matrix cap equals the configured repair or solve budget, with a 16 MiB minimum.
+An oversized solve returns `RecoveryMemoryLimit` with the missing-slice count,
+required bytes, and limit. Disk repair checks before backups, renames, and target
+creation. Streaming cutover checks before taking syndromes or opening targets.
+The C API adds status 13 without changing existing status values.
+
+The 16 MiB setting accepts up to 1,448 missing slices; 256 MiB accepts 5,792.
+The tested 97.656 GiB cases need at most 160 and remain below either cap. Total
+archive bytes and file count do not determine matrix size. A 32,768-slice
+loss would previously attempt 8 GiB of matrices regardless of `--mem`.
+
+This is a separate matrix cap, not a total-process RSS limit. During disk
+reconstruction the retained inverse needs `2 × k²` bytes, at most one quarter
+of the cap, in addition to engine buffers. Metadata, stacks, allocator retention,
+and caller-owned data remain additional. Streaming APIs also retain syndromes
+and reconstructed slices under their own contracts; this guard does not make
+those APIs equivalent to bounded disk repair. Direct low-level matrix APIs
+remain caller-managed.
+
+The change rejects oversized planning before allocation; it does not change
+the solve kernels for accepted repairs. The throughput measurements below
+come from the preceding streamed-buffer implementation. CI checks both limit
+boundaries, overflow, file preservation, streaming-syndrome preservation, and
+successful reconstruction within the limit.
+
 ## Small archive comparison
 
 The streaming SIMD implementation in `d8eeea4` was compared with `d10eb91`
