@@ -56,21 +56,34 @@ The large-archive comparison uses 200 × 500 MiB files, Apple M4, ten compute
 threads, and a 256 MiB repair-buffer budget. Turbo uses its default two
 verification threads. Each result is one full-process run with repaired bytes
 checked against the originals. The insufficient-parity case measures a correct
-refusal. CPU seconds sum user and system time across threads.
+refusal. CPU seconds sum user and system time across threads. Turbo reference
+runs preceded the final streaming-buffer runs on the same source fixture.
 
 | Scenario | Turbo seconds | par-rs seconds | Turbo CPU seconds | par-rs CPU seconds | Turbo peak MiB | par-rs peak MiB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| One missing file | 125.8 | 67.6 | 229.0 | 248.0 | 367 | 275 |
-| Scattered 10% damage | 457.6 | 148.9 | 916.5 | 909.0 | 1292 | 519 |
-| Whole-file 40% loss | 288.5 | 208.4 | 1086.1 | 1289.4 | 772 | 275 |
-| Mixed 40% loss | 310.1 | 221.4 | 1138.4 | 1419.7 | 772 | 277 |
-| Insufficient parity | 116.0 | 20.2 | 162.6 | 93.0 | 503 | 13 |
+| One missing file | 125.8 | 89.2 | 229.0 | 130.3 | 367.2 | 65.9 |
+| Scattered 10% damage | 457.6 | 191.9 | 916.5 | 905.1 | 1291.6 | 82.2 |
+| Whole-file 40% loss | 288.5 | 251.0 | 1086.1 | 1175.6 | 772.0 | 156.1 |
+| Mixed 40% loss | 310.1 | 281.3 | 1138.4 | 1359.3 | 772.2 | 146.9 |
+| Insufficient parity | 116.0 | 31.2 | 162.6 | 111.3 | 503.5 | 4.7 |
 
 A separate two-thread run with `--mem 16` and a 256-descriptor limit restored
-the missing 500 MiB file in 214.7 seconds with 24.3 MiB peak RAM.
+the missing 500 MiB file in 258.3 seconds with 24.4 MiB peak RAM.
 
 Methodology, damage layouts, resource limits, earlier measurements, and
 reproduction commands are in [PERFORMANCE.md](PERFORMANCE.md).
+
+### Streaming buffers with 1 MiB slices
+
+On 10 × 100 MiB files, with a 256 MiB budget and ten requested compute threads,
+the median of three warm-cache runs was as follows. Every repair passed a byte
+comparison. PERFORMANCE.md also records the 16 MiB budget and single-slice cases.
+
+| Scenario | Turbo seconds | par-rs seconds | Turbo peak MiB | par-rs peak MiB |
+| --- | ---: | ---: | ---: | ---: |
+| Intact verification | 0.774 | 0.068 | 5.4 | 8.2 |
+| 40 damaged slices | 1.846 | 0.494 | 83.1 | 82.3 |
+| One missing file | 1.530 | 0.920 | 139.2 | 123.1 |
 
 ### Earlier small archive measurements
 

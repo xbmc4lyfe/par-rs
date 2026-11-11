@@ -85,7 +85,7 @@ def prepare(scenario, stem, slice_size, volumes):
         subprocess.run(["/bin/cp", "-c", parity, WORK / parity.name], check=True)
     return touched
 
-def measure(command, log_path):
+def measure(command, log_path, sample_interval=0.05):
     usage = Usage()
     samples = []
     peak_rss_sample = (0, 0.0)
@@ -104,14 +104,19 @@ def measure(command, log_path):
             if pid:
                 child.returncode = os.waitstatus_to_exitcode(status)
                 break
-            time.sleep(0.05)
+            time.sleep(sample_interval)
     return dict(returncode=child.returncode, wall_s=time.monotonic() - start,
                 cpu_s=result.ru_utime + result.ru_stime, user_s=result.ru_utime,
                 system_s=result.ru_stime, rss_bytes=result.ru_maxrss,
                 block_in=result.ru_inblock, block_out=result.ru_oublock,
                 sampled_peak_rss_bytes=peak_rss_sample[0], sampled_peak_rss_at_s=peak_rss_sample[1],
-                disk_read_bytes=max((s[0] for s in samples), default=None),
-                disk_write_bytes=max((s[1] for s in samples), default=None))
+                disk_read_bytes=counter_peak(samples, 0),
+                disk_write_bytes=counter_peak(samples, 1))
+
+def counter_peak(samples, index):
+    peak = max((sample[index] for sample in samples), default=None)
+    # Darwin can report a wrapped negative accounting value as uint64.
+    return peak if peak is None or peak < (1 << 63) else None
 
 def same_bytes(first, second):
     if not second.is_file() or first.stat().st_size != second.stat().st_size:

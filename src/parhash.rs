@@ -6,9 +6,9 @@
 //! slices is hashed in lockstep lanes, and jobs are spread over all cores. The whole-file MD5
 //! chains (file description digests) cannot be split, so they run one file per thread.
 
-use crate::crc::{Crc32, crc32};
+use crate::crc::Crc32;
 use crate::hasher::{FileHasher, FileHashes, READ_CHUNK};
-use crate::md5simd::{LANES, md5_many_into};
+use crate::md5simd::{INIT as MD5_INIT, LANES, compress_blocks};
 use crate::packet::read_exact_at;
 use md5::{Digest, Md5};
 use std::fs::File;
@@ -30,8 +30,9 @@ pub struct HashRange {
     pub pad_to: u64,
 }
 
-/// Target bytes of message data per job (more lanes per job, fewer pool round trips).
-const JOB_BYTES: u64 = 32 << 20;
+/// Target aggregate verification scratch space, independent of set size.
+pub(crate) const WORKING_MEMORY_BYTES: u64 = 8 << 20;
+const HASH_CHUNK: usize = 64 << 10;
 
 /// Resolve the worker count.
 pub(crate) fn thread_count(requested: usize) -> usize {
@@ -44,32 +45,25 @@ pub(crate) fn thread_count(requested: usize) -> usize {
     }
 }
 
-/// Group consecutive ranges into jobs of roughly [`JOB_BYTES`], keeping multiples of the MD5
-/// lane count where possible so no lane idles.
+/// Group consecutive ranges from one file into full SIMD lanes.
 fn plan_jobs(ranges: &[HashRange]) -> Vec<std::ops::Range<usize>> {
     let mut jobs = Vec::new();
-    let mut start = 0usize;
-    let mut bytes = 0u64;
-    for (i, r) in ranges.iter().enumerate() {
-        if i > start && r.pad_to.max(1) > JOB_BYTES.saturating_sub(bytes) {
-            jobs.push(start..i);
-            start = i;
-            bytes = 0;
-        }
-        bytes = bytes.saturating_add(r.pad_to.max(1));
-        let count = i + 1 - start;
-        let full = bytes >= JOB_BYTES
-            && (count.is_multiple_of(LANES) || r.pad_to.max(1) > JOB_BYTES / LANES as u64);
-        if full {
-            jobs.push(start..i + 1);
-            start = i + 1;
-            bytes = 0;
-        }
-    }
-    if start < ranges.len() {
-        jobs.push(start..ranges.len());
+    let mut start = 0;
+    while start < ranges.len() {
+        let file = ranges[start].file;
+        let count = ranges[start..]
+            .iter()
+            .take(LANES)
+            .take_while(|r| r.file == file)
+            .count();
+        jobs.push(start..start + count);
+        start += count;
     }
     jobs
+}
+
+fn padded_bytes(length: u64) -> Option<u64> {
+    (length / 64 + 1 + u64::from(length % 64 >= 56)).checked_mul(64)
 }
 
 /// Shared pool state.
@@ -77,6 +71,8 @@ struct Pool<'a> {
     paths: &'a [&'a Path],
     ranges: &'a [HashRange],
     jobs: Vec<std::ops::Range<usize>>,
+    chunk_bytes: usize,
+    buffer_bytes: usize,
     next: AtomicUsize,
     bytes_done: AtomicU64,
     error: Mutex<Option<io::Error>>,
@@ -98,11 +94,13 @@ impl Pool<'_> {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// Run jobs until none are left; `on_job` is called after each job with the bytes done so far.
+    /// Run jobs until none are left; report completed file bytes after each job.
     fn work(&self, on_job: &mut dyn FnMut(u64)) {
         let mut file: Option<(usize, File)> = None;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut digests: Vec<[u8; 16]> = Vec::new();
+        if self.stopped() {
+            return;
+        }
+        let mut buf = Vec::with_capacity(self.buffer_bytes);
         loop {
             if self.stopped() {
                 return;
@@ -111,101 +109,94 @@ impl Pool<'_> {
             let Some(job) = self.jobs.get(j) else {
                 return;
             };
-            let rs = &self.ranges[job.clone()];
-            if rs[0].pad_to > JOB_BYTES {
-                let r = rs[0];
-                let result = (|| -> io::Result<(u32, [u8; 16])> {
-                    let f = if r.len > 0 {
-                        Some(File::open(self.paths[r.file])?)
-                    } else {
-                        None
-                    };
-                    buf.resize(READ_CHUNK, 0);
-                    let mut crc = Crc32::new();
-                    let mut md5 = Md5::new();
-                    let mut pos = 0;
-                    while pos < r.pad_to {
-                        if self.stopped() {
-                            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
-                        }
-                        let n = (r.pad_to - pos).min(buf.len() as u64) as usize;
+            let ranges = &self.ranges[job.clone()];
+            let result = (|| -> io::Result<Vec<(u32, [u8; 16])>> {
+                if ranges.iter().any(|r| r.len > 0)
+                    && file.as_ref().map(|(i, _)| *i) != Some(ranges[0].file)
+                {
+                    drop(file.take());
+                    file = Some((ranges[0].file, File::open(self.paths[ranges[0].file])?));
+                }
+                let mut scalar = (ranges.len() == 1).then(Md5::new);
+                let mut states = vec![MD5_INIT; ranges.len()];
+                let mut crcs: Vec<Crc32> = ranges.iter().map(|_| Crc32::new()).collect();
+                let lengths: Vec<u64> = ranges
+                    .iter()
+                    .map(|r| padded_bytes(r.pad_to).unwrap())
+                    .collect();
+                let end = lengths.iter().copied().max().unwrap_or(0);
+                buf.resize(ranges.len() * self.chunk_bytes, 0);
+                let mut pos = 0;
+                while pos < end {
+                    if self.stopped() {
+                        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+                    }
+                    let mut messages = Vec::with_capacity(ranges.len());
+                    for (lane, bytes) in buf.chunks_mut(self.chunk_bytes).enumerate() {
+                        let r = ranges[lane];
+                        let n = lengths[lane]
+                            .saturating_sub(pos)
+                            .min(self.chunk_bytes as u64) as usize;
+                        let bytes = &mut bytes[..n];
+                        bytes.fill(0);
                         let read = r.len.saturating_sub(pos).min(n as u64) as usize;
-                        if let Some(f) = &f
-                            && read > 0
-                        {
-                            read_exact_at(f, r.offset + pos, &mut buf[..read])?;
+                        if read > 0 {
+                            read_exact_at(
+                                &file.as_ref().unwrap().1,
+                                r.offset + pos,
+                                &mut bytes[..read],
+                            )?;
                         }
-                        buf[read..n].fill(0);
-                        crc.update(&buf[..n]);
-                        md5.update(&buf[..n]);
-                        pos += n as u64;
-                    }
-                    Ok((crc.finish(), md5.finalize().into()))
-                })();
-                match result {
-                    Ok(digest) => {
-                        self.out.lock().unwrap_or_else(|p| p.into_inner())[job.start] = digest
-                    }
-                    Err(e) => {
-                        self.fail(e);
-                        return;
-                    }
-                }
-                let done = self.bytes_done.fetch_add(r.len, Ordering::Relaxed) + r.len;
-                on_job(done);
-                continue;
-            }
-            let total: usize = rs.iter().map(|r| r.pad_to as usize).sum();
-            buf.clear();
-            buf.reserve_exact(total);
-            buf.resize(total, 0);
-            let mut off = 0usize;
-            let mut read_bytes = 0u64;
-            for r in rs {
-                let n = r.len as usize;
-                if n > 0 {
-                    if file.as_ref().map(|(i, _)| *i) != Some(r.file) {
-                        // Close the previous file before opening another one.
-                        drop(file.take());
-                        match File::open(self.paths[r.file]) {
-                            Ok(f) => file = Some((r.file, f)),
-                            Err(e) => {
-                                self.fail(e);
-                                return;
-                            }
+                        let data = r.pad_to.saturating_sub(pos).min(n as u64) as usize;
+                        crcs[lane].update(&bytes[..data]);
+                        if let Some(digest) = &mut scalar {
+                            digest.update(&bytes[..data]);
                         }
+                        if r.pad_to >= pos && r.pad_to - pos < n as u64 {
+                            bytes[(r.pad_to - pos) as usize] = 0x80;
+                        }
+                        if n > 0 && pos + n as u64 == lengths[lane] {
+                            bytes[n - 8..].copy_from_slice(&r.pad_to.wrapping_mul(8).to_le_bytes());
+                        }
+                        messages.push(&*bytes);
                     }
-                    let f = &file.as_ref().unwrap().1;
-                    if let Err(e) = read_exact_at(f, r.offset, &mut buf[off..off + n]) {
-                        self.fail(e);
-                        return;
+                    if scalar.is_none() {
+                        compress_blocks(&mut states, &messages);
                     }
-                    read_bytes += n as u64;
+                    pos = pos.saturating_add(self.chunk_bytes as u64);
                 }
-                off += r.pad_to as usize;
-            }
-            let mut msgs: Vec<&[u8]> = Vec::with_capacity(rs.len());
-            let mut off = 0usize;
-            for r in rs {
-                msgs.push(&buf[off..off + r.pad_to as usize]);
-                off += r.pad_to as usize;
-            }
-            digests.clear();
-            digests.resize(rs.len(), [0u8; 16]);
-            md5_many_into(&msgs, &mut digests);
-            {
-                let mut out = self.out.lock().unwrap_or_else(|p| p.into_inner());
-                for (k, m) in msgs.iter().enumerate() {
-                    out[job.start + k] = (crc32(m), digests[k]);
+                if let Some(digest) = scalar {
+                    return Ok(vec![(crcs[0].finish(), digest.finalize().into())]);
+                }
+                Ok(states
+                    .iter()
+                    .zip(crcs)
+                    .map(|(state, crc)| {
+                        let mut digest = [0u8; 16];
+                        for (bytes, word) in digest.chunks_mut(4).zip(state) {
+                            bytes.copy_from_slice(&word.to_le_bytes());
+                        }
+                        (crc.finish(), digest)
+                    })
+                    .collect())
+            })();
+            match result {
+                Ok(digests) => self.out.lock().unwrap_or_else(|p| p.into_inner())[job.clone()]
+                    .copy_from_slice(&digests),
+                Err(e) => {
+                    self.fail(e);
+                    return;
                 }
             }
+            let read_bytes = ranges.iter().map(|r| r.len).sum();
             let done = self.bytes_done.fetch_add(read_bytes, Ordering::Relaxed) + read_bytes;
             on_job(done);
         }
     }
 }
 
-/// CRC-32 and MD5 of every range, in order, computed on `threads` threads (0 = all cores).
+/// CRC-32 and MD5 of every range, using up to `threads` workers (0 = all cores).
+/// Worker message buffers share at most 8 MiB of scratch space.
 ///
 /// `progress` receives the cumulative number of file bytes hashed; it is only called from the
 /// calling thread. Ranges past the end of a file must be clamped by the caller (`len` may be 0
@@ -214,6 +205,25 @@ pub fn hash_ranges_parallel(
     paths: &[&Path],
     ranges: &[HashRange],
     threads: usize,
+    cancel: Option<&AtomicBool>,
+    progress: &mut dyn FnMut(u64),
+) -> io::Result<Vec<(u32, [u8; 16])>> {
+    hash_ranges_parallel_with_budget(
+        paths,
+        ranges,
+        threads,
+        WORKING_MEMORY_BYTES,
+        cancel,
+        progress,
+    )
+}
+
+/// Hash ranges with a shared budget for worker message buffers.
+pub(crate) fn hash_ranges_parallel_with_budget(
+    paths: &[&Path],
+    ranges: &[HashRange],
+    threads: usize,
+    memory_bytes: u64,
     cancel: Option<&AtomicBool>,
     progress: &mut dyn FnMut(u64),
 ) -> io::Result<Vec<(u32, [u8; 16])>> {
@@ -229,12 +239,29 @@ pub fn hash_ranges_parallel(
             "invalid hash range",
         ));
     }
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
+    if ranges.iter().any(|r| padded_bytes(r.pad_to).is_none()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hash range too large",
+        ));
+    }
+    let memory_bytes = memory_bytes.clamp(READ_CHUNK as u64, WORKING_MEMORY_BYTES);
     let jobs = plan_jobs(ranges);
+    let lanes = jobs.iter().map(|j| j.len()).max().unwrap_or(1);
     let threads = thread_count(threads).clamp(1, jobs.len());
+    let threads = (threads as u64).min(memory_bytes / (lanes * 64) as u64) as usize;
+    let per_lane = (memory_bytes / threads as u64 / lanes as u64).min(HASH_CHUNK as u64);
+    let chunk_bytes = 1usize << per_lane.ilog2();
+    let buffer_bytes = lanes * chunk_bytes;
     let pool = Pool {
         paths,
         ranges,
         jobs,
+        chunk_bytes,
+        buffer_bytes,
         next: AtomicUsize::new(0),
         bytes_done: AtomicU64::new(0),
         error: Mutex::new(None),
@@ -357,6 +384,57 @@ mod tests {
     }
 
     #[test]
+    fn streaming_simd_matches_scalar_at_lane_chunk_and_padding_boundaries() {
+        let dir = tmpdir("streaming-simd");
+        let path = dir.join("data");
+        let data: Vec<u8> = (0..262144u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        std::fs::write(&path, &data).unwrap();
+        let sizes = [
+            0, 1, 55, 56, 63, 64, 16383, 16384, 16385, 65535, 65536, 65537, 131071, 131072, 131073,
+        ];
+        let ranges: Vec<HashRange> = (0..33)
+            .map(|i| {
+                let len = sizes[i % sizes.len()];
+                HashRange {
+                    file: 0,
+                    offset: (i * 17) as u64,
+                    len,
+                    pad_to: len + (i % 5) as u64,
+                }
+            })
+            .collect();
+        let expected: Vec<_> = ranges
+            .iter()
+            .map(|r| {
+                let mut message = data[r.offset as usize..(r.offset + r.len) as usize].to_vec();
+                message.resize(r.pad_to as usize, 0);
+                slice_checksums(&message)
+            })
+            .collect();
+        for (range, expected) in ranges.iter().zip(&expected) {
+            let got = hash_ranges_parallel(&[&path], &[*range], 1, None, &mut |_| {}).unwrap();
+            assert_eq!(got, vec![*expected]);
+        }
+        for count in [1, 2, 4, 5, 8, 9, 16, 17, 33] {
+            for budget in [1 << 20, 8 << 20] {
+                let got = hash_ranges_parallel_with_budget(
+                    &[&path],
+                    &ranges[..count],
+                    3,
+                    budget,
+                    None,
+                    &mut |_| {},
+                )
+                .unwrap();
+                assert_eq!(got, expected[..count], "lanes {count}, budget {budget}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn invalid_ranges_and_cancelled_huge_padding_do_not_panic() {
         let paths = [Path::new("unused")];
         for range in [
@@ -440,13 +518,13 @@ mod tests {
                 slice_checksums(&data[r.offset as usize..r.offset as usize + 300])
             );
         }
-        assert!(plan_jobs(&many).len() == 1);
+        assert!(plan_jobs(&many).len() > 1);
         let big: Vec<HashRange> = (0..100)
             .map(|i| HashRange {
                 file: 0,
                 offset: 0,
                 len: 0,
-                pad_to: (JOB_BYTES / 10) * (1 + i % 2),
+                pad_to: (32 << 20) / 10 * (1 + i % 2),
             })
             .collect();
         assert!(plan_jobs(&big).len() > 1);
