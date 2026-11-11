@@ -357,6 +357,44 @@ mod tests {
     }
 
     #[test]
+    fn invalid_ranges_and_cancelled_huge_padding_do_not_panic() {
+        let paths = [Path::new("unused")];
+        for range in [
+            HashRange {
+                file: 1,
+                offset: 0,
+                len: 0,
+                pad_to: 0,
+            },
+            HashRange {
+                file: 0,
+                offset: 0,
+                len: 2,
+                pad_to: 1,
+            },
+            HashRange {
+                file: 0,
+                offset: u64::MAX,
+                len: 1,
+                pad_to: 1,
+            },
+        ] {
+            let error = hash_ranges_parallel(&paths, &[range], 1, None, &mut |_| {}).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        let cancel = AtomicBool::new(true);
+        let range = HashRange {
+            file: 0,
+            offset: 0,
+            len: 0,
+            pad_to: u64::MAX,
+        };
+        let error =
+            hash_ranges_parallel(&paths, &[range], 1, Some(&cancel), &mut |_| {}).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
     fn slice_hashes_match_sequential_for_short_last_slice_and_missing_tail() {
         let dir = tmpdir("slices");
         let ss = 1000u64;
