@@ -65,7 +65,8 @@ both defaulting to 64 MiB. The syndrome cap limits resident slot payloads and
 reconstructed output payloads separately. The working cap applies separately
 to staging, queued and active folding payloads, and per-call scratch. The
 existing count settings remain upper limits and are reduced to fit these caps.
-Working memory must fit two slices and the 1 MiB whole-file hash buffer;
+Working memory must fit the larger of two slices or the 1 MiB hash buffer,
+plus the 256 KiB packet-search buffer (a minimum of 1.25 MiB);
 construction returns `StreamingMemoryLimit` if it cannot. C status 14 represents
 this error. Explicit `SessionOptions` struct literals must include the new
 fields or use `..Default::default()`.
@@ -88,7 +89,10 @@ buffers and tail-padding scratch allocate their final sizes to avoid geometric
 capacity growth. Parity packets that cannot fit a slot are skipped before payload
 hashing or scratch allocation; admitted packets still require valid MD5 hashes.
 Duplicate exponents remain separate candidates until verification, so a corrupt
-packet cannot hide a later valid packet with the same exponent.
+packet cannot hide a later valid packet with the same exponent. Unverified
+recovery frame lengths never determine where scanning resumes. A bounded
+search scans skipped or rejected payloads for later packets without hashing
+or allocating whole slices, preserving recovery after header corruption.
 
 The allocation regression uses a 16 MiB article, 1 MiB slices, a 1 MiB staging
 limit, a 4 MiB working cap, and two resident slots. It checks both bulk delivery
