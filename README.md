@@ -52,6 +52,28 @@ differential tests instead. `unsafe` is confined to the SIMD kernels (`gf16/simd
 
 ## Performance
 
+The large-archive comparison uses 200 × 500 MiB files, Apple M4, ten compute
+threads, and a 256 MiB repair-buffer budget. Turbo uses its default two
+verification threads. Each result is one full-process run with repaired bytes
+checked against the originals. The insufficient-parity case measures a correct
+refusal. CPU seconds sum user and system time across threads.
+
+| Scenario | Turbo seconds | par-rs seconds | Turbo CPU seconds | par-rs CPU seconds | Turbo peak MiB | par-rs peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| One missing file | 125.8 | 67.6 | 229.0 | 248.0 | 367 | 275 |
+| Scattered 10% damage | 457.6 | 148.9 | 916.5 | 909.0 | 1292 | 519 |
+| Whole-file 40% loss | 288.5 | 208.4 | 1086.1 | 1289.4 | 772 | 275 |
+| Mixed 40% loss | 310.1 | 221.4 | 1138.4 | 1419.7 | 772 | 277 |
+| Insufficient parity | 116.0 | 20.2 | 162.6 | 93.0 | 503 | 13 |
+
+A separate two-thread run with `--mem 16` and a 256-descriptor limit restored
+the missing 500 MiB file in 214.7 seconds with 24.3 MiB peak RAM.
+
+Methodology, damage layouts, resource limits, earlier measurements, and
+reproduction commands are in [PERFORMANCE.md](PERFORMANCE.md).
+
+### Earlier small archive measurements
+
 Apple M4 (4P + 6E cores, NEON), 10 threads, warm page cache. Dataset: 10 × 100 MiB random
 files, 1 MiB slices (1000 input blocks), 100 recovery blocks. Best of 3, seconds; every tool
 produced correct output (verified by MD5 against the originals). Harness: `bench/compare.py`
