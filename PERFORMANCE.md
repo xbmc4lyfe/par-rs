@@ -2,27 +2,70 @@
 
 ## Bounded hashing and scanning
 
-The repair command-line tool and `Par2Repairer` stream large slices through bounded buffers.
-Slices larger than 32 MiB use a 1 MiB hash buffer per worker. Smaller slices
-retain the SIMD batch path, with at most 32 MiB of message storage per worker.
-Hash workers retain one file handle between jobs. A streamed job can briefly
-hold a second handle.
+The repair command-line tool and `Par2Repairer` stream slices through bounded
+buffers. SIMD MD5 state is retained between reads, with a scalar streaming path
+for single-message jobs. Up to 16 consecutive ranges from one file share a
+job. Each lane reads at most 64 KiB at a time, and message buffers share an
+8 MiB working-space target. Workers retain one file handle between jobs.
 
-The scanner uses read buffers between 64 KiB and 8 MiB. It allocates outgoing
-and candidate buffers only when needed, with at most three buffers per scanner.
-This removes slice-sized allocations and the repeated movement of a large
-sliding window. Candidate confirmation and outgoing-byte reads can reread data
-when a slice exceeds the buffer. Existing resident bytes are reused.
+The scanner uses read buffers between 64 KiB and 256 KiB. It allocates outgoing
+and candidate buffers only when needed. Parallel scanners share the verification
+working-space target. Candidate confirmation and outgoing-byte reads can reread
+data when a slice exceeds the buffer. Existing resident bytes are reused.
+
+Reconstruction chunks are capped at 256 KiB as well as the configured buffer
+budget. This reduces the input pipeline and output working set for ordinary
+1 MiB slices. Whole-file hash workers are also limited by their buffer costs.
 
 Cancellation is checked between streaming chunks. A cancelled scan returns a
 whole-file digest only if the file has already been completely hashed. It
 stops without reading the remaining file just to finish that digest.
 
-`--mem` controls the Reed–Solomon buffer budget, with a 16 MiB minimum.
-Hashing, scanning, matrices, metadata, thread stacks, and allocator overhead
-also consume memory. These measurements cover the repair command-line tool and
-`Par2Repairer`. The separate APIs that accept or retain complete slices have
-different memory requirements.
+`--mem` controls the per-phase buffer budget, with a 16 MiB minimum.
+Verification uses at most its 8 MiB working-space target for message buffers.
+Matrices, metadata, thread stacks, and allocator overhead also consume memory.
+Allocators can retain freed buffers between phases. These measurements cover
+`Par2Repairer` and the repair command-line tool. APIs that accept or retain
+complete slices have different memory requirements.
+
+## Small archive comparison
+
+The streaming SIMD implementation in `d8eeea4` was compared with `d10eb91`
+(the first bounded-buffer change) and Turbo 1.5.0 on the same M4 host.
+The main fixture has 10 independent random files of 100 MiB each, 1 MiB slices,
+and 100 recovery slices. Tool order rotates between repetitions, and files are
+warmed before each timed process. The table shows medians of three runs with
+ten requested compute threads. Every repair passed a byte comparison.
+
+| Budget MiB | Scenario | Turbo seconds | par-rs seconds | Turbo CPU seconds | par-rs CPU seconds | Turbo peak MiB | par-rs peak MiB |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | Intact verification | 0.785 | 0.087 | 1.436 | 0.558 | 6.4 | 8.2 |
+| 16 | 40 damaged slices | 1.925 | 0.629 | 4.986 | 2.851 | 26.8 | 28.8 |
+| 16 | One missing file | 1.478 | 1.492 | 6.022 | 4.149 | 23.3 | 31.2 |
+| 256 | Intact verification | 0.774 | 0.068 | 1.420 | 0.568 | 5.4 | 8.2 |
+| 256 | 40 damaged slices | 1.846 | 0.494 | 4.972 | 3.464 | 83.1 | 82.3 |
+| 256 | One missing file | 1.530 | 0.920 | 6.458 | 6.536 | 139.2 | 123.1 |
+
+At the 256 MiB setting, earlier peak RSS was 323.3 MiB for verification,
+663.1 MiB for scattered damage, and 593.6 MiB for a missing file. The missing-file
+repair takes about 11% longer than that earlier implementation while reducing
+peak RAM about 79%. It remains faster than Turbo in these measurements.
+
+A second fixture uses 64 files of 16 MiB, with one slice per file. At the
+256 MiB setting, current verification takes 0.205 seconds, 1.738 CPU seconds,
+and 3.6 MiB peak RSS. Turbo takes 1.185 seconds, 1.866 CPU seconds, and
+35.3 MiB. This case exercises the scalar streaming path for singleton jobs.
+
+The warm-cache SSD measurements leave cold-cache and rotational-disk throughput
+unverified. Full measurements are in [the buffer-budget results](bench/results/buffer-budget-m4.json).
+
+To repeat both layouts, build the baseline from `d10eb91` separately and supply
+its executable along with the current build and Turbo.
+
+```sh
+python3 bench/buffer_budget.py --baseline /path/to/baseline/par-rs --current target/release/examples/par-rs --turbo /path/to/par2
+python3 bench/buffer_budget.py --baseline /path/to/baseline/par-rs --current target/release/examples/par-rs --turbo /path/to/par2 --root /tmp/par-rs-single-slice --single-slice-files
+```
 
 ## Large archive comparison
 
@@ -30,7 +73,7 @@ The workload contains 200 files of 500 MiB each, totaling 97.656 GiB.
 The benchmark uses Apple M4, 32 GiB RAM, APFS, ten compute threads, and a
 256 MiB repair-buffer budget. Turbo uses its default two verification threads.
 Each scenario starts from fresh APFS clones of the same source files.
-Turbo runs first, followed by `par-rs`. Each row is one measured run.
+In the first pass, Turbo runs first, followed by `par-rs`. Each row is one measured run.
 
 The source files share a random template with a unique 4 KiB marker in every
 50 MiB segment. This exercises real hashing and reconstruction while limiting
@@ -48,7 +91,44 @@ scenarios use 250 MiB slices, 400 source slices, and 160 recovery slices.
 - Insufficient parity removes 80 files and withholds 20 recovery slices.
   Both tools must refuse repair and leave the missing files absent.
 
-### Results with bounded buffers
+### Results with streamed SIMD buffers
+
+These follow-up runs use `d8eeea4` and the same source fixture. The Turbo
+reference measurements below are reused from the earlier pass, rather than
+rerun alongside this executable. Each large scenario has one measured run,
+so cache state and timing variation limit the comparison.
+
+| Scenario | Turbo seconds | par-rs seconds | Turbo CPU seconds | par-rs CPU seconds | Turbo peak MiB | par-rs peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| One missing file | 125.8 | 89.2 | 229.0 | 130.3 | 367.2 | 65.9 |
+| Scattered 10% damage | 457.6 | 191.9 | 916.5 | 905.1 | 1291.6 | 82.2 |
+| Whole-file 40% loss | 288.5 | 251.0 | 1086.1 | 1175.6 | 772.0 | 156.1 |
+| Mixed 40% loss | 310.1 | 281.3 | 1138.4 | 1359.3 | 772.2 | 146.9 |
+| Insufficient parity | 116.0 | 31.2 | 162.6 | 111.3 | 503.5 | 4.7 |
+
+Compared with the first bounded-buffer implementation below, successful
+large repairs take 20–32% longer with the tighter chunk cap. Peak RSS falls
+43–84%, and total CPU time falls or remains nearly unchanged. All these
+repairs remain faster than the recorded Turbo runs. The smaller working set
+trades some throughput for lower memory use.
+
+A separate two-thread run with `--mem 16` and a 256-descriptor limit restored
+the missing 500 MiB file in 258.3 seconds with 24.4 MiB peak RAM. It used 100.9 CPU seconds.
+
+The final executable hash, correctness checks, read counters, and all six
+runs are in [the streamed results](bench/results/large-streamed-m4.json).
+
+The sampled process read counters for the final executable were as follows.
+
+| Scenario | Turbo read GiB | par-rs read GiB |
+| --- | ---: | ---: |
+| One missing file | 194.9 | 195.0 |
+| Scattered 10% damage | 258.0 | 237.0 |
+| Whole-file 40% loss | 229.5 | 233.4 |
+| Mixed 40% loss | 246.6 | 253.3 |
+| Insufficient parity | 92.8 | 58.6 |
+
+### First bounded-buffer results
 
 These runs use the implementation in `f5566ce`, built with Rust 1.99.1,
 and par2cmdline-turbo 1.5.0. Every expected repair or refusal passed validation.
@@ -75,7 +155,7 @@ The sampled process read counters were as follows.
 The complete metrics and executable hashes are in
 [the measurement file](bench/results/large-set-m4.json).
 
-### Reduced-resource run
+### First reduced-resource run
 
 A separate run restored the missing 500 MiB file in the same 97.656 GiB set
 with two threads, `--mem 16`, and a 256-descriptor soft limit. It passed the
@@ -121,13 +201,19 @@ Wall time includes the complete repair process. CPU time is user plus system
 time from `wait4`. Peak RSS comes from the same process resource report.
 Disk bytes come from sampled Darwin process counters. Buffered writes can be
 underreported, so those counters do not establish total physical writes.
+Wrapped negative accounting values are recorded as unavailable in the streamed
+results, with the original unsigned value retained for inspection.
 
 ## Regression coverage
 
 `just ci` runs allocation bounds, a 300-file descriptor test, bounded scanner
 reads with shifted large slices and a padded tail, huge-slice CRC rejection,
 and cancellation during a chunked read. Existing tests cover cross-tool repair,
-renamed and split files, and Reed–Solomon reconstruction.
+renamed and split files, and Reed–Solomon reconstruction. The buffer regression
+test also requests 64 verification threads with a 16 MiB budget and checks
+aggregate live allocations during intact and damaged scans. Reconstruction
+has a separate allocation ceiling. Scalar and SIMD hashes are checked against
+independent digests at message, chunk, padding, and lane-count boundaries.
 
 These deterministic checks run in ordinary CI. Timing comparisons use the
 standalone harness because shared runner scheduling and cache state affect
