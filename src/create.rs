@@ -39,6 +39,10 @@ pub enum VolumeScheme {
     /// Exact volume count, with extra slices in the first volumes.
     /// Counts must be positive and no greater than the recovery slice count.
     Balanced(u32),
+    /// Maximum recovery slices per volume, with an exponential prefix.
+    /// The cap must be positive. It counts payload slices, not file bytes,
+    /// and does not derive a limit from source-file sizes.
+    Limited(u32),
     /// `par2cmdline`'s default: powers of two starting at 1 slice per volume, remainder in the last.
     Exponential,
 }
@@ -107,12 +111,14 @@ pub enum CreateError {
     BadSliceSize(u64),
     /// No source files.
     NoSources,
-    /// Balanced recovery volumes require nonempty source data.
+    /// Balanced and limited recovery volumes require nonempty source data.
     NoSourceData,
     /// More than 32768 input slices.
     TooManyInputSlices(u64),
     /// Recovery exponents would exceed 65535.
     TooManyRecoveryBlocks,
+    /// A limited layout requires a positive slice cap.
+    BadVolumeLimit(u32),
     /// Invalid requested count for a balanced volume layout.
     BadVolumeCount {
         /// Requested number of volumes.
@@ -141,13 +147,16 @@ impl fmt::Display for CreateError {
             ),
             CreateError::NoSources => f.write_str("no source files"),
             CreateError::NoSourceData => {
-                f.write_str("balanced volumes require nonempty source data")
+                f.write_str("balanced and limited volumes require nonempty source data")
             }
             CreateError::TooManyInputSlices(n) => write!(
                 f,
                 "{n} input slices exceed the PAR2 limit of 32768; use a larger slice size"
             ),
             CreateError::TooManyRecoveryBlocks => f.write_str("recovery exponents exceed 65535"),
+            CreateError::BadVolumeLimit(limit) => {
+                write!(f, "volume slice limit {limit} must be positive")
+            }
             CreateError::BadVolumeCount {
                 count,
                 recovery_blocks,
@@ -253,8 +262,9 @@ impl InputReader for SourceReader {
 ///
 /// Returns `(first exponent offset, slice count)` for each volume. A balanced
 /// layout requires a positive volume count no greater than `total`. This also
-/// rejects explicit balanced counts when `total` is zero. Other schemes allow
-/// zero recovery slices and retain their existing layout behavior.
+/// rejects explicit balanced counts when `total` is zero. A limited layout
+/// requires a positive slice cap, including when `total` is zero. Positive caps
+/// allow zero recovery slices. Other schemes retain their existing behavior.
 ///
 /// Use this function for fallible planning and before reading source files.
 pub fn checked_volume_layout(
@@ -263,6 +273,33 @@ pub fn checked_volume_layout(
 ) -> Result<Vec<(u32, u32)>, CreateError> {
     if total > 65535 {
         return Err(CreateError::TooManyRecoveryBlocks);
+    }
+    if let VolumeScheme::Limited(cap) = scheme {
+        if cap == 0 {
+            return Err(CreateError::BadVolumeLimit(cap));
+        }
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+        let (prefix, tails, cap) = limited_geometry(cap, total);
+        let prefix_files = u32::BITS - prefix.leading_zeros();
+        let mut layout = Vec::new();
+        layout
+            .try_reserve_exact((prefix_files + tails) as usize)
+            .map_err(|error| CreateError::Io(io::Error::other(error)))?;
+        let mut first = 0;
+        let mut step = 1;
+        while first < prefix {
+            let count = step.min(prefix - first);
+            layout.push((first, count));
+            first += count;
+            step *= 2;
+        }
+        for _ in 0..tails {
+            layout.push((first, cap));
+            first += cap;
+        }
+        return Ok(layout);
     }
     let VolumeScheme::Balanced(count) = scheme else {
         return Ok(volume_layout(scheme, total));
@@ -288,12 +325,20 @@ pub fn checked_volume_layout(
     Ok(layout)
 }
 
+// The checked planner bounds total to 65535 and requires positive cap/total.
+fn limited_geometry(cap: u32, total: u32) -> (u32, u32, u32) {
+    let cap = cap.min(total);
+    let tails = total / cap - 1;
+    (total - tails * cap, tails, cap)
+}
+
 /// Volume layout: `(first exponent offset, count)` per volume.
 ///
 /// # Compatibility warning
 ///
-/// For `Balanced`, invalid counts, totals greater than 65535, or allocation failure
-/// return an empty layout. This is indistinguishable from zero recovery.
+/// For `Balanced` and `Limited`, invalid parameters, totals greater than 65535,
+/// or allocation failure return an empty layout. This is indistinguishable
+/// from zero recovery.
 /// Use [`checked_volume_layout`] when consuming the new variant. Existing
 /// schemes retain their previous behavior, including `Uniform(0)`.
 pub fn volume_layout(scheme: VolumeScheme, total: u32) -> Vec<(u32, u32)> {
@@ -302,7 +347,7 @@ pub fn volume_layout(scheme: VolumeScheme, total: u32) -> Vec<(u32, u32)> {
         return out;
     }
     match scheme {
-        VolumeScheme::Balanced(_) => {
+        VolumeScheme::Balanced(_) | VolumeScheme::Limited(_) => {
             return checked_volume_layout(scheme, total).unwrap_or_default();
         }
         VolumeScheme::Single => out.push((0, total)),
@@ -329,27 +374,40 @@ pub fn volume_layout(scheme: VolumeScheme, total: u32) -> Vec<(u32, u32)> {
     out
 }
 
-fn creation_volume_name(
-    base: &str,
-    first: u32,
-    count: u32,
-    end: u32,
-    total: u32,
+// Compute once per set so a cap of one does not cause quadratic name planning.
+fn creation_volume_widths(
     scheme: VolumeScheme,
-) -> String {
-    if let VolumeScheme::Balanced(volumes) = scheme {
-        // Checked planning guarantees positive counts and a nonempty layout.
-        let first_width = (end.ilog10() + 1) as usize;
-        let count_width = (total.div_ceil(volumes).ilog10() + 1) as usize;
-        format!("{base}.vol{first:0first_width$}+{count:0count_width$}.par2")
-    } else {
-        crate::filenames::volume_filename(
-            base,
-            first,
-            count,
-            crate::filenames::volume_number_width(end),
-        )
+    total: u32,
+    first_exponent: u32,
+    layout: &[(u32, u32)],
+) -> (usize, usize) {
+    let digits = |n: u32| (n.max(1).ilog10() + 1) as usize;
+    match scheme {
+        VolumeScheme::Balanced(volumes) => (
+            digits(first_exponent + total),
+            digits(total.div_ceil(volumes)),
+        ),
+        VolumeScheme::Limited(cap) => {
+            let (prefix, _, _) = limited_geometry(cap, total);
+            // The index allocation's naming sentinel ends the prefix. Tail
+            // volume starts can exceed that sentinel, but not the set end.
+            let last_start = layout.last().map_or(0, |&(first, _)| first);
+            let largest = layout.iter().map(|&(_, count)| count).max().unwrap_or(1);
+            (
+                digits(first_exponent + prefix.max(last_start)),
+                digits(largest),
+            )
+        }
+        _ => {
+            let width = crate::filenames::volume_number_width(first_exponent + total);
+            (width, width)
+        }
     }
+}
+
+fn creation_volume_name(base: &str, first: u32, count: u32, widths: (usize, usize)) -> String {
+    let (first_width, count_width) = widths;
+    format!("{base}.vol{first:0first_width$}+{count:0count_width$}.par2")
 }
 
 /// Where each recovery slice lives inside its volume file.
@@ -468,7 +526,12 @@ pub fn create(
     if input_slices > 32768 {
         return Err(CreateError::TooManyInputSlices(input_slices));
     }
-    if input_slices == 0 && matches!(opts.volumes, VolumeScheme::Balanced(_)) {
+    if input_slices == 0
+        && matches!(
+            opts.volumes,
+            VolumeScheme::Balanced(_) | VolumeScheme::Limited(_)
+        )
+    {
         return Err(CreateError::NoSourceData);
     }
     let ids: Vec<FileId> = hashed.iter().map(|h| h.file_id).collect();
@@ -516,15 +579,9 @@ pub fn create(
         locations: vec![(0, 0); if with_recovery { total as usize } else { 0 }],
     };
     if with_recovery {
+        let widths = creation_volume_widths(opts.volumes, total, opts.first_exponent, &layout);
         for (vi, &(first, count)) in layout.iter().enumerate() {
-            let name = creation_volume_name(
-                base,
-                opts.first_exponent + first,
-                count,
-                opts.first_exponent + total,
-                total,
-                opts.volumes,
-            );
+            let name = creation_volume_name(base, opts.first_exponent + first, count, widths);
             let path = out_dir.join(&name);
             let copies = 1 + (31 - count.max(1).leading_zeros()); // 1 + floor(log2(count))
             for i in 0..count {
@@ -937,7 +994,12 @@ pub fn build_set(
     if input_slices > 32768 {
         return Err(CreateError::TooManyInputSlices(input_slices as u64));
     }
-    if input_slices == 0 && matches!(opts.volumes, VolumeScheme::Balanced(_)) {
+    if input_slices == 0
+        && matches!(
+            opts.volumes,
+            VolumeScheme::Balanced(_) | VolumeScheme::Limited(_)
+        )
+    {
         return Err(CreateError::NoSourceData);
     }
     let ids: Vec<FileId> = mems.iter().map(|m| m.id).collect();
@@ -993,15 +1055,14 @@ pub fn build_set(
             EngineConfig::default(),
             opts.kernel,
         )?;
+        let widths = creation_volume_widths(
+            opts.volumes,
+            opts.recovery_blocks,
+            opts.first_exponent,
+            &layout,
+        );
         for (first, count) in layout {
-            let name = creation_volume_name(
-                base,
-                opts.first_exponent + first,
-                count,
-                opts.first_exponent + opts.recovery_blocks,
-                opts.recovery_blocks,
-                opts.volumes,
-            );
+            let name = creation_volume_name(base, opts.first_exponent + first, count, widths);
             let mut vol = Vec::new();
             for i in first..first + count {
                 let (e, data) = (exponents[i as usize], &rec[i as usize]);
