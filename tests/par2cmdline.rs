@@ -317,6 +317,13 @@ fn balanced_volumes_match_reference_and_repair() {
     };
     for (total, volumes, first_exponent, expected, names) in [
         (
+            6,
+            3,
+            0,
+            vec![(0, 2), (2, 2), (4, 2)],
+            vec!["set.vol0+2.par2", "set.vol2+2.par2", "set.vol4+2.par2"],
+        ),
+        (
             7,
             3,
             17,

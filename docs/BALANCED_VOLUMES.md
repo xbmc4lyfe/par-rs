@@ -14,14 +14,17 @@ or excess balanced counts, including any balanced count with zero recovery
 slices. Balanced planning reserves its bounded output before filling it.
 The disk creator and in-memory builder use this checked path before source
 metadata, hashing, encoding, or output creation. Existing exponent bounds
-remain in place. Omit an explicit balanced layout for an index-only set.
+remain in place. A Balanced request with no input slices returns
+`NoSourceData` after source identification and before output acquisition.
+Existing schemes still allow index-only output for empty source contents.
+Omit an explicit balanced layout for an index-only set.
 
 ## Compatibility
 
 Existing `CreateOptions` and `SetOptions` fields and defaults are unchanged.
 The public `VolumeScheme` and `CreateError` enums have new variants.
 Consumers with exhaustive matches must handle `Balanced` and
-`BadVolumeCount`. This requires source changes for those consumers; it is
+`BadVolumeCount` and `NoSourceData`. This requires source changes for those consumers; it is
 not a claim of compatibility for every downstream source file. This Git
 revision does not publish a new crate version.
 

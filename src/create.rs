@@ -107,6 +107,8 @@ pub enum CreateError {
     BadSliceSize(u64),
     /// No source files.
     NoSources,
+    /// Balanced recovery volumes require nonempty source data.
+    NoSourceData,
     /// More than 32768 input slices.
     TooManyInputSlices(u64),
     /// Recovery exponents would exceed 65535.
@@ -138,6 +140,9 @@ impl fmt::Display for CreateError {
                 "invalid slice size {s} (must be a positive multiple of 4)"
             ),
             CreateError::NoSources => f.write_str("no source files"),
+            CreateError::NoSourceData => {
+                f.write_str("balanced volumes require nonempty source data")
+            }
             CreateError::TooManyInputSlices(n) => write!(
                 f,
                 "{n} input slices exceed the PAR2 limit of 32768; use a larger slice size"
@@ -462,6 +467,9 @@ pub fn create(
     let input_slices: u64 = hashed.iter().map(|h| h.slices.len() as u64).sum();
     if input_slices > 32768 {
         return Err(CreateError::TooManyInputSlices(input_slices));
+    }
+    if input_slices == 0 && matches!(opts.volumes, VolumeScheme::Balanced(_)) {
+        return Err(CreateError::NoSourceData);
     }
     let ids: Vec<FileId> = hashed.iter().map(|h| h.file_id).collect();
     let main_body = encode_main_body(opts.slice_size, &ids, &[]);
@@ -929,6 +937,9 @@ pub fn build_set(
     if input_slices > 32768 {
         return Err(CreateError::TooManyInputSlices(input_slices as u64));
     }
+    if input_slices == 0 && matches!(opts.volumes, VolumeScheme::Balanced(_)) {
+        return Err(CreateError::NoSourceData);
+    }
     let ids: Vec<FileId> = mems.iter().map(|m| m.id).collect();
     let main_body = encode_main_body(ss as u64, &ids, &[]);
     let set_id = compute_set_id(&main_body);
@@ -1075,6 +1086,88 @@ mod tests {
             checked_volume_layout(VolumeScheme::Balanced(u32::MAX), u32::MAX),
             Err(CreateError::TooManyRecoveryBlocks)
         ));
+    }
+
+    #[test]
+    fn balanced_empty_source_data_fails_without_creating_output() {
+        let dir = tmpdir("balanced-empty");
+        std::fs::write(dir.join("empty.bin"), b"").unwrap();
+        std::fs::write(dir.join("set.par2"), b"keep this index").unwrap();
+        let sources = [SourceFile::new(dir.join("empty.bin"))];
+        let options = CreateOptions {
+            slice_size: 4,
+            recovery_blocks: 7,
+            volumes: VolumeScheme::Balanced(3),
+            ..CreateOptions::default()
+        };
+        for destination in [dir.join("missing"), dir.clone()] {
+            assert!(matches!(
+                create(
+                    &sources,
+                    &destination,
+                    "set",
+                    &options,
+                    None,
+                    &mut |_, _, _| {}
+                ),
+                Err(CreateError::NoSourceData)
+            ));
+        }
+        assert!(matches!(
+            build_set(
+                "set",
+                &[("empty.bin", b"")],
+                &SetOptions {
+                    slice_size: 4,
+                    recovery_blocks: 7,
+                    volumes: VolumeScheme::Balanced(3),
+                    ..SetOptions::default()
+                }
+            ),
+            Err(CreateError::NoSourceData)
+        ));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read(dir.join("set.par2")).unwrap(),
+            b"keep this index"
+        );
+        assert_eq!(std::fs::read(dir.join("empty.bin")).unwrap(), b"");
+        for (index, scheme) in [
+            VolumeScheme::Single,
+            VolumeScheme::Uniform(0),
+            VolumeScheme::Uniform(3),
+            VolumeScheme::Exponential,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let report = create(
+                &sources,
+                &dir.join(format!("legacy-{index}")),
+                "set",
+                &CreateOptions {
+                    volumes: scheme,
+                    ..options.clone()
+                },
+                None,
+                &mut |_, _, _| {},
+            )
+            .unwrap();
+            assert_eq!(report.files.len(), 1);
+            let memory = build_set(
+                "set",
+                &[("empty.bin", b"")],
+                &SetOptions {
+                    slice_size: 4,
+                    recovery_blocks: 7,
+                    volumes: scheme,
+                    ..SetOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(memory.volumes.is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
