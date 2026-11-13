@@ -441,3 +441,144 @@ fn balanced_volumes_match_reference_and_repair() {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[test]
+fn limited_volumes_match_reference_and_cross_repair() {
+    let explicit = std::env::var_os("PAR2_LAYOUT_REFERENCE");
+    if explicit.is_none() && !par2_available() {
+        eprintln!("par2 not available; skipping limited reference comparison");
+        return;
+    }
+    let reference = explicit.unwrap_or_else(|| "par2".into());
+    let invoke = |dir: &Path, args: &[&str]| {
+        let out = Command::new(&reference)
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{reference:?} {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    for (total, size, first, counts) in [
+        (7, 12, 0, vec![1, 2, 1, 3]),
+        (8, 16, 2, vec![1, 2, 1, 4]),
+        (9, 20, 0, vec![1, 2, 4, 2]),
+        (10, 16, 0, vec![1, 2, 3, 4]),
+        (63, 4, 0, vec![1; 63]),
+        (8, 13, 0, vec![1, 2, 1, 4]),
+        (7, 12, 32768, vec![1, 2, 1, 3]),
+        (0, 16, 0, vec![]),
+        (3, 64, 99, vec![1, 2]),
+    ] {
+        let dir = tmpdir(&format!("limited-reference-{total}-{size}-{first}"));
+        let original = rnd(size, 435);
+        let source = dir.join("data.bin");
+        std::fs::write(&source, &original).unwrap();
+        let cap = (size as u32).div_ceil(4);
+        let own = dir.join("own");
+        let report = create(
+            &[SourceFile::new(source)],
+            &own,
+            "set",
+            &CreateOptions {
+                slice_size: 4,
+                recovery_blocks: total,
+                first_exponent: first,
+                volumes: VolumeScheme::Limited(cap),
+                ..CreateOptions::default()
+            },
+            None,
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+        let external = dir.join("external");
+        std::fs::create_dir(&external).unwrap();
+        for destination in [&own, &external] {
+            std::fs::write(destination.join("data.bin"), &original).unwrap();
+        }
+        invoke(
+            &external,
+            &[
+                "c",
+                "-q",
+                "-t1",
+                "-s4",
+                &format!("-c{total}"),
+                "-l",
+                &format!("-f{first}"),
+                "set.par2",
+                "data.bin",
+            ],
+        );
+        assert_eq!(report.files.len(), counts.len() + 1);
+        let own_names: std::collections::BTreeSet<_> = report
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        let external_names: std::collections::BTreeSet<_> = std::fs::read_dir(&external)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "par2"))
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        assert_eq!(own_names, external_names);
+        let mut next = first;
+        for (&count, output) in counts.iter().zip(report.files.iter().skip(1)) {
+            for path in [output.clone(), external.join(output.file_name().unwrap())] {
+                let set = load_par2_file(&path, ScanOptions::FULL).unwrap();
+                assert_eq!(
+                    set.recovery.keys().copied().collect::<Vec<_>>(),
+                    (next..next + count).collect::<Vec<_>>()
+                );
+                assert!(set.recovery.values().all(|slice| slice.md5_verified));
+            }
+            next += count;
+        }
+        assert_eq!(next, first + total);
+        invoke(&own, &["v", "-q", "set.par2"]);
+        if total > 0 {
+            // Each creator is checked with both a missing target and a corrupt
+            // target by the other implementation's actual repair path.
+            for corrupt in [false, true] {
+                if !corrupt && total < cap {
+                    continue; // A missing whole file needs at least cap recovery slices.
+                }
+                let mut damaged = original.clone();
+                damaged[0] ^= 255;
+                for destination in [&own, &external] {
+                    let path = destination.join("data.bin");
+                    if corrupt {
+                        std::fs::write(path, &damaged).unwrap();
+                    } else {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+                invoke(&own, &["r", "-q", "-t1", "set.par2"]);
+                assert_eq!(std::fs::read(own.join("data.bin")).unwrap(), original);
+                if corrupt {
+                    assert_eq!(std::fs::read(own.join("data.bin.1")).unwrap(), damaged);
+                }
+                let mut repairer = Par2Repairer::new(&external, RepairOptions::default());
+                repairer.load_par2_set(&external.join("set.par2")).unwrap();
+                repairer.finalize().unwrap();
+                let verified = repairer.verify(None, &mut NullObserver).unwrap();
+                assert!(verified.repair_possible);
+                assert!(matches!(
+                    repairer.repair(&mut NullObserver).unwrap(),
+                    RepairResult::Repaired { .. }
+                ));
+                assert_eq!(std::fs::read(external.join("data.bin")).unwrap(), original);
+                if corrupt {
+                    assert_eq!(std::fs::read(external.join("data.bin.1")).unwrap(), damaged);
+                }
+                invoke(&external, &["v", "-q", "set.par2"]);
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
