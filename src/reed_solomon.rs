@@ -794,7 +794,9 @@ impl<'a> Engine<'a> {
                     }
                     let mut processed = 0usize;
                     let mut status: Result<(), RsError> = Ok(());
-                    for batch in batch_rx.iter() {
+                    // Own the receiver here so early exit disconnects blocked
+                    // producers before the scope waits to join them.
+                    for batch in batch_rx {
                         let batch = match batch {
                             Ok(b) => b,
                             Err(e) => {
