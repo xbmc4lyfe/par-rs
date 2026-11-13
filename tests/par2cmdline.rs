@@ -293,3 +293,151 @@ fn large_slice_count_and_many_missing_blocks() {
     check(&dir, &files);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn balanced_volumes_match_reference_and_repair() {
+    let explicit = std::env::var_os("PAR2_LAYOUT_REFERENCE");
+    if explicit.is_none() && !par2_available() {
+        eprintln!("par2 not available; skipping balanced reference comparison");
+        return;
+    }
+    let reference = explicit.unwrap_or_else(|| "par2".into());
+    let invoke = |dir: &Path, args: &[&str]| {
+        let out = Command::new(&reference)
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{reference:?} {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    for (total, volumes, first_exponent, expected, names) in [
+        (
+            6,
+            3,
+            0,
+            vec![(0, 2), (2, 2), (4, 2)],
+            vec!["set.vol0+2.par2", "set.vol2+2.par2", "set.vol4+2.par2"],
+        ),
+        (
+            7,
+            3,
+            17,
+            vec![(17, 3), (20, 2), (22, 2)],
+            vec!["set.vol17+3.par2", "set.vol20+2.par2", "set.vol22+2.par2"],
+        ),
+        (
+            10,
+            4,
+            17,
+            vec![(17, 3), (20, 3), (23, 2), (25, 2)],
+            vec![
+                "set.vol17+3.par2",
+                "set.vol20+3.par2",
+                "set.vol23+2.par2",
+                "set.vol25+2.par2",
+            ],
+        ),
+        (
+            8,
+            3,
+            17,
+            vec![(17, 3), (20, 3), (23, 2)],
+            vec!["set.vol17+3.par2", "set.vol20+3.par2", "set.vol23+2.par2"],
+        ),
+        (
+            7,
+            3,
+            0,
+            vec![(0, 3), (3, 2), (5, 2)],
+            vec!["set.vol0+3.par2", "set.vol3+2.par2", "set.vol5+2.par2"],
+        ),
+        (
+            19,
+            2,
+            0,
+            vec![(0, 10), (10, 9)],
+            vec!["set.vol00+10.par2", "set.vol10+09.par2"],
+        ),
+        (
+            7,
+            3,
+            32768,
+            vec![(32768, 3), (32771, 2), (32773, 2)],
+            vec![
+                "set.vol32768+3.par2",
+                "set.vol32771+2.par2",
+                "set.vol32773+2.par2",
+            ],
+        ),
+    ] {
+        let dir = tmpdir(&format!("balanced-reference-{total}-{volumes}"));
+        let files = write_files(&dir, &[256]);
+        let source = SourceFile::new(dir.join("data0.bin"));
+        let options = CreateOptions {
+            slice_size: 64,
+            recovery_blocks: total,
+            first_exponent,
+            volumes: VolumeScheme::Balanced(volumes),
+            ..CreateOptions::default()
+        };
+        let own = dir.join("own");
+        std::fs::create_dir(&own).unwrap();
+        std::fs::write(own.join("data0.bin"), &files[0].1).unwrap();
+        let report = create(&[source], &own, "set", &options, None, &mut |_, _, _| {}).unwrap();
+        let external = dir.join("external");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("data0.bin"), &files[0].1).unwrap();
+        invoke(
+            &external,
+            &[
+                "c",
+                "-q",
+                "-t1",
+                "-s64",
+                &format!("-c{total}"),
+                &format!("-n{volumes}"),
+                "-u",
+                &format!("-f{first_exponent}"),
+                "set.par2",
+                "data0.bin",
+            ],
+        );
+        for (((first, count), name), output) in
+            expected.iter().zip(&names).zip(report.files.iter().skip(1))
+        {
+            assert_eq!(output.file_name().unwrap(), *name);
+            for path in [output.clone(), external.join(name)] {
+                let set = load_par2_file(&path, ScanOptions::FULL).unwrap();
+                assert_eq!(
+                    set.recovery.keys().copied().collect::<Vec<_>>(),
+                    (*first..first + count).collect::<Vec<_>>()
+                );
+                assert!(set.recovery.values().all(|slice| slice.md5_verified));
+            }
+        }
+        assert_eq!(report.files.len(), expected.len() + 1);
+        invoke(&own, &["v", "-q", "set.par2"]);
+        std::fs::remove_file(own.join("data0.bin")).unwrap();
+        invoke(&own, &["r", "-q", "-t1", "set.par2"]);
+        check(&own, &files);
+        std::fs::remove_file(external.join("data0.bin")).unwrap();
+        let mut repairer = Par2Repairer::new(&external, RepairOptions::default());
+        repairer.load_par2_set(&external.join("set.par2")).unwrap();
+        repairer.finalize().unwrap();
+        let verified = repairer.verify(None, &mut NullObserver).unwrap();
+        assert!(verified.repair_possible);
+        assert_eq!(verified.missing_blocks, 4);
+        assert!(matches!(
+            repairer.repair(&mut NullObserver).unwrap(),
+            RepairResult::Repaired { .. }
+        ));
+        check(&external, &files);
+        invoke(&external, &["v", "-q", "set.par2"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

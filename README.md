@@ -47,7 +47,7 @@ differential tests instead. `unsafe` is confined to the SIMD kernels (`gf16/simd
 | Repair | `repairer` | `Par2Repairer`: load (metadata only), quick verify from download CRCs, full scan, misnamed/split/extra/dupe files, incremental volume loading, backup rotation (`.1`, `.bak`, delete), post-repair verification, cancellation, observer callbacks |
 | Streaming | `streaming` | fold verified blocks into Reed-Solomon syndromes **while downloading**; repair at the end reads only the recovery slices; early repair as soon as `damaged + pending <= recovery`; works before recovery volumes arrive (syndromes need only the exponents) |
 | Rename | `renamer` | `ParRenamer` port: par2-by-content detection, `<setid>.volNNN+01.PAR2` renaming, 16k-hash renaming, split-fragment and existing-target protection, missing-file detection with ignore extensions, `.bad` marking, dry-run |
-| Create | `create` | `build_set` (index + volumes in memory, UniFileN for non-ASCII names) and `create` on disk; exponential / uniform / single volumes, `par2cmdline`-compatible layout |
+| Create | `create` | `build_set` (index + volumes in memory, UniFileN for non-ASCII names) and `create` on disk; exponential / fixed-size / balanced / single volumes, `par2cmdline`-compatible layout |
 | C ABI | `ffi` | opaque repairer handle, callbacks for progress/messages/quick-verify, stateless CRC and name helpers, renamer entry point |
 
 ## Performance
@@ -280,6 +280,10 @@ Run these commands from the repository root:
 | x86_64 AVX2 / AVX-512BW kernels | compiled, not executed (emulator lacks AVX); `Kernel::detect()` self-tests every kernel against the scalar reference at startup and falls back on mismatch |
 
 ## API notes and deviations from the written specifications
+
+See [Balanced recovery volumes](docs/BALANCED_VOLUMES.md) for exact volume
+counts, checked planning, invalid-count behavior, and migration notes for
+exhaustive enum matches.
 
 * Root re-exports follow the `gf2` signatures: `crc32_zeros(len)`, `crc32_combine(crc1, crc2, len2: usize)`.
   The register-level variants with other signatures stay under `crc::` (`crc::crc32_zeros(crc, n)`,

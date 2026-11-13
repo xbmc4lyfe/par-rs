@@ -36,6 +36,9 @@ pub enum VolumeScheme {
     Single,
     /// Fixed number of slices per volume (the last one may be smaller).
     Uniform(u32),
+    /// Exact volume count, with extra slices in the first volumes.
+    /// Counts must be positive and no greater than the recovery slice count.
+    Balanced(u32),
     /// `par2cmdline`'s default: powers of two starting at 1 slice per volume, remainder in the last.
     Exponential,
 }
@@ -104,10 +107,19 @@ pub enum CreateError {
     BadSliceSize(u64),
     /// No source files.
     NoSources,
+    /// Balanced recovery volumes require nonempty source data.
+    NoSourceData,
     /// More than 32768 input slices.
     TooManyInputSlices(u64),
     /// Recovery exponents would exceed 65535.
     TooManyRecoveryBlocks,
+    /// Invalid requested count for a balanced volume layout.
+    BadVolumeCount {
+        /// Requested number of volumes.
+        count: u32,
+        /// Available recovery slices.
+        recovery_blocks: u32,
+    },
     /// Empty or invalid PAR2 name for a source.
     BadSourceName(PathBuf),
     /// Two sources resolve to the same file id.
@@ -128,11 +140,21 @@ impl fmt::Display for CreateError {
                 "invalid slice size {s} (must be a positive multiple of 4)"
             ),
             CreateError::NoSources => f.write_str("no source files"),
+            CreateError::NoSourceData => {
+                f.write_str("balanced volumes require nonempty source data")
+            }
             CreateError::TooManyInputSlices(n) => write!(
                 f,
                 "{n} input slices exceed the PAR2 limit of 32768; use a larger slice size"
             ),
             CreateError::TooManyRecoveryBlocks => f.write_str("recovery exponents exceed 65535"),
+            CreateError::BadVolumeCount {
+                count,
+                recovery_blocks,
+            } => write!(
+                f,
+                "volume count {count} must be positive and no greater than {recovery_blocks} recovery blocks"
+            ),
             CreateError::BadSourceName(p) => write!(f, "invalid PAR2 name for {}", p.display()),
             CreateError::DuplicateSource(p) => write!(f, "duplicate source {}", p.display()),
             CreateError::Io(e) => write!(f, "I/O error: {e}"),
@@ -227,13 +249,62 @@ impl InputReader for SourceReader {
     }
 }
 
+/// Plan volumes with at most 65535 recovery slices.
+///
+/// Returns `(first exponent offset, slice count)` for each volume. A balanced
+/// layout requires a positive volume count no greater than `total`. This also
+/// rejects explicit balanced counts when `total` is zero. Other schemes allow
+/// zero recovery slices and retain their existing layout behavior.
+///
+/// Use this function for fallible planning and before reading source files.
+pub fn checked_volume_layout(
+    scheme: VolumeScheme,
+    total: u32,
+) -> Result<Vec<(u32, u32)>, CreateError> {
+    if total > 65535 {
+        return Err(CreateError::TooManyRecoveryBlocks);
+    }
+    let VolumeScheme::Balanced(count) = scheme else {
+        return Ok(volume_layout(scheme, total));
+    };
+    if count == 0 || count > total {
+        return Err(CreateError::BadVolumeCount {
+            count,
+            recovery_blocks: total,
+        });
+    }
+    let mut layout = Vec::new();
+    layout
+        .try_reserve_exact(count as usize)
+        .map_err(|error| CreateError::Io(io::Error::other(error)))?;
+    let base = total / count;
+    let remainder = total % count;
+    let mut first = 0;
+    for index in 0..count {
+        let blocks = base + u32::from(index < remainder);
+        layout.push((first, blocks));
+        first += blocks;
+    }
+    Ok(layout)
+}
+
 /// Volume layout: `(first exponent offset, count)` per volume.
+///
+/// # Compatibility warning
+///
+/// For `Balanced`, invalid counts, totals greater than 65535, or allocation failure
+/// return an empty layout. This is indistinguishable from zero recovery.
+/// Use [`checked_volume_layout`] when consuming the new variant. Existing
+/// schemes retain their previous behavior, including `Uniform(0)`.
 pub fn volume_layout(scheme: VolumeScheme, total: u32) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     if total == 0 {
         return out;
     }
     match scheme {
+        VolumeScheme::Balanced(_) => {
+            return checked_volume_layout(scheme, total).unwrap_or_default();
+        }
         VolumeScheme::Single => out.push((0, total)),
         VolumeScheme::Uniform(n) => {
             let n = n.max(1);
@@ -256,6 +327,29 @@ pub fn volume_layout(scheme: VolumeScheme, total: u32) -> Vec<(u32, u32)> {
         }
     }
     out
+}
+
+fn creation_volume_name(
+    base: &str,
+    first: u32,
+    count: u32,
+    end: u32,
+    total: u32,
+    scheme: VolumeScheme,
+) -> String {
+    if let VolumeScheme::Balanced(volumes) = scheme {
+        // Checked planning guarantees positive counts and a nonempty layout.
+        let first_width = (end.ilog10() + 1) as usize;
+        let count_width = (total.div_ceil(volumes).ilog10() + 1) as usize;
+        format!("{base}.vol{first:0first_width$}+{count:0count_width$}.par2")
+    } else {
+        crate::filenames::volume_filename(
+            base,
+            first,
+            count,
+            crate::filenames::volume_number_width(end),
+        )
+    }
 }
 
 /// Where each recovery slice lives inside its volume file.
@@ -322,6 +416,7 @@ pub fn create(
     if (opts.first_exponent as u64 + opts.recovery_blocks as u64) > 65535 {
         return Err(CreateError::TooManyRecoveryBlocks);
     }
+    let layout = checked_volume_layout(opts.volumes, opts.recovery_blocks)?;
 
     // ---- identify sources ----
     // The file order (and so the Main packet and set id) only needs each file's length and its
@@ -373,6 +468,9 @@ pub fn create(
     if input_slices > 32768 {
         return Err(CreateError::TooManyInputSlices(input_slices));
     }
+    if input_slices == 0 && matches!(opts.volumes, VolumeScheme::Balanced(_)) {
+        return Err(CreateError::NoSourceData);
+    }
     let ids: Vec<FileId> = hashed.iter().map(|h| h.file_id).collect();
     let main_body = encode_main_body(opts.slice_size, &ids, &[]);
     let set_id = compute_set_id(&main_body);
@@ -418,11 +516,15 @@ pub fn create(
         locations: vec![(0, 0); if with_recovery { total as usize } else { 0 }],
     };
     if with_recovery {
-        let layout = volume_layout(opts.volumes, total);
-        let width = crate::filenames::volume_number_width(opts.first_exponent + total);
         for (vi, &(first, count)) in layout.iter().enumerate() {
-            let name =
-                crate::filenames::volume_filename(base, opts.first_exponent + first, count, width);
+            let name = creation_volume_name(
+                base,
+                opts.first_exponent + first,
+                count,
+                opts.first_exponent + total,
+                total,
+                opts.volumes,
+            );
             let path = out_dir.join(&name);
             let copies = 1 + (31 - count.max(1).leading_zeros()); // 1 + floor(log2(count))
             for i in 0..count {
@@ -789,6 +891,7 @@ pub fn build_set(
     if (opts.first_exponent as u64 + opts.recovery_blocks as u64) > 65535 {
         return Err(CreateError::TooManyRecoveryBlocks);
     }
+    let layout = checked_volume_layout(opts.volumes, opts.recovery_blocks)?;
     struct Mem<'a> {
         name: &'a str,
         data: &'a [u8],
@@ -833,6 +936,9 @@ pub fn build_set(
     let input_slices: usize = mems.iter().map(|m| m.slices.len()).sum();
     if input_slices > 32768 {
         return Err(CreateError::TooManyInputSlices(input_slices as u64));
+    }
+    if input_slices == 0 && matches!(opts.volumes, VolumeScheme::Balanced(_)) {
+        return Err(CreateError::NoSourceData);
     }
     let ids: Vec<FileId> = mems.iter().map(|m| m.id).collect();
     let main_body = encode_main_body(ss as u64, &ids, &[]);
@@ -887,12 +993,15 @@ pub fn build_set(
             EngineConfig::default(),
             opts.kernel,
         )?;
-        let layout = volume_layout(opts.volumes, opts.recovery_blocks);
-        let width =
-            crate::filenames::volume_number_width(opts.first_exponent + opts.recovery_blocks);
         for (first, count) in layout {
-            let name =
-                crate::filenames::volume_filename(base, opts.first_exponent + first, count, width);
+            let name = creation_volume_name(
+                base,
+                opts.first_exponent + first,
+                count,
+                opts.first_exponent + opts.recovery_blocks,
+                opts.recovery_blocks,
+                opts.volumes,
+            );
             let mut vol = Vec::new();
             for i in first..first + count {
                 let (e, data) = (exponents[i as usize], &rec[i as usize]);
@@ -938,6 +1047,282 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn balanced_layouts_keep_exact_reference_boundaries() {
+        for (total, count, expected) in [
+            (7, 3, vec![(0, 3), (3, 2), (5, 2)]),
+            (10, 4, vec![(0, 3), (3, 3), (6, 2), (8, 2)]),
+            (8, 3, vec![(0, 3), (3, 3), (6, 2)]),
+            (6, 3, vec![(0, 2), (2, 2), (4, 2)]),
+            (7, 1, vec![(0, 7)]),
+            (3, 3, vec![(0, 1), (1, 1), (2, 1)]),
+            (65535, 2, vec![(0, 32768), (32768, 32767)]),
+        ] {
+            assert_eq!(
+                checked_volume_layout(VolumeScheme::Balanced(count), total).unwrap(),
+                expected
+            );
+        }
+        let maximal = checked_volume_layout(VolumeScheme::Balanced(65535), 65535).unwrap();
+        assert_eq!(maximal.len(), 65535);
+        assert_eq!(maximal.first(), Some(&(0, 1)));
+        assert_eq!(maximal.last(), Some(&(65534, 1)));
+        for scheme in [
+            VolumeScheme::Single,
+            VolumeScheme::Uniform(0),
+            VolumeScheme::Uniform(3),
+            VolumeScheme::Exponential,
+        ] {
+            for total in [0, 1, 7, 20] {
+                assert_eq!(
+                    checked_volume_layout(scheme, total).unwrap(),
+                    volume_layout(scheme, total)
+                );
+            }
+        }
+        assert!(matches!(
+            checked_volume_layout(VolumeScheme::Balanced(u32::MAX), u32::MAX),
+            Err(CreateError::TooManyRecoveryBlocks)
+        ));
+    }
+
+    #[test]
+    fn balanced_empty_source_data_fails_without_creating_output() {
+        let dir = tmpdir("balanced-empty");
+        std::fs::write(dir.join("empty.bin"), b"").unwrap();
+        std::fs::write(dir.join("set.par2"), b"keep this index").unwrap();
+        let sources = [SourceFile::new(dir.join("empty.bin"))];
+        let options = CreateOptions {
+            slice_size: 4,
+            recovery_blocks: 7,
+            volumes: VolumeScheme::Balanced(3),
+            ..CreateOptions::default()
+        };
+        for destination in [dir.join("missing"), dir.clone()] {
+            assert!(matches!(
+                create(
+                    &sources,
+                    &destination,
+                    "set",
+                    &options,
+                    None,
+                    &mut |_, _, _| {}
+                ),
+                Err(CreateError::NoSourceData)
+            ));
+        }
+        assert!(matches!(
+            build_set(
+                "set",
+                &[("empty.bin", b"")],
+                &SetOptions {
+                    slice_size: 4,
+                    recovery_blocks: 7,
+                    volumes: VolumeScheme::Balanced(3),
+                    ..SetOptions::default()
+                }
+            ),
+            Err(CreateError::NoSourceData)
+        ));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read(dir.join("set.par2")).unwrap(),
+            b"keep this index"
+        );
+        assert_eq!(std::fs::read(dir.join("empty.bin")).unwrap(), b"");
+        for (index, scheme) in [
+            VolumeScheme::Single,
+            VolumeScheme::Uniform(0),
+            VolumeScheme::Uniform(3),
+            VolumeScheme::Exponential,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let report = create(
+                &sources,
+                &dir.join(format!("legacy-{index}")),
+                "set",
+                &CreateOptions {
+                    volumes: scheme,
+                    ..options.clone()
+                },
+                None,
+                &mut |_, _, _| {},
+            )
+            .unwrap();
+            assert_eq!(report.files.len(), 1);
+            let memory = build_set(
+                "set",
+                &[("empty.bin", b"")],
+                &SetOptions {
+                    slice_size: 4,
+                    recovery_blocks: 7,
+                    volumes: scheme,
+                    ..SetOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(memory.volumes.is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn balanced_addition_preserves_legacy_volume_filenames() {
+        for (scheme, names) in [
+            (VolumeScheme::Single, vec!["set.vol17+07.par2"]),
+            (
+                VolumeScheme::Uniform(3),
+                vec![
+                    "set.vol17+03.par2",
+                    "set.vol20+03.par2",
+                    "set.vol23+01.par2",
+                ],
+            ),
+            (
+                VolumeScheme::Exponential,
+                vec![
+                    "set.vol17+01.par2",
+                    "set.vol18+02.par2",
+                    "set.vol20+04.par2",
+                ],
+            ),
+        ] {
+            let set = build_set(
+                "set",
+                &[("data.bin", b"1234")],
+                &SetOptions {
+                    slice_size: 4,
+                    recovery_blocks: 7,
+                    first_exponent: 17,
+                    volumes: scheme,
+                    ..SetOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                set.volumes
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+                names
+            );
+        }
+    }
+
+    #[test]
+    fn balanced_invalid_counts_fail_before_source_or_output_io() {
+        let dir = tmpdir("balanced-invalid");
+        let output = dir.join("absent");
+        let sources = [SourceFile::new(dir.join("missing.bin"))];
+        std::fs::write(dir.join("set.par2"), b"preserve this index").unwrap();
+        for (total, count) in [(0, 0), (7, 0), (0, 1), (7, 8), (7, u32::MAX)] {
+            let scheme = VolumeScheme::Balanced(count);
+            assert!(matches!(checked_volume_layout(scheme, total),
+                Err(CreateError::BadVolumeCount { count: n, recovery_blocks: r }) if n == count && r == total));
+            assert!(volume_layout(scheme, total).is_empty());
+            let options = CreateOptions {
+                slice_size: 4,
+                recovery_blocks: total,
+                volumes: scheme,
+                ..CreateOptions::default()
+            };
+            for destination in [&output, &dir] {
+                assert!(matches!(
+                    create(
+                        &sources,
+                        destination,
+                        "set",
+                        &options,
+                        None,
+                        &mut |_, _, _| {}
+                    ),
+                    Err(CreateError::BadVolumeCount { .. })
+                ));
+            }
+            let memory = SetOptions {
+                slice_size: 4,
+                recovery_blocks: total,
+                volumes: scheme,
+                ..SetOptions::default()
+            };
+            assert!(matches!(
+                build_set("set", &[("data.bin", b"1234")], &memory),
+                Err(CreateError::BadVolumeCount { .. })
+            ));
+        }
+        assert!(!output.exists());
+        assert_eq!(
+            std::fs::read(dir.join("set.par2")).unwrap(),
+            b"preserve this index"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn balanced_disk_and_memory_sets_use_first_exponent() {
+        let dir = tmpdir("balanced-sets");
+        let data = rnd(256, 91);
+        std::fs::write(dir.join("data.bin"), &data).unwrap();
+        let options = CreateOptions {
+            slice_size: 64,
+            recovery_blocks: 7,
+            first_exponent: 65528,
+            volumes: VolumeScheme::Balanced(3),
+            ..CreateOptions::default()
+        };
+        let report = create(
+            &[SourceFile::new(dir.join("data.bin"))],
+            &dir,
+            "set",
+            &options,
+            None,
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+        let names: Vec<_> = report
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "set.par2",
+                "set.vol65528+3.par2",
+                "set.vol65531+2.par2",
+                "set.vol65533+2.par2"
+            ]
+        );
+        let memory = build_set(
+            "set",
+            &[("data.bin", &data)],
+            &SetOptions {
+                slice_size: 64,
+                recovery_blocks: 7,
+                first_exponent: 65528,
+                volumes: VolumeScheme::Balanced(3),
+                ..SetOptions::default()
+            },
+        )
+        .unwrap();
+        for (index, expected) in [
+            (1, vec![65528, 65529, 65530]),
+            (2, vec![65531, 65532]),
+            (3, vec![65533, 65534]),
+        ] {
+            let disk = load_par2_file(&report.files[index], ScanOptions::FULL).unwrap();
+            let mem = load_par2_bytes(&memory.volumes[index - 1].1, ScanOptions::FULL).unwrap();
+            assert_eq!(disk.recovery.keys().copied().collect::<Vec<_>>(), expected);
+            assert_eq!(mem.recovery.keys().copied().collect::<Vec<_>>(), expected);
+            assert!(disk.recovery.values().all(|r| r.md5_verified));
+            assert!(mem.recovery.values().all(|r| r.md5_verified));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

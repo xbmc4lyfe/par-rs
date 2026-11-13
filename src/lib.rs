@@ -205,7 +205,7 @@ pub use bridge::{
 pub use crc::{Crc32, Crc32Combiner, WindowTable};
 pub use create::{
     CreateError, CreateOptions, CreateReport, CreateStage, Par2Set, SetOptions, SourceFile,
-    VolumeScheme, build_set, create, create_in_memory,
+    VolumeScheme, build_set, checked_volume_layout, create, create_in_memory,
 };
 pub use damage::{
     ByteRange, DownloadStatus, FileDamage, QuickVerdict, RangeReader, Segment, blocks_touched,
