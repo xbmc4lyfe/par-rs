@@ -25,6 +25,7 @@
 //! | [`filenames`] | `.par2` / `.volXX+YY.par2` parsing, collection grouping, volume selection heuristics |
 //! | [`twin`] | set fingerprinting and twin / near-twin classification |
 //! | [`damage`] | download hole tracking, damage projection, article-CRC based quick verification |
+//! | [`geometry`] | checked physical source sizing and local loss-range unions |
 //! | [`scanner`] | aligned + sliding-window block scanner with CRC hash index and MD5 confirmation |
 //! | [`reed_solomon`] | recovery planning, matrix inversion, chunked multi-threaded streaming engine |
 //! | [`repairer`] | `Par2Repairer`: load, verify, locate blocks, repair on disk |
@@ -112,6 +113,7 @@ pub mod ffi;
     clippy::panic
 )]
 pub mod filenames;
+pub mod geometry;
 #[allow(
     clippy::indexing_slicing,
     clippy::unwrap_used,
@@ -216,6 +218,10 @@ pub use filenames::{
     ParName, calc_completed_volume_blocks, calc_queued_volume_blocks, find_main_pars,
     parse_par_filename, pick_twin_volume, same_par_collection, select_more_pars,
     volume_blocks_bytes,
+};
+pub use geometry::{
+    FileGeometry, GeometryError, GeometryLimits, SliceSizeRequest, SourceGeometry, SourceSize,
+    checked_source_geometry,
 };
 pub use gf2::{
     Crc32Shift, FoldError, GF2_ORDER, GF2_POLY, RollingCrc32, compute_interval_crcs, crc32,
