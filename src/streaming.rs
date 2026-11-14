@@ -3266,12 +3266,35 @@ impl StreamingParSession {
         &self,
         target_file_ids: &[FileId],
     ) -> Result<EarlyRepairReport, RepairError> {
+        self.repair_targets_timed(target_file_ids, &mut None)
+    }
+
+    /// Repairs targets and returns the hashes from their required verification read.
+    ///
+    /// A hash entry is included only after the whole-file MD5 and length match the
+    /// PAR2 description. This adds no target read. These are results of this call,
+    /// not a guarantee against later writes: callers must retain target ownership
+    /// while publishing or reusing them. An error returns no hash entries.
+    pub fn repair_available_targets_with_hashes_now(
+        &self,
+        target_file_ids: &[FileId],
+    ) -> Result<(EarlyRepairReport, Vec<(FileId, crate::hasher::FileHashes)>), RepairError> {
+        let mut hashes = Some(Vec::new());
+        let report = self.repair_targets_timed(target_file_ids, &mut hashes)?;
+        Ok((report, hashes.unwrap()))
+    }
+
+    fn repair_targets_timed(
+        &self,
+        target_file_ids: &[FileId],
+        hashes: &mut Option<Vec<(FileId, crate::hasher::FileHashes)>>,
+    ) -> Result<EarlyRepairReport, RepairError> {
         let _total = self.inner.control.phase(RepairPhase::Total);
         self.inner
             .control
             .repair_attempts
             .fetch_add(1, Ordering::Relaxed);
-        let result = self.repair_available_targets_inner(target_file_ids);
+        let result = self.repair_available_targets_inner(target_file_ids, hashes);
         if result.is_ok() {
             self.inner
                 .control
@@ -3284,6 +3307,7 @@ impl StreamingParSession {
     fn repair_available_targets_inner(
         &self,
         target_file_ids: &[FileId],
+        hashes: &mut Option<Vec<(FileId, crate::hasher::FileHashes)>>,
     ) -> Result<EarlyRepairReport, RepairError> {
         let wait = self.inner.control.phase(RepairPhase::PayloadWait);
         let _payload = self
@@ -3338,7 +3362,7 @@ impl StreamingParSession {
         };
         if rows.is_empty() || k == 0 {
             for id in target_file_ids {
-                let (st, ok) = self.check_target_timed(id)?;
+                let (st, ok) = self.check_target_timed(id, hashes)?;
                 report.files.push((*id, st, ok));
             }
             return Ok(report);
@@ -3532,19 +3556,27 @@ impl StreamingParSession {
         }
         drop(refold);
         for id in target_file_ids {
-            let (st, ok) = self.check_target_timed(id)?;
+            let (st, ok) = self.check_target_timed(id, hashes)?;
             report.files.push((*id, st, ok));
         }
         Ok(report)
     }
 
-    fn check_target_timed(&self, id: &FileId) -> Result<(VolumeStatus, bool), RepairError> {
+    fn check_target_timed(
+        &self,
+        id: &FileId,
+        hashes: &mut Option<Vec<(FileId, crate::hasher::FileHashes)>>,
+    ) -> Result<(VolumeStatus, bool), RepairError> {
         let _verify = self.inner.control.phase(RepairPhase::Verify);
-        self.check_target(id)
+        self.check_target(id, hashes)
     }
 
     /// Volume status plus whole-file MD5 check (only performed when all slices are verified).
-    fn check_target(&self, id: &FileId) -> Result<(VolumeStatus, bool), RepairError> {
+    fn check_target(
+        &self,
+        id: &FileId,
+        hashes: &mut Option<Vec<(FileId, crate::hasher::FileHashes)>>,
+    ) -> Result<(VolumeStatus, bool), RepairError> {
         let fi = self.inner.file_index[id];
         let f = &self.inner.files[fi];
         let st = {
@@ -3556,7 +3588,13 @@ impl StreamingParSession {
                 .and_then(|source| crate::hasher::hash_reader(&source));
             self.inner.control.ensure_running()?;
             result
-                .map(|h| h.md5_full == f.hash_full && h.len == f.length)
+                .map(|h| {
+                    let valid = h.md5_full == f.hash_full && h.len == f.length;
+                    if valid && let Some(hashes) = hashes {
+                        hashes.push((*id, h));
+                    }
+                    valid
+                })
                 .unwrap_or(false)
         } else {
             false
