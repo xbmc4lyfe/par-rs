@@ -102,7 +102,11 @@ pub(super) struct CountedFile<'a> {
 impl<'a> CountedFile<'a> {
     pub fn open(path: &Path, control: &'a LiveControl, class: IoClass) -> io::Result<Self> {
         control.ensure_reading()?;
-        let file = File::open(path)?;
+        Self::from_file(File::open(path)?, control, class)
+    }
+
+    pub fn from_file(file: File, control: &'a LiveControl, class: IoClass) -> io::Result<Self> {
+        control.ensure_reading()?;
         let len = file.metadata()?.len();
         Ok(Self {
             file: Mutex::new(file),

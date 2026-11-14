@@ -2497,6 +2497,17 @@ impl StreamingParSession {
                 let covered = normalize_ranges(&t.covered[g]);
                 t.metadata_entries = t.metadata_entries - previous + covered.len();
                 t.covered[g] = covered.clone();
+                // Keep both retained coverage representations current even if
+                // the later disk read or verification fails.
+                if t.states[g] != SliceState::Damaged {
+                    Self::set_state(
+                        &mut t,
+                        g,
+                        SliceState::PartiallyArrived {
+                            covered: covered.clone(),
+                        },
+                    );
+                }
                 // Article CRC for the quick path (only exact per-article pieces are usable).
                 if s == offset && e == end {
                     if let Some(entry) = t.article_crcs[g]
@@ -2575,9 +2586,6 @@ impl StreamingParSession {
                         }
                     }
                     completed.push((g, staged, quick));
-                } else if t.states[g] != SliceState::Damaged {
-                    // A damaged slice stays damaged until it is fully covered and re-verified.
-                    Self::set_state(&mut t, g, SliceState::PartiallyArrived { covered });
                 }
             }
         }
@@ -2616,7 +2624,7 @@ impl StreamingParSession {
                         .fetch_add(ram_bytes as u64, Ordering::Relaxed);
                     Self::set_state(&mut t, g, SliceState::VerifiedGood);
                     drop(t);
-                    self.fold(g, data);
+                    self.fold(g, data)?;
                     out.events.push(SliceEvent {
                         file_id: *file_id,
                         slice_idx: b,
@@ -2638,6 +2646,7 @@ impl StreamingParSession {
             let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
             out.unpause = Self::schedule_unpause(&mut t);
         }
+        self.inner.control.ensure_running()?;
         Ok(out)
     }
 
@@ -2700,7 +2709,8 @@ impl StreamingParSession {
     // -----------------------------------------------------------------------------------------
 
     /// Fold verified slice `g` (natural layout, unpadded) into every syndrome slot.
-    fn fold(&self, g: usize, data: Vec<u8>) {
+    fn fold(&self, g: usize, data: Vec<u8>) -> Result<(), RepairError> {
+        self.inner.control.ensure_running()?;
         let ss = self.inner.slice_size;
         let words = ss / 2;
         let mut split = vec![0u8; ss];
@@ -2743,6 +2753,7 @@ impl StreamingParSession {
                 }
             }
         }
+        self.inner.control.ensure_running()
     }
 
     /// Wait until all queued folds have been applied.
@@ -3032,14 +3043,23 @@ impl StreamingParSession {
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
         if hole_range.is_empty()
-            || (candidate_bytes.len() as i64) < hole_range.size
+            || (candidate_bytes.len() as u64) < hole_range.size as u64
             || hole_range.offset < 0
             || f.slice_count == 0
         {
             return Ok(Vec::new());
         }
         let hs = hole_range.offset as u64;
-        let he = (hole_range.end() as u64).min(f.length);
+        let end = hole_range
+            .offset
+            .checked_add(hole_range.size)
+            .ok_or_else(|| {
+                io_ctx("donor range")(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "donor range overflow",
+                ))
+            })?;
+        let he = (end as u64).min(f.length);
         if hs >= he {
             return Ok(Vec::new());
         }
@@ -3051,9 +3071,18 @@ impl StreamingParSession {
             .truncate(false)
             .open(disk_file)
             .map_err(io_ctx(format!("opening {}", disk_file.display())))?;
-        let disk_len = fh.metadata().map(|m| m.len()).unwrap_or(0);
+        let source = fh
+            .try_clone()
+            .and_then(|file| CountedFile::from_file(file, &self.inner.control, IoClass::Source))
+            .map_err(|e| {
+                self.inner
+                    .control
+                    .io_error(format!("reading {}", disk_file.display()), e)
+            })?;
+        let disk_len = source.source_len();
         let mut healed = Vec::new();
         for b in b0..=b1.min(f.slice_count - 1) {
+            self.inner.control.ensure_running()?;
             let g = f.first_slice + b;
             {
                 let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -3067,17 +3096,21 @@ impl StreamingParSession {
             let mut buf = vec![0u8; slen];
             let avail = disk_len.saturating_sub(sstart).min(slen as u64) as usize;
             if avail > 0 {
-                read_exact_at(&fh, sstart, &mut buf[..avail])
-                    .map_err(io_ctx(format!("reading {}", disk_file.display())))?;
+                source.read_at(sstart, &mut buf[..avail]).map_err(|e| {
+                    self.inner
+                        .control
+                        .io_error(format!("reading {}", disk_file.display()), e)
+                })?;
             }
             let s = hs.max(sstart);
             let e = he.min(send);
             buf[(s - sstart) as usize..(e - sstart) as usize]
                 .copy_from_slice(&candidate_bytes[(s - hs) as usize..(e - hs) as usize]);
-            let Some(data) = self.verify_slice_bytes_direct(fi, b, buf)? else {
+            let verified = self.verify_slice_bytes_direct(fi, b, buf)?;
+            self.inner.control.ensure_running()?;
+            let Some(data) = verified else {
                 continue;
             };
-            self.inner.control.ensure_running()?;
             write_all_at(&fh, sstart, &data)
                 .map_err(io_ctx(format!("writing {}", disk_file.display())))?;
             let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -3089,13 +3122,15 @@ impl StreamingParSession {
                 t.staging_bytes -= st.buf.len() as u64;
             }
             Self::set_state(&mut t, g, SliceState::VerifiedGood);
+            self.inner.control.ram.fetch_add(e - s, Ordering::Relaxed);
             drop(t);
-            self.fold(g, data);
+            self.fold(g, data)?;
             healed.push(b);
         }
         if !healed.is_empty() {
             fh.sync_data().ok();
         }
+        self.inner.control.ensure_running()?;
         Ok(healed)
     }
 
@@ -3340,7 +3375,7 @@ impl StreamingParSession {
                 }
                 Self::set_state(&mut t, g, SliceState::VerifiedGood);
             }
-            self.fold(g, data);
+            self.fold(g, data)?;
             report.repaired_slices.push((f.file_id, b));
         }
         for id in target_file_ids {
