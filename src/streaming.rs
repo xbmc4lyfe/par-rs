@@ -55,7 +55,7 @@ use crate::damage::{ByteRange, normalize_ranges, range_covered};
 use crate::gf16::simd::{Kernel, MAX_MULTI, Plane, PlaneMut};
 use crate::gf16::{input_constant_logs, rs_coefficient};
 use crate::hasher::slice_checksums;
-use crate::packet::{FileSource, read_exact_at};
+use crate::packet::read_exact_at;
 use crate::repairer::{
     BlockLocation, FileStatus, Level, Par2Repairer, RepairError, RepairObserver, io_ctx,
     write_all_at,
@@ -65,6 +65,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+
+mod control;
+use crate::packet::PacketSource;
+pub use control::LiveIoStats;
+use control::{CountedFile, IoClass, LiveControl};
 
 /// Options for [`Par2Repairer::enable_streaming`].
 #[derive(Clone, Debug)]
@@ -1437,9 +1442,7 @@ mod tests {
 
 use crate::filenames::select_more_pars;
 use crate::packet::{FileId, PacketSet, ScanOptions, SetId};
-use crate::reed_solomon::{
-    Engine, EngineConfig, InputKind, InputSpec, Matrix, OutputSink, plan_recovery,
-};
+use crate::reed_solomon::{Engine, EngineConfig, InputKind, InputSpec, Matrix, OutputSink};
 use crate::repairer::{RepairReader, SliceSrc};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
@@ -1719,6 +1722,7 @@ struct LiveStaged {
 
 /// Mutable tracker state (one lock, held only for bookkeeping—never during hashing or I/O).
 struct Tracker {
+    metadata_entries: usize,
     states: Vec<SliceState>,
     counts: [usize; 4],
     /// Slice-relative coverage by successful articles (kept across the `Damaged` state so a
@@ -1778,6 +1782,7 @@ struct FoldJob {
     logbase: u16,
     /// Split-plane slice data (`slice_size` bytes).
     split: Arc<Vec<u8>>,
+    control: Arc<LiveControl>,
 }
 
 struct FoldPool {
@@ -1790,6 +1795,9 @@ fn fold_lane(kernel: &Kernel, slots: &SlotList, job: &FoldJob, lane: usize, stri
     let list = slots.read().unwrap_or_else(|e| e.into_inner());
     let src = Plane::from_halves(&job.split);
     for (i, slot) in list.iter().enumerate() {
+        if job.control.cancelled.load(Ordering::Acquire) {
+            return;
+        }
         if i % stride != lane {
             continue;
         }
@@ -1798,12 +1806,29 @@ fn fold_lane(kernel: &Kernel, slots: &SlotList, job: &FoldJob, lane: usize, stri
             continue;
         }
         let c = rs_coefficient(job.logbase, s.exponent);
-        let mut dst = PlaneMut::from_halves(&mut s.data);
-        kernel.mul_acc_split(&mut dst, src, c);
+        let (lo, hi) = s.data.split_at_mut(src.lo.len());
+        for start in (0..src.lo.len()).step_by(32768) {
+            if job.control.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let end = (start + 32768).min(src.lo.len());
+            kernel.mul_acc_split(
+                &mut PlaneMut {
+                    lo: &mut lo[start..end],
+                    hi: &mut hi[start..end],
+                },
+                Plane {
+                    lo: &src.lo[start..end],
+                    hi: &src.hi[start..end],
+                },
+                c,
+            );
+        }
     }
 }
 
 struct SessionInner {
+    control: Arc<LiveControl>,
     payload_gate: RwLock<()>,
     active_payloads: Mutex<usize>,
     payload_available: Condvar,
@@ -1836,20 +1861,23 @@ impl Drop for PayloadPermit<'_> {
 }
 
 impl SessionInner {
-    fn admit_payload(&self) -> PayloadPermit<'_> {
+    fn admit_payload(&self) -> Result<PayloadPermit<'_>, RepairError> {
+        self.control.ensure_running()?;
         let cap = self.opts.max_working_bytes / (2 * self.slice_size as u64);
         let mut active = self
             .active_payloads
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         while *active as u64 >= cap {
+            self.control.ensure_running()?;
             active = self
                 .payload_available
                 .wait(active)
                 .unwrap_or_else(|e| e.into_inner());
         }
+        self.control.ensure_running()?;
         *active += 1;
-        PayloadPermit(self)
+        Ok(PayloadPermit(self))
     }
 }
 
@@ -1869,6 +1897,17 @@ impl StreamingParSession {
         opts: SessionOptions,
     ) -> Result<Self, RepairError> {
         let main = set.main.as_ref().ok_or(RepairError::NoMainPacket)?;
+        let opts = opts.bounded(main.slice_size)?;
+        let file_metadata = main.recoverable_file_ids.len().checked_mul(
+            std::mem::size_of::<LiveFile>() + 4 * std::mem::size_of::<(FileId, usize)>(),
+        );
+        if file_metadata.is_none_or(|bytes| bytes as u64 > opts.max_working_bytes) {
+            return Err(RepairError::StreamingMemoryLimit {
+                context: "file metadata",
+                required_bytes: file_metadata.map_or(u64::MAX, |n| n as u64),
+                limit_bytes: opts.max_working_bytes,
+            });
+        }
         let missing: Vec<FileId> = main
             .recoverable_file_ids
             .iter()
@@ -1880,7 +1919,67 @@ impl StreamingParSession {
                 missing_descriptions: missing,
             });
         }
-        let opts = opts.bounded(main.slice_size)?;
+        // Check the complete global layout before allocating tracker/syndrome state.
+        let mut ids = BTreeSet::new();
+        let mut total = 0u64;
+        for id in &main.recoverable_file_ids {
+            if !ids.insert(*id) {
+                return Err(io_ctx("streaming source geometry")(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate recoverable file ID",
+                )));
+            }
+            let len = set.file_descs[id].file_length;
+            let count = len / main.slice_size + u64::from(!len.is_multiple_of(main.slice_size));
+            total = total.checked_add(count).ok_or_else(|| {
+                io_ctx("streaming source geometry")(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "source slice count overflow",
+                ))
+            })?;
+            if total > 32768 {
+                return Err(io_ctx("streaming source geometry")(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "more than 32768 source slices",
+                )));
+            }
+        }
+        let metadata = (|| {
+            let per_slice = std::mem::size_of::<SliceState>()
+                + 2 * std::mem::size_of::<Vec<ByteRange>>()
+                + std::mem::size_of::<ChecksumEntry>();
+            let mut bytes = (total as usize)
+                .checked_mul(per_slice)?
+                .checked_add(file_metadata?)?;
+            bytes = bytes.checked_add(
+                usize::try_from(
+                    total
+                        .div_ceil(64)
+                        .checked_mul(8)?
+                        .checked_mul(opts.max_syndrome_slots as u64)?,
+                )
+                .ok()?,
+            )?;
+            for id in &main.recoverable_file_ids {
+                // Raw name, lossy UTF-8 local name, joined path, and capacity growth.
+                bytes = bytes.checked_add(set.file_descs[id].name.len().checked_mul(16)?)?;
+                bytes = bytes.checked_add(
+                    base_dir
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .len()
+                        .checked_mul(2)?,
+                )?;
+            }
+            Some(bytes as u64)
+        })();
+        if metadata.is_none_or(|bytes| bytes > opts.max_working_bytes) {
+            return Err(RepairError::StreamingMemoryLimit {
+                context: "slice metadata",
+                required_bytes: metadata.unwrap_or(u64::MAX),
+                limit_bytes: opts.max_working_bytes,
+            });
+        }
         let ss = main.slice_size as usize;
         let mut files = Vec::new();
         let mut file_index = HashMap::new();
@@ -1966,12 +2065,14 @@ impl StreamingParSession {
             FoldPool { txs, pending }
         });
         let inner = SessionInner {
+            control: Arc::new(LiveControl::default()),
             payload_gate: RwLock::new(()),
             active_payloads: Mutex::new(0),
             payload_available: Condvar::new(),
             set_id: set.set_id.unwrap_or(SetId([0; 16])),
             slice_size: ss,
             tracker: Mutex::new(Tracker {
+                metadata_entries: 0,
                 states: vec![SliceState::Unarrived; total],
                 counts: [total, 0, 0, 0],
                 covered: vec![Vec::new(); total],
@@ -1997,6 +2098,32 @@ impl StreamingParSession {
         })
     }
 
+    /// Permanently cancel this session and wake blocked payload admissions.
+    /// Existing output may be partial; it must not be published as verified.
+    pub fn cancel(&self) {
+        // Share the admission predicate mutex to avoid a missed wakeup.
+        let _active = self
+            .inner
+            .active_payloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.inner.control.cancelled.store(true, Ordering::Release);
+        self.inner.payload_available.notify_all();
+        if let Some(pool) = &self.inner.pool {
+            pool.pending.1.notify_all();
+        }
+    }
+
+    /// Whether this session has been permanently cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.control.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Cumulative logical I/O categories; a concurrent snapshot is not atomic.
+    pub fn io_stats(&self) -> LiveIoStats {
+        self.inner.control.stats()
+    }
+
     /// Set id.
     pub fn set_id(&self) -> SetId {
         self.inner.set_id
@@ -2019,6 +2146,12 @@ impl StreamingParSession {
         let old = t.states[g].tag();
         if t.states[g] == new {
             return false;
+        }
+        if new == SliceState::VerifiedGood {
+            t.metadata_entries -= t.covered[g].len();
+            t.covered[g] = Vec::new();
+            t.metadata_entries -= t.article_crcs[g].len();
+            t.article_crcs[g] = Vec::new();
         }
         t.counts[old as usize] -= 1;
         t.counts[new.tag() as usize] += 1;
@@ -2173,7 +2306,7 @@ impl StreamingParSession {
             ready_recovery: ready,
             unpaused_in_flight: in_flight,
             needed_recovery_blocks: (damaged - ready as i64 - in_flight).max(0),
-            early_cutover_possible: damaged as usize + unarrived <= ready,
+            early_cutover_possible: !self.is_cancelled() && damaged as usize + unarrived <= ready,
             pending_folds: pending,
         }
     }
@@ -2222,6 +2355,7 @@ impl StreamingParSession {
         offset: u64,
         size: u64,
     ) -> Result<(Vec<SliceEvent>, Option<UnpauseAction>), RepairError> {
+        self.inner.control.ensure_running()?;
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
@@ -2229,7 +2363,15 @@ impl StreamingParSession {
         if size == 0 || offset >= f.length || f.slice_count == 0 {
             return Ok((events, None));
         }
-        let end = (offset + size).min(f.length);
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| {
+                io_ctx("article range")(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "article offset overflow",
+                ))
+            })?
+            .min(f.length);
         let (b0, b1) = ((offset / ss) as usize, ((end - 1) / ss) as usize);
         let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
         for b in b0..=b1.min(f.slice_count - 1) {
@@ -2238,6 +2380,7 @@ impl StreamingParSession {
                 continue;
             }
             if let Some(st) = t.staging.remove(&g) {
+                t.metadata_entries -= st.ranges.len();
                 t.staging_bytes -= st.buf.len() as u64;
             }
             if Self::set_state(&mut t, g, SliceState::Damaged) {
@@ -2269,7 +2412,7 @@ impl StreamingParSession {
             .payload_gate
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        let _permit = self.inner.admit_payload();
+        let _permit = self.inner.admit_payload()?;
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
@@ -2277,7 +2420,21 @@ impl StreamingParSession {
         if size == 0 || offset >= f.length || f.slice_count == 0 {
             return Ok(out);
         }
-        let end = (offset + size).min(f.length);
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| {
+                io_ctx("article range")(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "article offset overflow",
+                ))
+            })?
+            .min(f.length);
+        if bytes.is_some_and(|data| (data.len() as u64) < end - offset) {
+            return Err(io_ctx("article bytes")(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RAM payload is shorter than the article range",
+            )));
+        }
         let (b0, b1) = ((offset / ss) as usize, ((end - 1) / ss) as usize);
         // Phase 1 (locked): coverage, staging, ParQuick CRC bookkeeping; collect completed slices.
         let mut completed_charges = StagingCharges {
@@ -2287,6 +2444,42 @@ impl StreamingParSession {
         let mut completed: Vec<(usize, Option<Vec<u8>>, Option<u32>)> = Vec::new();
         {
             let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let mut additional = 0usize;
+            for b in b0..=b1.min(f.slice_count - 1) {
+                let g = f.first_slice + b;
+                if t.states[g] == SliceState::VerifiedGood {
+                    continue;
+                }
+                let begin = b as u64 * ss;
+                let stop = (begin + ss).min(f.length);
+                let lo = offset.max(begin) - begin;
+                let hi = end.min(stop) - begin;
+                additional +=
+                    usize::from(!range_covered(&t.covered[g], lo as i64, (hi - lo) as i64));
+                additional += usize::from(
+                    offset >= begin
+                        && end <= stop
+                        && !t.article_crcs[g]
+                            .iter()
+                            .any(|&(o, l, _)| o == lo && l == hi - lo),
+                );
+                if bytes.is_some() {
+                    additional +=
+                        usize::from(t.staging.get(&g).is_none_or(|st| {
+                            !range_covered(&st.ranges, lo as i64, (hi - lo) as i64)
+                        }));
+                }
+            }
+            // Charge capacity growth and normalization temporaries conservatively.
+            let required = (t.metadata_entries + additional) as u64
+                * (8 * std::mem::size_of::<(u64, u64, u32)>()) as u64;
+            if required > self.inner.opts.max_working_bytes {
+                return Err(RepairError::StreamingMemoryLimit {
+                    context: "article metadata",
+                    required_bytes: required,
+                    limit_bytes: self.inner.opts.max_working_bytes,
+                });
+            }
             for b in b0..=b1.min(f.slice_count - 1) {
                 let g = f.first_slice + b;
                 if t.states[g] == SliceState::VerifiedGood {
@@ -2301,12 +2494,33 @@ impl StreamingParSession {
                 }
                 let slen = (send - sstart) as usize;
                 // Coverage.
+                let previous = t.covered[g].len();
                 t.covered[g].push(ByteRange::new((s - sstart) as i64, (e - s) as i64));
                 let covered = normalize_ranges(&t.covered[g]);
+                t.metadata_entries = t.metadata_entries - previous + covered.len();
                 t.covered[g] = covered.clone();
+                // Keep both retained coverage representations current even if
+                // the later disk read or verification fails.
+                if t.states[g] != SliceState::Damaged {
+                    Self::set_state(
+                        &mut t,
+                        g,
+                        SliceState::PartiallyArrived {
+                            covered: covered.clone(),
+                        },
+                    );
+                }
                 // Article CRC for the quick path (only exact per-article pieces are usable).
                 if s == offset && e == end {
-                    t.article_crcs[g].push((s - sstart, e - s, crc32));
+                    if let Some(entry) = t.article_crcs[g]
+                        .iter_mut()
+                        .find(|(o, l, _)| *o == s - sstart && *l == e - s)
+                    {
+                        entry.2 = crc32;
+                    } else {
+                        t.article_crcs[g].push((s - sstart, e - s, crc32));
+                        t.metadata_entries += 1;
+                    }
                 }
                 // Staging.
                 if let Some(d) = bytes {
@@ -2322,13 +2536,18 @@ impl StreamingParSession {
                         let rel = (s - sstart) as usize;
                         st.buf[rel..rel + (e - s) as usize]
                             .copy_from_slice(&d[(s - offset) as usize..(e - offset) as usize]);
+                        let previous = st.ranges.len();
                         st.ranges.push(ByteRange::new(rel as i64, (e - s) as i64));
+                        st.ranges = normalize_ranges(&st.ranges);
+                        let current = st.ranges.len();
+                        t.metadata_entries = t.metadata_entries - previous + current;
                     }
                 }
                 if range_covered(&covered, 0, slen as i64) {
                     // Complete: hand the bytes (if fully staged) to the unlocked phase.
                     let staged = match t.staging.remove(&g) {
                         Some(st) => {
+                            t.metadata_entries -= st.ranges.len();
                             if range_covered(&normalize_ranges(&st.ranges), 0, slen as i64) {
                                 completed_charges.bytes += st.buf.len() as u64;
                                 Some(st.buf)
@@ -2341,6 +2560,7 @@ impl StreamingParSession {
                     };
                     // ParQuick: combined CRC when the articles tile the slice exactly.
                     let mut crcs = std::mem::take(&mut t.article_crcs[g]);
+                    t.metadata_entries -= crcs.len();
                     crcs.sort_unstable();
                     let mut quick: Option<u32> = None;
                     if !crcs.is_empty() && crcs[0].0 == 0 {
@@ -2368,9 +2588,6 @@ impl StreamingParSession {
                         }
                     }
                     completed.push((g, staged, quick));
-                } else if t.states[g] != SliceState::Damaged {
-                    // A damaged slice stays damaged until it is fully covered and re-verified.
-                    Self::set_state(&mut t, g, SliceState::PartiallyArrived { covered });
                 }
             }
         }
@@ -2394,6 +2611,7 @@ impl StreamingParSession {
                     None
                 }
             });
+            let ram_bytes = staged.as_ref().map_or(0, |data| data.len());
             let verdict = self.verify_slice_bytes(fi, b, staged, quick)?;
             let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
             if t.states[g] == SliceState::VerifiedGood {
@@ -2401,9 +2619,14 @@ impl StreamingParSession {
             }
             match verdict {
                 Some(data) => {
+                    self.inner.control.ensure_running()?;
+                    self.inner
+                        .control
+                        .ram
+                        .fetch_add(ram_bytes as u64, Ordering::Relaxed);
                     Self::set_state(&mut t, g, SliceState::VerifiedGood);
                     drop(t);
-                    self.fold(g, data);
+                    self.fold(g, data)?;
                     out.events.push(SliceEvent {
                         file_id: *file_id,
                         slice_idx: b,
@@ -2425,6 +2648,7 @@ impl StreamingParSession {
             let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
             out.unpause = Self::schedule_unpause(&mut t);
         }
+        self.inner.control.ensure_running()?;
         Ok(out)
     }
 
@@ -2455,11 +2679,18 @@ impl StreamingParSession {
             None => {
                 let off = b as u64 * ss;
                 let len = (f.length - off).min(ss) as usize;
-                let fh = File::open(&f.target_path)
-                    .map_err(io_ctx(format!("opening {}", f.target_path.display())))?;
+                let fh = CountedFile::open(&f.target_path, &self.inner.control, IoClass::Source)
+                    .map_err(|e| {
+                        self.inner
+                            .control
+                            .io_error(format!("opening {}", f.target_path.display()), e)
+                    })?;
                 let mut buf = vec![0u8; len];
-                read_exact_at(&fh, off, &mut buf)
-                    .map_err(io_ctx(format!("reading {}", f.target_path.display())))?;
+                fh.read_at(off, &mut buf).map_err(|e| {
+                    self.inner
+                        .control
+                        .io_error(format!("reading {}", f.target_path.display()), e)
+                })?;
                 buf
             }
         };
@@ -2480,7 +2711,8 @@ impl StreamingParSession {
     // -----------------------------------------------------------------------------------------
 
     /// Fold verified slice `g` (natural layout, unpadded) into every syndrome slot.
-    fn fold(&self, g: usize, data: Vec<u8>) {
+    fn fold(&self, g: usize, data: Vec<u8>) -> Result<(), RepairError> {
+        self.inner.control.ensure_running()?;
         let ss = self.inner.slice_size;
         let words = ss / 2;
         let mut split = vec![0u8; ss];
@@ -2499,6 +2731,7 @@ impl StreamingParSession {
             slice: g,
             logbase: self.inner.logs[g],
             split: Arc::new(split),
+            control: Arc::clone(&self.inner.control),
         });
         self.inner.folds.fetch_add(1, Ordering::Relaxed);
         match &self.inner.pool {
@@ -2522,6 +2755,7 @@ impl StreamingParSession {
                 }
             }
         }
+        self.inner.control.ensure_running()
     }
 
     /// Wait until all queued folds have been applied.
@@ -2547,7 +2781,9 @@ impl StreamingParSession {
     /// missing ones from the target files (needed for slots allocated after slices were
     /// verified and evicted from RAM).
     fn backfill_slots(&self) -> Result<(), RepairError> {
+        self.inner.control.ensure_running()?;
         self.flush();
+        self.inner.control.ensure_running()?;
         let verified: Vec<usize> = {
             let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
             (0..t.states.len())
@@ -2588,15 +2824,14 @@ impl StreamingParSession {
                     lo[n] = data[2 * n];
                 }
             }
-            let src = Plane::from_halves(&split);
-            for slot in needs {
-                let mut s = slot.lock().unwrap_or_else(|e| e.into_inner());
-                if s.folded_mask.set(g) {
-                    let c = rs_coefficient(self.inner.logs[g], s.exponent);
-                    let mut dst = PlaneMut::from_halves(&mut s.data);
-                    self.inner.opts.kernel.mul_acc_split(&mut dst, src, c);
-                }
-            }
+            let job = FoldJob {
+                slice: g,
+                logbase: self.inner.logs[g],
+                split: Arc::new(split),
+                control: Arc::clone(&self.inner.control),
+            };
+            fold_lane(&self.inner.opts.kernel, &self.inner.slots, &job, 0, 1);
+            self.inner.control.ensure_running()?;
         }
         Ok(())
     }
@@ -2612,11 +2847,18 @@ impl StreamingParSession {
         let ss = self.inner.slice_size as u64;
         let off = (g - f.first_slice) as u64 * ss;
         let len = (f.length - off).min(ss) as usize;
-        let fh = File::open(&f.target_path)
-            .map_err(io_ctx(format!("opening {}", f.target_path.display())))?;
+        let fh = CountedFile::open(&f.target_path, &self.inner.control, IoClass::Backfill)
+            .map_err(|e| {
+                self.inner
+                    .control
+                    .io_error(format!("opening {}", f.target_path.display()), e)
+            })?;
         let mut buf = vec![0u8; len];
-        read_exact_at(&fh, off, &mut buf)
-            .map_err(io_ctx(format!("reading {}", f.target_path.display())))?;
+        fh.read_at(off, &mut buf).map_err(|e| {
+            self.inner
+                .control
+                .io_error(format!("reading {}", f.target_path.display()), e)
+        })?;
         Ok(buf)
     }
 
@@ -2629,12 +2871,28 @@ impl StreamingParSession {
         path: &Path,
         queued_id: Option<u64>,
     ) -> Result<usize, RepairError> {
+        self.inner.control.ensure_running()?;
+        let result = self.absorb_recovery_volume(path, queued_id);
+        self.inner.control.ensure_running()?;
+        result
+    }
+
+    fn absorb_recovery_volume(
+        &self,
+        path: &Path,
+        queued_id: Option<u64>,
+    ) -> Result<usize, RepairError> {
         let _payload = self
             .inner
             .payload_gate
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        let src = FileSource::open(path).map_err(io_ctx(format!("opening {}", path.display())))?;
+        self.inner.control.ensure_running()?;
+        let src = CountedFile::open(path, &self.inner.control, IoClass::Recovery).map_err(|e| {
+            self.inner
+                .control
+                .io_error(format!("opening {}", path.display()), e)
+        })?;
         let ss = self.inner.slice_size;
         let mut absorbed = 0usize;
         let mut need_backfill = false;
@@ -2782,19 +3040,28 @@ impl StreamingParSession {
             .payload_gate
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        let _permit = self.inner.admit_payload();
+        let _permit = self.inner.admit_payload()?;
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
         if hole_range.is_empty()
-            || (candidate_bytes.len() as i64) < hole_range.size
+            || (candidate_bytes.len() as u64) < hole_range.size as u64
             || hole_range.offset < 0
             || f.slice_count == 0
         {
             return Ok(Vec::new());
         }
         let hs = hole_range.offset as u64;
-        let he = (hole_range.end() as u64).min(f.length);
+        let end = hole_range
+            .offset
+            .checked_add(hole_range.size)
+            .ok_or_else(|| {
+                io_ctx("donor range")(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "donor range overflow",
+                ))
+            })?;
+        let he = (end as u64).min(f.length);
         if hs >= he {
             return Ok(Vec::new());
         }
@@ -2806,9 +3073,18 @@ impl StreamingParSession {
             .truncate(false)
             .open(disk_file)
             .map_err(io_ctx(format!("opening {}", disk_file.display())))?;
-        let disk_len = fh.metadata().map(|m| m.len()).unwrap_or(0);
+        let source = fh
+            .try_clone()
+            .and_then(|file| CountedFile::from_file(file, &self.inner.control, IoClass::Source))
+            .map_err(|e| {
+                self.inner
+                    .control
+                    .io_error(format!("reading {}", disk_file.display()), e)
+            })?;
+        let disk_len = source.source_len();
         let mut healed = Vec::new();
         for b in b0..=b1.min(f.slice_count - 1) {
+            self.inner.control.ensure_running()?;
             let g = f.first_slice + b;
             {
                 let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -2822,14 +3098,19 @@ impl StreamingParSession {
             let mut buf = vec![0u8; slen];
             let avail = disk_len.saturating_sub(sstart).min(slen as u64) as usize;
             if avail > 0 {
-                read_exact_at(&fh, sstart, &mut buf[..avail])
-                    .map_err(io_ctx(format!("reading {}", disk_file.display())))?;
+                source.read_at(sstart, &mut buf[..avail]).map_err(|e| {
+                    self.inner
+                        .control
+                        .io_error(format!("reading {}", disk_file.display()), e)
+                })?;
             }
             let s = hs.max(sstart);
             let e = he.min(send);
             buf[(s - sstart) as usize..(e - sstart) as usize]
                 .copy_from_slice(&candidate_bytes[(s - hs) as usize..(e - hs) as usize]);
-            let Some(data) = self.verify_slice_bytes_direct(fi, b, buf)? else {
+            let verified = self.verify_slice_bytes_direct(fi, b, buf)?;
+            self.inner.control.ensure_running()?;
+            let Some(data) = verified else {
                 continue;
             };
             write_all_at(&fh, sstart, &data)
@@ -2839,16 +3120,19 @@ impl StreamingParSession {
                 continue;
             }
             if let Some(st) = t.staging.remove(&g) {
+                t.metadata_entries -= st.ranges.len();
                 t.staging_bytes -= st.buf.len() as u64;
             }
             Self::set_state(&mut t, g, SliceState::VerifiedGood);
+            self.inner.control.ram.fetch_add(e - s, Ordering::Relaxed);
             drop(t);
-            self.fold(g, data);
+            self.fold(g, data)?;
             healed.push(b);
         }
         if !healed.is_empty() {
             fh.sync_data().ok();
         }
+        self.inner.control.ensure_running()?;
         Ok(healed)
     }
 
@@ -2874,6 +3158,7 @@ impl StreamingParSession {
             .payload_gate
             .write()
             .unwrap_or_else(|e| e.into_inner());
+        self.inner.control.ensure_running()?;
         for id in target_file_ids {
             self.file(id)?;
         }
@@ -2925,13 +3210,15 @@ impl StreamingParSession {
             k as u64,
             self.inner.opts.solve_mem_limit_bytes,
         )?;
-        let plan = plan_recovery(
+        let plan = crate::reed_solomon::plan_recovery_controlled(
             &self.inner.logs,
             &present,
             &ready_exps,
             &self.inner.opts.kernel,
+            &|| self.is_cancelled(),
         )
         .map_err(|e| match e {
+            crate::reed_solomon::RsError::Cancelled => RepairError::Cancelled,
             crate::reed_solomon::RsError::NotEnoughRecovery { needed, available } => {
                 RepairError::NotEnoughRecovery {
                     needed: needed as u64,
@@ -3022,6 +3309,9 @@ impl StreamingParSession {
         }
         let mut recon: Vec<Vec<u8>> = rows.iter().map(|_| vec![0; ss]).collect();
         let mut sink = |output: usize, offset: u64, data: &[u8]| -> io::Result<()> {
+            if self.is_cancelled() {
+                return Err(io::Error::other("live session cancelled"));
+            }
             let (fi, block_off, block_len) = out_map[output];
             let buf = &mut recon[output];
             buf[offset as usize..offset as usize + data.len()].copy_from_slice(data);
@@ -3047,11 +3337,12 @@ impl StreamingParSession {
         let run = engine.run(
             &reader,
             &mut sink as &mut dyn OutputSink,
-            None,
+            Some(&self.inner.control.cancelled),
             &mut |_, _, _, _| {},
         );
         // Return the syndromes to their slots before handling the result.
         drop(taken);
+        self.inner.control.ensure_running()?;
         run.map_err(|e| match e {
             crate::reed_solomon::RsError::Io(e) => RepairError::Io {
                 context: "early repair".into(),
@@ -3060,9 +3351,11 @@ impl StreamingParSession {
             crate::reed_solomon::RsError::Cancelled => RepairError::Cancelled,
             _ => RepairError::Singular,
         })?;
+        self.inner.control.ensure_running()?;
         for fh in targets.values() {
             fh.sync_data().ok();
         }
+        self.inner.control.ensure_running()?;
         // Mark and fold the reconstructed slices so later solves see them as verified.
         for (ri, &g) in rows.iter().enumerate() {
             let fi = self
@@ -3079,11 +3372,12 @@ impl StreamingParSession {
             {
                 let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(st) = t.staging.remove(&g) {
+                    t.metadata_entries -= st.ranges.len();
                     t.staging_bytes -= st.buf.len() as u64;
                 }
                 Self::set_state(&mut t, g, SliceState::VerifiedGood);
             }
-            self.fold(g, data);
+            self.fold(g, data)?;
             report.repaired_slices.push((f.file_id, b));
         }
         for id in target_file_ids {
@@ -3102,7 +3396,10 @@ impl StreamingParSession {
             Self::volume_status_locked(&t, f)
         };
         let ok = if st == VolumeStatus::CompleteAndVerified {
-            crate::hasher::hash_file(&f.target_path)
+            let result = CountedFile::open(&f.target_path, &self.inner.control, IoClass::Target)
+                .and_then(|source| crate::hasher::hash_reader(&source));
+            self.inner.control.ensure_running()?;
+            result
                 .map(|h| h.md5_full == f.hash_full && h.len == f.length)
                 .unwrap_or(false)
         } else {
@@ -3120,6 +3417,7 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod live_tests {
+    mod control_tests;
     use super::*;
     use crate::crc::crc32;
     use crate::create::{CreateOptions, SourceFile, VolumeScheme, create};
