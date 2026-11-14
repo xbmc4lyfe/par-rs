@@ -490,3 +490,138 @@ fn live_partial_replays_are_bounded_without_rejecting_duplicates() {
     assert_eq!(s.status().verified, 0);
     std::fs::remove_dir_all(&fx.dir).unwrap();
 }
+
+#[test]
+fn live_ram_only_pressure_never_reads_an_uncommitted_source() {
+    let fx = fixture(
+        "ram-only-pressure",
+        &[8192],
+        4096,
+        1,
+        VolumeScheme::Uniform(1),
+    );
+    let id = fid(&fx, &fx.files[0].0);
+    let s = StreamingParSession::new(
+        &fx.set,
+        &fx.dir,
+        SessionOptions {
+            max_staging_bytes: 4096,
+            preallocated_syndrome_slots: 1,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    let data = &fx.files[0].1;
+    s.on_article_finished_memory_only(&id, 0, &data[..2048], crc32(&data[..2048]))
+        .unwrap();
+    let before = s.status();
+    let refused =
+        s.on_article_finished_memory_only(&id, 4096, &data[4096..6144], crc32(&data[4096..6144]));
+    assert!(matches!(
+        refused,
+        Err(RepairError::StreamingMemoryLimit { .. })
+    ));
+    assert_eq!(
+        s.status(),
+        before,
+        "refusal must not accept coverage or mark damage"
+    );
+    s.on_article_finished_memory_only(&id, 2048, &data[2048..4096], crc32(&data[2048..4096]))
+        .unwrap();
+    s.on_article_finished_memory_only(&id, 4096, &data[4096..6144], crc32(&data[4096..6144]))
+        .unwrap();
+    s.on_article_finished_memory_only(&id, 6144, &data[6144..], crc32(&data[6144..]))
+        .unwrap();
+    assert_eq!(s.status().verified, 2);
+    assert_eq!(s.io_stats().source_bytes_read, 0);
+    assert!(!fx.dir.join(&fx.files[0].0).exists());
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn live_ram_only_full_slices_work_without_staging_or_target_files() {
+    let fx = fixture("ram-only-whole", &[8192], 4096, 1, VolumeScheme::Uniform(1));
+    let id = fid(&fx, &fx.files[0].0);
+    let s = StreamingParSession::new(
+        &fx.set,
+        &fx.dir,
+        SessionOptions {
+            max_staging_bytes: 0,
+            preallocated_syndrome_slots: 1,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    s.on_article_finished_memory_only(&id, 0, &fx.files[0].1, crc32(&fx.files[0].1))
+        .unwrap();
+    assert_eq!(s.status().verified, 2);
+    assert_eq!(s.io_stats().ram_bytes_verified, 8192);
+    assert_eq!(s.io_stats().source_bytes_read, 0);
+    s.cancel();
+    assert!(matches!(
+        s.on_article_finished_memory_only(&id, 0, &fx.files[0].1, crc32(&fx.files[0].1)),
+        Err(RepairError::Cancelled)
+    ));
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn live_ram_only_whole_slice_does_not_starve_the_adjacent_partial_slice() {
+    let fx = fixture(
+        "ram-only-adjacent",
+        &[8192],
+        4096,
+        1,
+        VolumeScheme::Uniform(1),
+    );
+    let id = fid(&fx, &fx.files[0].0);
+    let s = StreamingParSession::new(
+        &fx.set,
+        &fx.dir,
+        SessionOptions {
+            max_staging_bytes: 4096,
+            preallocated_syndrome_slots: 1,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    let data = &fx.files[0].1;
+    s.on_article_finished_memory_only(&id, 0, &data[..6144], crc32(&data[..6144]))
+        .unwrap();
+    s.on_article_finished_memory_only(&id, 6144, &data[6144..], crc32(&data[6144..]))
+        .unwrap();
+    assert_eq!(s.status().verified, 2);
+    assert_eq!(s.io_stats().source_bytes_read, 0);
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn live_ram_only_does_not_complete_coverage_previously_accepted_without_ram() {
+    let fx = fixture(
+        "ram-only-legacy",
+        &[4096],
+        4096,
+        1,
+        VolumeScheme::Uniform(1),
+    );
+    let id = fid(&fx, &fx.files[0].0);
+    let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    s.on_article_finished(&id, 0, 2048, crc32(&fx.files[0].1[..2048]), None)
+        .unwrap();
+    let before = s.status();
+    assert!(
+        s.on_article_finished_memory_only(
+            &id,
+            2048,
+            &fx.files[0].1[2048..],
+            crc32(&fx.files[0].1[2048..])
+        )
+        .is_err()
+    );
+    assert_eq!(s.status(), before);
+    assert_eq!(s.io_stats().source_bytes_read, 0);
+    s.on_article_finished_memory_only(&id, 0, &fx.files[0].1, crc32(&fx.files[0].1))
+        .unwrap();
+    assert_eq!(s.status().verified, 1);
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}

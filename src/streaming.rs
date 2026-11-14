@@ -1715,6 +1715,11 @@ struct LiveFile {
     hash_full: [u8; 16],
 }
 
+struct ArticlePayload<'a> {
+    bytes: Option<&'a [u8]>,
+    memory_only: bool,
+}
+
 struct LiveStaged {
     buf: Vec<u8>,
     ranges: Vec<ByteRange>,
@@ -2407,6 +2412,53 @@ impl StreamingParSession {
         crc32: u32,
         bytes: Option<&[u8]>,
     ) -> Result<ArticleOutcome, RepairError> {
+        self.on_article_payload(
+            file_id,
+            offset,
+            size,
+            crc32,
+            ArticlePayload {
+                bytes,
+                memory_only: false,
+            },
+        )
+    }
+
+    /// Accept decoded RAM bytes without ever reading the target file.
+    ///
+    /// Unlike [`Self::on_article_finished`], this does not require the bytes to
+    /// have reached disk. If partial-slice staging cannot retain them, refuse
+    /// the article before changing coverage. The caller can replay it after a
+    /// flush barrier or when staging becomes available. Whole slices supplied
+    /// by this call do not require partial staging.
+    pub fn on_article_finished_memory_only(
+        &self,
+        file_id: &FileId,
+        offset: u64,
+        bytes: &[u8],
+        crc32: u32,
+    ) -> Result<ArticleOutcome, RepairError> {
+        self.on_article_payload(
+            file_id,
+            offset,
+            bytes.len() as u64,
+            crc32,
+            ArticlePayload {
+                bytes: Some(bytes),
+                memory_only: true,
+            },
+        )
+    }
+
+    fn on_article_payload(
+        &self,
+        file_id: &FileId,
+        offset: u64,
+        size: u64,
+        crc32: u32,
+        payload: ArticlePayload<'_>,
+    ) -> Result<ArticleOutcome, RepairError> {
+        let bytes = payload.bytes;
         let _payload = self
             .inner
             .payload_gate
@@ -2444,6 +2496,50 @@ impl StreamingParSession {
         let mut completed: Vec<(usize, Option<Vec<u8>>, Option<u32>)> = Vec::new();
         {
             let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+            if payload.memory_only {
+                let mut required = t.staging_bytes;
+                for b in b0..=b1.min(f.slice_count - 1) {
+                    let g = f.first_slice + b;
+                    if t.states[g] == SliceState::VerifiedGood {
+                        continue;
+                    }
+                    let start = b as u64 * ss;
+                    let stop = (start + ss).min(f.length);
+                    // Phase 2 can consume whole incoming slices directly.
+                    if offset <= start && end >= stop {
+                        continue;
+                    }
+                    let lo = offset.max(start) - start;
+                    let hi = end.min(stop) - start;
+                    let piece = ByteRange::new(lo as i64, (hi - lo) as i64);
+                    let staged = t.staging.get(&g);
+                    if staged.is_none() {
+                        required = required.saturating_add(stop - start);
+                    }
+                    // Coverage supplied earlier through the committed-disk API
+                    // need not still be resident. Do not complete it from disk.
+                    let mut covered = t.covered[g].clone();
+                    covered.push(piece);
+                    if range_covered(&normalize_ranges(&covered), 0, (stop - start) as i64) {
+                        let mut resident = staged.map_or_else(Vec::new, |s| s.ranges.clone());
+                        resident.push(piece);
+                        if !range_covered(&normalize_ranges(&resident), 0, (stop - start) as i64) {
+                            return Err(RepairError::StreamingMemoryLimit {
+                                context: "RAM-only slice coverage",
+                                required_bytes: stop - start,
+                                limit_bytes: 0,
+                            });
+                        }
+                    }
+                }
+                if required > self.inner.opts.max_staging_bytes {
+                    return Err(RepairError::StreamingMemoryLimit {
+                        context: "RAM-only partial staging",
+                        required_bytes: required,
+                        limit_bytes: self.inner.opts.max_staging_bytes,
+                    });
+                }
+            }
             let mut additional = 0usize;
             for b in b0..=b1.min(f.slice_count - 1) {
                 let g = f.first_slice + b;
@@ -2523,7 +2619,9 @@ impl StreamingParSession {
                     }
                 }
                 // Staging.
-                if let Some(d) = bytes {
+                if let Some(d) = bytes
+                    && (!payload.memory_only || offset > sstart || end < send)
+                {
                     let have = t.staging.contains_key(&g);
                     if have || t.staging_bytes + slen as u64 <= self.inner.opts.max_staging_bytes {
                         if !have {
@@ -2611,6 +2709,13 @@ impl StreamingParSession {
                     None
                 }
             });
+            if payload.memory_only && staged.is_none() {
+                return Err(RepairError::StreamingMemoryLimit {
+                    context: "RAM-only completed slice",
+                    required_bytes: (f.length - b as u64 * ss).min(ss),
+                    limit_bytes: 0,
+                });
+            }
             let ram_bytes = staged.as_ref().map_or(0, |data| data.len());
             let verdict = self.verify_slice_bytes(fi, b, staged, quick)?;
             let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
