@@ -920,3 +920,208 @@ fn rename_cycles_match_reference_bytes_backups_and_live_leftovers() {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+// Licensed under GPL-2.0-or-later, matching Cargo.toml.
+#[test]
+fn explicit_exponential_names_match_reference_boundaries_and_packets() {
+    use par_rs::packet::{PacketIter, TYPE_RECVSLIC};
+    use par_rs::{VolumeNaming, build_set_with_volume_naming, create_with_volume_naming};
+    use std::collections::BTreeMap;
+    let explicit = std::env::var_os("PAR2_NAMING_REFERENCE");
+    if explicit.is_none() && !par2_available() {
+        eprintln!("par2 not available; skipping naming comparison");
+        return;
+    }
+    let reference = explicit.unwrap_or_else(|| "par2".into());
+    let artifacts = std::env::var_os("PAR2_NAMING_ARTIFACT_DIR").map(PathBuf::from);
+    let root = artifacts
+        .clone()
+        .unwrap_or_else(|| tmpdir("exponential-names"));
+    std::fs::create_dir_all(&root).unwrap();
+    let invoke = |dir: &Path, args: &[&str]| {
+        let out = Command::new(&reference)
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        eprintln!(
+            "NAMING_REFERENCE cwd={} argv={reference:?} {args:?} status={:?}\n{}{}",
+            dir.display(),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success());
+    };
+    fn recovery_packets(path: &Path) -> BTreeMap<u32, Vec<u8>> {
+        let bytes = std::fs::read(path).unwrap();
+        let mut iter = PacketIter::new(
+            bytes.as_slice(),
+            ScanOptions {
+                resync: false,
+                ..ScanOptions::FULL
+            },
+        );
+        let mut out = BTreeMap::new();
+        let mut cursor = 0;
+        for packet in iter.by_ref() {
+            let packet = packet.unwrap();
+            assert!(packet.md5_verified);
+            assert_eq!(packet.offset as usize, cursor);
+            let start = packet.offset as usize;
+            cursor += packet.header.length as usize;
+            if packet.header.packet_type == TYPE_RECVSLIC {
+                let exponent =
+                    u32::from_le_bytes(bytes[start + 64..start + 68].try_into().unwrap());
+                assert!(
+                    out.insert(exponent, bytes[start..cursor].to_vec())
+                        .is_none()
+                );
+            }
+        }
+        assert_eq!(cursor, bytes.len());
+        assert_eq!(iter.stats().md5_failures, 0);
+        assert_eq!(iter.stats().skipped_bytes, 0);
+        out
+    }
+    // High first_exponent65525 is library-only coverage in volume_naming.rs.
+    for (total, first) in [
+        (9, 0),
+        (10, 0),
+        (99, 0),
+        (100, 0),
+        (3, 7),
+        (9, 90),
+        (9, 91),
+        (7, 17),
+        (17, 0),
+        (25, 0),
+        (227, 0),
+    ] {
+        let case = root.join(format!("r{total}-f{first}"));
+        std::fs::create_dir(&case).unwrap();
+        let own = case.join("library");
+        let external = case.join("reference");
+        std::fs::create_dir(&own).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        let data: Vec<_> = (0..64).collect();
+        for dir in [&own, &external] {
+            std::fs::write(dir.join("data.bin"), &data).unwrap();
+        }
+        let options = CreateOptions {
+            slice_size: 16,
+            recovery_blocks: total,
+            first_exponent: first,
+            creator: "par-rs-naming-test".into(),
+            engine: par_rs::EngineConfig {
+                num_threads: 1,
+                mem_limit_bytes: 16 << 20,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let report = create_with_volume_naming(
+            &[SourceFile::new(own.join("data.bin"))],
+            &own,
+            "set",
+            &options,
+            VolumeNaming::Par2cmdlineExponential,
+            None,
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+        let memory = build_set_with_volume_naming(
+            "set",
+            &[("data.bin", &data)],
+            &par_rs::SetOptions {
+                slice_size: 16,
+                recovery_blocks: total,
+                first_exponent: first,
+                creator: options.creator.clone(),
+                ..Default::default()
+            },
+            VolumeNaming::Par2cmdlineExponential,
+        )
+        .unwrap();
+        assert_eq!(memory.index, std::fs::read(&report.files[0]).unwrap());
+        for ((name, bytes), path) in memory.volumes.iter().zip(report.files.iter().skip(1)) {
+            assert_eq!(path.file_name().unwrap(), name.as_str());
+            assert_eq!(*bytes, std::fs::read(path).unwrap());
+        }
+        invoke(
+            &external,
+            &[
+                "c",
+                "-q",
+                "-t1",
+                "-T1",
+                "-m16",
+                "-s16",
+                &format!("-c{total}"),
+                &format!("-f{first}"),
+                "set.par2",
+                "data.bin",
+            ],
+        );
+        let mut external_names: Vec<_> = std::fs::read_dir(&external)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_str().unwrap().ends_with(".par2"))
+            .collect();
+        external_names.sort();
+        let mut own_names: Vec<_> = report
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        own_names.sort();
+        assert_eq!(own_names, external_names);
+        let a = load_par2_file(&own.join("set.par2"), ScanOptions::FULL).unwrap();
+        let b = load_par2_file(&external.join("set.par2"), ScanOptions::FULL).unwrap();
+        assert_eq!(a.set_id, b.set_id);
+        assert_eq!(a.main, b.main);
+        assert_eq!(a.file_descs, b.file_descs);
+        assert_eq!(a.ifscs, b.ifscs);
+        assert!(!a.creator_string().is_empty());
+        assert!(!b.creator_string().is_empty());
+        recovery_packets(&own.join("set.par2"));
+        recovery_packets(&external.join("set.par2"));
+        let mut exponents = Vec::new();
+        for path in report.files.iter().skip(1) {
+            let ours = recovery_packets(path);
+            let theirs = recovery_packets(&external.join(path.file_name().unwrap()));
+            assert_eq!(ours, theirs);
+            exponents.extend(ours.keys().copied());
+        }
+        exponents.sort();
+        assert_eq!(exponents, (first..first + total).collect::<Vec<_>>());
+        if total == 10 && first == 0 {
+            invoke(&own, &["v", "-q", "set.par2"]);
+            std::fs::remove_file(own.join("data.bin")).unwrap();
+            invoke(&own, &["r", "-q", "-t1", "-T1", "set.par2"]);
+            assert_eq!(std::fs::read(own.join("data.bin")).unwrap(), data);
+            std::fs::remove_file(external.join("data.bin")).unwrap();
+            let mut repairer = Par2Repairer::new(
+                &external,
+                RepairOptions {
+                    full_file_md5: true,
+                    num_threads: 1,
+                    ..Default::default()
+                },
+            );
+            repairer.load_par2_set(&external.join("set.par2")).unwrap();
+            repairer.finalize().unwrap();
+            let verified = repairer.verify(None, &mut NullObserver).unwrap();
+            assert_eq!(verified.missing_blocks, 4);
+            assert!(matches!(
+                repairer.repair(&mut NullObserver).unwrap(),
+                RepairResult::Repaired { .. }
+            ));
+            assert_eq!(std::fs::read(external.join("data.bin")).unwrap(), data);
+            invoke(&external, &["v", "-q", "set.par2"]);
+        }
+    }
+    if artifacts.is_none() {
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
