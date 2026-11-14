@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod donor;
+mod rename;
 
 /// How an explicitly admitted extra file supplies source blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1766,6 +1767,8 @@ impl Par2Repairer {
         }
         // Reject before backups, renames, or target creation change the filesystem.
         check_recovery_matrix_memory(missing_total, self.options.mem_limit_bytes)?;
+        let (mut copies, mut backups) =
+            rename::Copies::prepare(self, incomplete.len(), self.verification_memory())?;
         observer.stage(Stage::Repairing);
         let t_start = std::time::Instant::now();
         let lap = |observer: &mut dyn RepairObserver, what: &str| {
@@ -1776,7 +1779,6 @@ impl Par2Repairer {
         };
 
         // ---- 1. rotate damaged targets, rename misnamed complete copies ----
-        let mut backups: Vec<PathBuf> = Vec::new();
         let mut repaired_names: Vec<String> = Vec::new();
         let mut to_rebuild: Vec<usize> = Vec::new();
         // Per file: the disk index of its backup when the original is patched in place (its
@@ -1804,12 +1806,11 @@ impl Par2Repairer {
                     self.disk_files[di] = backup.clone();
                     self.disk_index.remove(&target);
                     self.disk_index.insert(backup.clone(), di);
+                    copies.remap(&mut self.files, di, &backup);
+                    copies.backed_up(di, backups.len());
                     if patched_in_place {
                         in_place.insert(fi, di);
                     }
-                }
-                if self.files[fi].complete_file.as_deref() == Some(target.as_path()) {
-                    self.files[fi].complete_file = Some(backup.clone());
                 }
                 backups.push(backup);
             }
@@ -1825,38 +1826,36 @@ impl Par2Repairer {
                 // Is the copy an exclusive source? Other files may read blocks from it; copying
                 // is safer than renaming when any other file's blocks live there.
                 let di = self.disk_index.get(&copy).copied();
-                let shared = di.is_some_and(|di| {
-                    self.locations.iter().enumerate().any(|(g, l)| {
-                        l.as_ref().is_some_and(|l| l.file == di)
-                            && !(self.files[fi].first_block
-                                ..self.files[fi].first_block + self.files[fi].block_count as usize)
-                                .contains(&g)
-                    })
-                });
+                let shared = copies.shared(self, fi, di, &copy);
                 if !shared {
                     std::fs::rename(&copy, &target).map_err(io_ctx(format!(
                         "renaming {} to {}",
                         copy.display(),
                         target.display()
                     )))?;
-                    observer.message(
-                        Level::Info,
-                        &format!("Renamed {} to {}", copy.display(), target.display()),
-                    );
                     if let Some(di) = di {
                         self.disk_files[di] = target.clone();
                         self.disk_index.remove(&copy);
                         self.disk_index.insert(target.clone(), di);
+                        copies.remap(&mut self.files, di, &target);
+                        copies.moved(di, &copy, &backups);
+                    } else {
+                        self.files[fi].complete_file = Some(target.clone());
                     }
-                    self.files[fi].complete_file = Some(target.clone());
                     self.files[fi].status = FileStatus::Complete;
                     self.files[fi].target_exists = true;
                     repaired_names.push(self.files[fi].target_filename.clone());
+                    observer.message(
+                        Level::Info,
+                        &format!("Renamed {} to {}", copy.display(), target.display()),
+                    );
                     continue;
                 }
             }
             to_rebuild.push(fi);
         }
+        copies.retain_backups(&mut backups);
+        drop(copies);
 
         lap(observer, "backups");
         // ---- 2. create targets, copy located blocks ----
