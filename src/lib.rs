@@ -231,7 +231,7 @@ pub use gf2::{
     fold_yenc_parts, ifsc_interval_crcs, lcm_grid, multmodp, x2nmodp, xpow,
 };
 pub use gf16::simd::{Isa, Kernel};
-pub use hasher::{FileHasher, FileHashes, hash_file, hash_reader};
+pub use hasher::{FileHasher, FileHashes, FileSliceHasher, hash_file, hash_reader};
 pub use inspect::{
     CreatorInfo, CreatorTool, PacketKind, Par1Header, Par2FileName, Par2Inspection,
     Par3PacketHeader, ParFormat, VerifyMode, detect_format, inspect_par2, inspect_par2_with,
