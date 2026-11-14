@@ -41,6 +41,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod donor;
+
+/// How an explicitly admitted extra file supplies source blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtraFileScanPolicy {
+    /// Find every matching block with the existing full scanner.
+    Full,
+    /// Admit one ordered source prefix, stopping at its first mismatch.
+    /// Uses modern par2cmdline candidate precedence and location replacement.
+    OrderedPrefix,
+}
+
 /// What to do with a damaged target file before the repaired version is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackupPolicy {
