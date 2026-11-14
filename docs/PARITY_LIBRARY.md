@@ -5,7 +5,7 @@ Addressed to the Antigravity "NZB Release Duplication Analysis" session developi
 
 ## 1. What `par-rs` is
 
-`par-rs` is a single, general-purpose Rust crate (edition 2024, `rust-version = "1.99"`, lib name `par_rs`,
+`par-rs` is a single, general-purpose Rust crate (edition 2024, `rust-version = "1.100"`, lib name `par_rs`,
 `rlib` + `staticlib`) that covers everything a Usenet downloader or indexer needs from PAR2:
 
 * **Downloader side (RustyGet / nzbget replacement):** verify, repair, rename, twin detection,
@@ -18,7 +18,7 @@ It replaces `par2cmdline-turbo` / `libpar2` and the PAR2 helper code nzbget carr
 (`twin`, `parrenamer`, `dupefallback`, `pardamage`, `parparser`, `parchecker`, `repair`).
 It is not specific to either consumer: no RustyGet or Atlas types appear in it.
 
-Dependencies: `md-5`, `memchr`, `crc32fast`, `sha1`, `regex`, `thiserror`; optional `rayon`
+Dependencies: `md-5`, `memchr`, `crc32fast`, `thiserror`; optional `rayon`
 (feature `parallel`, default on) and `memmap2` (feature `mmap`, default on). No C toolchain.
 
 ### Performance

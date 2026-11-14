@@ -2126,8 +2126,8 @@ impl StreamingParSession {
 
     fn volume_status_locked(t: &Tracker, f: &LiveFile) -> VolumeStatus {
         let (mut v, mut d, mut u) = (0, 0, 0);
-        for g in f.first_slice..f.first_slice + f.slice_count {
-            match t.states[g] {
+        for state in &t.states[f.first_slice..f.first_slice + f.slice_count] {
+            match state {
                 SliceState::VerifiedGood => v += 1,
                 SliceState::Damaged => d += 1,
                 _ => u += 1,
