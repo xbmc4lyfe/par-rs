@@ -669,6 +669,67 @@ fn live_repair_phase_stats_preserve_the_verify_only_path() {
 }
 
 #[test]
+fn live_target_hashes_reuse_the_required_verification_read() {
+    let fx = fixture(
+        "target-hashes",
+        &[777, 1024],
+        1024,
+        1,
+        VolumeScheme::Uniform(1),
+    );
+    let target = fid(&fx, &fx.files[0].0);
+    let other = fid(&fx, &fx.files[1].0);
+    let session = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    session
+        .on_article_finished_memory_only(&other, 0, &fx.files[1].1, crc32(&fx.files[1].1))
+        .unwrap();
+    session
+        .on_recovery_volume_arrived(&fx.vols[0], None)
+        .unwrap();
+    let (report, hashes) = session
+        .repair_available_targets_with_hashes_now(&[target])
+        .unwrap();
+    assert!(report.files[0].2);
+    assert_eq!(hashes.len(), 1);
+    assert_eq!(hashes[0].0, target);
+    assert_eq!(hashes[0].1.crc32, crc32(&fx.files[0].1));
+    assert_eq!(hashes[0].1.len, 777);
+    assert_eq!(hashes[0].1.md5_full, fx.set.file_descs[&target].hash_full);
+    assert_eq!(
+        std::fs::read(fx.dir.join(&fx.files[0].0)).unwrap(),
+        fx.files[0].1
+    );
+    assert_eq!(session.io_stats().target_verification_bytes_read, 777);
+    assert_eq!(session.io_stats().source_bytes_read, 0);
+    let (_, hashes) = session
+        .repair_available_targets_with_hashes_now(&[target])
+        .unwrap();
+    assert_eq!(hashes[0].1.len, 777);
+    assert_eq!(session.io_stats().target_verification_bytes_read, 1554);
+    // Verified slice state cannot authorize a changed target's CRC or wrong length.
+    std::fs::write(fx.dir.join(&fx.files[0].0), vec![0; 777]).unwrap();
+    let (report, hashes) = session
+        .repair_available_targets_with_hashes_now(&[target])
+        .unwrap();
+    assert!(!report.files[0].2);
+    assert!(hashes.is_empty());
+    let mut extra = fx.files[0].1.clone();
+    extra.push(0);
+    std::fs::write(fx.dir.join(&fx.files[0].0), extra).unwrap();
+    let (report, hashes) = session
+        .repair_available_targets_with_hashes_now(&[target])
+        .unwrap();
+    assert!(!report.files[0].2);
+    assert!(hashes.is_empty());
+    session.cancel();
+    assert!(matches!(
+        session.repair_available_targets_with_hashes_now(&[target]),
+        Err(RepairError::Cancelled)
+    ));
+    std::fs::remove_dir_all(&fx.dir).unwrap();
+}
+
+#[test]
 fn live_repair_phase_stats_count_cancelled_attempts_without_writes() {
     let fx = fixture(
         "repair-phase-cancelled",
