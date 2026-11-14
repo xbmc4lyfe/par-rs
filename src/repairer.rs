@@ -42,6 +42,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod donor;
+mod donor_budget;
+pub use donor_budget::{DonorReadBudget, DonorReadError, DonorReadScope};
 mod rename;
 
 /// How an explicitly admitted extra file supplies source blocks.

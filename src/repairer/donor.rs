@@ -8,7 +8,7 @@ use std::mem::size_of;
 
 const MAX_BLOCKS: usize = 32768;
 
-struct OrderedReport {
+pub(super) struct OrderedReport {
     accepted: Vec<FoundBlock>,
     file_hashes: Option<FileHashes>,
     complete: Option<usize>,
@@ -282,7 +282,7 @@ impl Par2Repairer {
         self.add_ordered_source(path, &source, observer)
     }
 
-    fn scan_ordered_source<S: PacketSource + ?Sized>(
+    pub(super) fn scan_ordered_source<S: PacketSource + ?Sized>(
         &self,
         source: &S,
         donor_index: Option<usize>,
@@ -438,7 +438,7 @@ impl Par2Repairer {
         Ok(count)
     }
 
-    fn apply_ordered(&mut self, path: &Path, report: &OrderedReport) -> usize {
+    pub(super) fn apply_ordered(&mut self, path: &Path, report: &OrderedReport) -> usize {
         if report.accepted.is_empty() && report.complete.is_none() {
             return 0;
         }

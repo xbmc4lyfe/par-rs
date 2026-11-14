@@ -357,7 +357,7 @@ impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
         self.buf[(pos - self.base) as usize]
     }
 
-    fn finish_hash(mut self) -> Option<FileHashes> {
+    pub(crate) fn finish_hash(mut self) -> Option<FileHashes> {
         // Hash any trailing bytes never made resident (cannot happen when scan reaches EOF,
         // but cancellation may stop early).
         if let Some(h) = &mut self.hasher
