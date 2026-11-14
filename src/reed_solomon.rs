@@ -230,6 +230,17 @@ impl Matrix {
 
     /// Gauss-Jordan inversion. Returns `None` if singular.
     pub fn inverse(&self, kernel: &Kernel) -> Option<Matrix> {
+        self.inverse_controlled(kernel, &|| false).ok().flatten()
+    }
+
+    fn inverse_controlled(
+        &self,
+        kernel: &Kernel,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Matrix>, RsError> {
+        if cancelled() {
+            return Err(RsError::Cancelled);
+        }
         assert_eq!(self.rows, self.cols, "only square matrices can be inverted");
         let n = self.rows;
         // Augmented [A | I].
@@ -241,14 +252,22 @@ impl Matrix {
             aug.set(r, n + r, 1);
         }
         for col in 0..n {
+            if cancelled() {
+                return Err(RsError::Cancelled);
+            }
             // Find a non-zero pivot in this column.
-            let pivot = (col..n).find(|&r| aug.get(r, col) != 0)?;
+            let Some(pivot) = (col..n).find(|&r| aug.get(r, col) != 0) else {
+                return Ok(None);
+            };
             aug.swap_rows(pivot, col);
             let p = aug.get(col, col);
             if p != 1 {
                 aug.scale_row(col, gf16::inv(p));
             }
             for r in 0..n {
+                if cancelled() {
+                    return Err(RsError::Cancelled);
+                }
                 if r != col {
                     let f = aug.get(r, col);
                     if f != 0 {
@@ -263,7 +282,7 @@ impl Matrix {
                 inv.set(r, c, aug.get(r, n + c));
             }
         }
-        Some(inv)
+        Ok(Some(inv))
     }
 }
 
@@ -295,6 +314,25 @@ pub fn plan_recovery(
     available_exponents: &[u32],
     kernel: &Kernel,
 ) -> Result<RecoveryPlan, RsError> {
+    plan_recovery_controlled(
+        input_logbases,
+        present,
+        available_exponents,
+        kernel,
+        &|| false,
+    )
+}
+
+pub(crate) fn plan_recovery_controlled(
+    input_logbases: &[u16],
+    present: &[bool],
+    available_exponents: &[u32],
+    kernel: &Kernel,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<RecoveryPlan, RsError> {
+    if cancelled() {
+        return Err(RsError::Cancelled);
+    }
     assert_eq!(
         input_logbases.len(),
         present.len(),
@@ -329,13 +367,19 @@ pub fn plan_recovery(
     let mut used: Vec<u32> = exps[..k].to_vec();
     let mut next_unused = k;
     loop {
+        if cancelled() {
+            return Err(RsError::Cancelled);
+        }
         let mut a = Matrix::zeros(k, k);
         for (j, &e) in used.iter().enumerate() {
+            if cancelled() {
+                return Err(RsError::Cancelled);
+            }
             for (m, &idx) in missing.iter().enumerate() {
                 a.set(j, m, rs_coefficient(input_logbases[idx], e));
             }
         }
-        if let Some(inverse) = a.inverse(kernel) {
+        if let Some(inverse) = a.inverse_controlled(kernel, cancelled)? {
             return Ok(RecoveryPlan {
                 missing,
                 used_exponents: used,
@@ -1093,6 +1137,34 @@ mod tests {
             output_group: 3,
             reader_threads: 2,
         }
+    }
+
+    #[test]
+    fn recovery_planning_checks_cancellation_during_work() {
+        let polls = std::cell::Cell::new(0);
+        let stop = || {
+            polls.set(polls.get() + 1);
+            polls.get() >= 3
+        };
+        assert!(matches!(
+            plan_recovery_controlled(
+                &[1, 2, 4, 7],
+                &[false; 4],
+                &[0, 1, 2, 3],
+                &Kernel::detect(),
+                &stop
+            ),
+            Err(RsError::Cancelled)
+        ));
+        let polls = std::cell::Cell::new(0);
+        let stop = || {
+            polls.set(polls.get() + 1);
+            polls.get() >= 3
+        };
+        assert!(matches!(
+            Matrix::identity(4).inverse_controlled(&Kernel::detect(), &stop),
+            Err(RsError::Cancelled)
+        ));
     }
 
     #[test]

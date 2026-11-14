@@ -237,6 +237,20 @@ syndrome slot plus an optional bounded folder pool (full queue ⇒ inline fold, 
 writer), and each slot keeps a `folded_mask` bitset so slots allocated when a late volume arrives
 are back-filled from disk for exactly the slices they lack.
 
+Use `session.io_stats()` to distinguish verified RAM input, source verification
+reads, late-exponent backfill, recovery-file reads, and repaired-target hash reads.
+These are cumulative logical bytes, including successful read chunks before an
+I/O error, rather than physical device traffic. A fully RAM-fed, pretracked solve
+can avoid rereading the other source files; the repaired target still receives a
+whole-file MD5 check.
+
+`session.cancel()` permanently stops new payload admissions and interrupts queued
+folding, bounded reads, matrix planning, and repair. A cancelled session must be
+replaced; in-place output may be partial and must remain unavailable to unpack
+until ordinary verification or repair succeeds. The caller must also synchronize
+its article writers and cache flushes with repair writes; a session lock does not
+control external writers.
+
 Command-line tool for manual use:
 
 ```sh

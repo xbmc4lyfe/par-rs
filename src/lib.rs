@@ -257,9 +257,9 @@ pub use repairer::{
 pub use scanner::{ChecksumIndex, ScanConfig, ScanReport, scan_file};
 pub use stream::{FileLayout, StreamEvent, StreamStatus, StreamingSliceAssembler, SyndromeBank};
 pub use streaming::{
-    ArticleOutcome, BitVec, BlockEvent, BlockState, EarlyRepairReport, LiveStatus, QueuedVolume,
-    SessionOptions, SliceEvent, SliceState, StreamingOptions, StreamingParSession, StreamingStats,
-    StreamingStatus, UnpauseAction, VolumeStatus,
+    ArticleOutcome, BitVec, BlockEvent, BlockState, EarlyRepairReport, LiveIoStats, LiveStatus,
+    QueuedVolume, SessionOptions, SliceEvent, SliceState, StreamingOptions, StreamingParSession,
+    StreamingStats, StreamingStatus, UnpauseAction, VolumeStatus,
 };
 pub use twin::{FileSig, TwinRelation, block_size, compare_twin_par2_data, fingerprint, par2_set};
 pub use verify::{

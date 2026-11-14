@@ -1,6 +1,6 @@
 # Streaming PAR2 repair for `RustyGet`
 
-Status: approved by the user with “ok go” after reviewing this design on 2026-11-14. Implement early bounded accumulation under the stated resource and verification contracts. Existing deployment and coordination holds remain in force.
+Status: approved by the user after reviewing this design on 2026-11-14. Implement early bounded accumulation under the stated resource and verification contracts. Existing deployment and coordination holds remain in force.
 
 RustyGet should do PAR2 verification and repair accumulation while articles arrive, so repairing a damaged archive volume does not require a new pass over the entire downloaded set. It should fetch useful recovery volumes alongside data and release a held unpack volume as soon as that volume is repaired and verified.
 
