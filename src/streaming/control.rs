@@ -49,7 +49,8 @@ pub struct RepairPhaseStats {
     pub target_write_ns: u64,
     /// Target data synchronization attempts.
     pub target_sync_ns: u64,
-    /// Publishing and folding reconstructed source slices into syndromes.
+    /// Publishing repaired slices and dispatching folds, with any inline work.
+    /// Queued worker completion is outside this timer.
     pub refold_ns: u64,
     /// Whole-file target MD5 and length checks.
     pub target_verification_ns: u64,
