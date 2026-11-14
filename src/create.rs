@@ -47,6 +47,17 @@ pub enum VolumeScheme {
     Exponential,
 }
 
+/// Filename spelling for recovery volumes, independent of their allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeNaming {
+    /// Preserve the native names produced by [`create`] and [`build_set`].
+    Native,
+    /// Use independent decimal widths, with a minimum of one digit, for
+    /// [`VolumeScheme::Exponential`]. Other schemes retain their native names.
+    /// This selects filename spelling only, not a general compatibility profile.
+    Par2cmdlineExponential,
+}
+
 /// Creation parameters.
 #[derive(Clone, Debug)]
 pub struct CreateOptions {
@@ -380,8 +391,17 @@ fn creation_volume_widths(
     total: u32,
     first_exponent: u32,
     layout: &[(u32, u32)],
+    naming: VolumeNaming,
 ) -> (usize, usize) {
     let digits = |n: u32| (n.max(1).ilog10() + 1) as usize;
+    if naming == VolumeNaming::Par2cmdlineExponential && scheme == VolumeScheme::Exponential {
+        // The zero-count index allocation is the exclusive set end. It participates
+        // in the reference exponent width, even beyond the last volume start.
+        return (
+            digits(first_exponent + total),
+            digits(layout.iter().map(|&(_, count)| count).max().unwrap_or(1)),
+        );
+    }
     match scheme {
         VolumeScheme::Balanced(volumes) => (
             digits(first_exponent + total),
@@ -459,6 +479,31 @@ pub fn create(
     out_dir: &Path,
     base: &str,
     opts: &CreateOptions,
+    cancel: Option<&AtomicBool>,
+    progress: &mut CreateProgress<'_>,
+) -> Result<CreateReport, CreateError> {
+    create_with_volume_naming(
+        sources,
+        out_dir,
+        base,
+        opts,
+        VolumeNaming::Native,
+        cancel,
+        progress,
+    )
+}
+
+/// Create a recovery set with an explicit volume filename policy.
+///
+/// This has the same validation, I/O, progress, and cancellation behavior as
+/// [`create`]. The policy only changes exponential volume names; it does not
+/// change packet bytes, volume allocation, or publication behavior.
+pub fn create_with_volume_naming(
+    sources: &[SourceFile],
+    out_dir: &Path,
+    base: &str,
+    opts: &CreateOptions,
+    naming: VolumeNaming,
     cancel: Option<&AtomicBool>,
     progress: &mut CreateProgress<'_>,
 ) -> Result<CreateReport, CreateError> {
@@ -579,7 +624,8 @@ pub fn create(
         locations: vec![(0, 0); if with_recovery { total as usize } else { 0 }],
     };
     if with_recovery {
-        let widths = creation_volume_widths(opts.volumes, total, opts.first_exponent, &layout);
+        let widths =
+            creation_volume_widths(opts.volumes, total, opts.first_exponent, &layout, naming);
         for (vi, &(first, count)) in layout.iter().enumerate() {
             let name = creation_volume_name(base, opts.first_exponent + first, count, widths);
             let path = out_dir.join(&name);
@@ -938,6 +984,19 @@ pub fn build_set(
     sources: &[(&str, &[u8])],
     opts: &SetOptions,
 ) -> Result<Par2Set, CreateError> {
+    build_set_with_volume_naming(base, sources, opts, VolumeNaming::Native)
+}
+
+/// Build a complete PAR2 set with an explicit volume filename policy.
+///
+/// Like [`build_set`], with filename spelling selected independently of packet
+/// bytes and allocation. Only exponential volume names can differ from Native.
+pub fn build_set_with_volume_naming(
+    base: &str,
+    sources: &[(&str, &[u8])],
+    opts: &SetOptions,
+    naming: VolumeNaming,
+) -> Result<Par2Set, CreateError> {
     let ss = opts.slice_size;
     if ss == 0 || !ss.is_multiple_of(4) {
         return Err(CreateError::BadSliceSize(ss as u64));
@@ -1060,6 +1119,7 @@ pub fn build_set(
             opts.recovery_blocks,
             opts.first_exponent,
             &layout,
+            naming,
         );
         for (first, count) in layout {
             let name = creation_volume_name(base, opts.first_exponent + first, count, widths);
