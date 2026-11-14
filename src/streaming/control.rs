@@ -25,6 +25,66 @@ pub struct LiveIoStats {
     pub target_verification_bytes_read: u64,
 }
 
+/// Cumulative wall-clock nanoseconds for selected-target repair calls.
+/// Timers include failed and cancelled attempts. Decode time includes output
+/// callbacks; target write time is nested within decode time. Parallel work can
+/// overlap, so these fields must not be summed or subtracted as CPU time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepairPhaseStats {
+    /// Total started calls. Counts refusals and cancellations.
+    pub attempts: u64,
+    /// Calls that returned an `Ok` report; inspect its per-file verification flags.
+    pub completed: u64,
+    /// Bytes in fully successful target write callbacks, not physical device I/O.
+    pub target_bytes_written: u64,
+    /// Time waiting for exclusive payload admission.
+    pub payload_wait_ns: u64,
+    /// Time reconciling recovery slots before matrix planning.
+    pub backfill_ns: u64,
+    /// Recovery matrix planning, inversion, and selected-row construction.
+    pub matrix_ns: u64,
+    /// Decode engine wall time, including its output callbacks.
+    pub decode_ns: u64,
+    /// Target write system calls within the decode callbacks.
+    pub target_write_ns: u64,
+    /// Target data synchronization attempts.
+    pub target_sync_ns: u64,
+    /// Publishing and folding reconstructed source slices into syndromes.
+    pub refold_ns: u64,
+    /// Whole-file target MD5 and length checks.
+    pub target_verification_ns: u64,
+    /// Elapsed time for the entire selected-target call.
+    pub total_ns: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum RepairPhase {
+    PayloadWait,
+    Backfill,
+    Matrix,
+    Decode,
+    Write,
+    Sync,
+    Refold,
+    Verify,
+    Total,
+}
+
+pub(super) struct PhaseTimer<'a> {
+    counter: &'a AtomicU64,
+    started: std::time::Instant,
+}
+impl Drop for PhaseTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let _ = self
+            .counter
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(old.saturating_add(elapsed))
+            });
+    }
+}
+
 #[derive(Default)]
 pub(super) struct LiveControl {
     pub cancelled: AtomicBool,
@@ -33,6 +93,10 @@ pub(super) struct LiveControl {
     backfill: AtomicU64,
     recovery: AtomicU64,
     target: AtomicU64,
+    pub repair_attempts: AtomicU64,
+    pub repair_completed: AtomicU64,
+    pub repair_written: AtomicU64,
+    phases: [AtomicU64; 9],
 }
 
 #[derive(Clone, Copy)]
@@ -44,6 +108,29 @@ pub(super) enum IoClass {
 }
 
 impl LiveControl {
+    pub fn phase(&self, phase: RepairPhase) -> PhaseTimer<'_> {
+        PhaseTimer {
+            counter: &self.phases[phase as usize],
+            started: std::time::Instant::now(),
+        }
+    }
+    pub fn repair_stats(&self) -> RepairPhaseStats {
+        let phase = |p: RepairPhase| self.phases[p as usize].load(Ordering::Relaxed);
+        RepairPhaseStats {
+            attempts: self.repair_attempts.load(Ordering::Relaxed),
+            completed: self.repair_completed.load(Ordering::Relaxed),
+            target_bytes_written: self.repair_written.load(Ordering::Relaxed),
+            payload_wait_ns: phase(RepairPhase::PayloadWait),
+            backfill_ns: phase(RepairPhase::Backfill),
+            matrix_ns: phase(RepairPhase::Matrix),
+            decode_ns: phase(RepairPhase::Decode),
+            target_write_ns: phase(RepairPhase::Write),
+            target_sync_ns: phase(RepairPhase::Sync),
+            refold_ns: phase(RepairPhase::Refold),
+            target_verification_ns: phase(RepairPhase::Verify),
+            total_ns: phase(RepairPhase::Total),
+        }
+    }
     pub fn ensure_running(&self) -> Result<(), RepairError> {
         if self.cancelled.load(Ordering::Acquire) {
             Err(RepairError::Cancelled)

@@ -68,8 +68,9 @@ use std::path::{Path, PathBuf};
 
 mod control;
 use crate::packet::PacketSource;
-pub use control::LiveIoStats;
+use control::RepairPhase;
 use control::{CountedFile, IoClass, LiveControl};
+pub use control::{LiveIoStats, RepairPhaseStats};
 
 /// Options for [`Par2Repairer::enable_streaming`].
 #[derive(Clone, Debug)]
@@ -2129,6 +2130,13 @@ impl StreamingParSession {
         self.inner.control.stats()
     }
 
+    /// Snapshot of cumulative selected-target repair wall times and write bytes.
+    /// Fields are sampled independently; take snapshots outside active repair calls
+    /// for exact deltas. Decode time includes the nested target write callbacks.
+    pub fn repair_phase_stats(&self) -> RepairPhaseStats {
+        self.inner.control.repair_stats()
+    }
+
     /// Set id.
     pub fn set_id(&self) -> SetId {
         self.inner.set_id
@@ -3258,16 +3266,40 @@ impl StreamingParSession {
         &self,
         target_file_ids: &[FileId],
     ) -> Result<EarlyRepairReport, RepairError> {
+        let _total = self.inner.control.phase(RepairPhase::Total);
+        self.inner
+            .control
+            .repair_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let result = self.repair_available_targets_inner(target_file_ids);
+        if result.is_ok() {
+            self.inner
+                .control
+                .repair_completed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn repair_available_targets_inner(
+        &self,
+        target_file_ids: &[FileId],
+    ) -> Result<EarlyRepairReport, RepairError> {
+        let wait = self.inner.control.phase(RepairPhase::PayloadWait);
         let _payload = self
             .inner
             .payload_gate
             .write()
             .unwrap_or_else(|e| e.into_inner());
+        drop(wait);
         self.inner.control.ensure_running()?;
         for id in target_file_ids {
             self.file(id)?;
         }
-        self.backfill_slots()?;
+        {
+            let _backfill = self.inner.control.phase(RepairPhase::Backfill);
+            self.backfill_slots()?;
+        }
         let ss = self.inner.slice_size;
         let (missing, present, ready_exps): (Vec<usize>, Vec<bool>, Vec<u32>) = {
             let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -3306,11 +3338,12 @@ impl StreamingParSession {
         };
         if rows.is_empty() || k == 0 {
             for id in target_file_ids {
-                let (st, ok) = self.check_target(id)?;
+                let (st, ok) = self.check_target_timed(id)?;
                 report.files.push((*id, st, ok));
             }
             return Ok(report);
         }
+        let matrix = self.inner.control.phase(RepairPhase::Matrix);
         crate::repairer::check_recovery_matrix_memory(
             k as u64,
             self.inner.opts.solve_mem_limit_bytes,
@@ -3345,6 +3378,7 @@ impl StreamingParSession {
                 sub.set(ri, j, plan.inverse.get(m, j));
             }
         }
+        drop(matrix);
         // Take the used syndromes out of their slots for the duration of the solve.
         self.flush();
         let slots: Vec<Arc<Mutex<SyndromeSlot>>> = self
@@ -3422,7 +3456,12 @@ impl StreamingParSession {
             buf[offset as usize..offset as usize + data.len()].copy_from_slice(data);
             if offset < block_len {
                 let n = ((block_len - offset) as usize).min(data.len());
+                let _write = self.inner.control.phase(RepairPhase::Write);
                 write_all_at(&targets[&fi], block_off + offset, &data[..n])?;
+                self.inner
+                    .control
+                    .repair_written
+                    .fetch_add(n as u64, Ordering::Relaxed);
             }
             Ok(())
         };
@@ -3439,12 +3478,14 @@ impl StreamingParSession {
             config,
             kernel: self.inner.opts.kernel,
         };
+        let decode = self.inner.control.phase(RepairPhase::Decode);
         let run = engine.run(
             &reader,
             &mut sink as &mut dyn OutputSink,
             Some(&self.inner.control.cancelled),
             &mut |_, _, _, _| {},
         );
+        drop(decode);
         // Return the syndromes to their slots before handling the result.
         drop(taken);
         self.inner.control.ensure_running()?;
@@ -3457,10 +3498,14 @@ impl StreamingParSession {
             _ => RepairError::Singular,
         })?;
         self.inner.control.ensure_running()?;
-        for fh in targets.values() {
-            fh.sync_data().ok();
+        {
+            let _sync = self.inner.control.phase(RepairPhase::Sync);
+            for fh in targets.values() {
+                fh.sync_data().ok();
+            }
         }
         self.inner.control.ensure_running()?;
+        let refold = self.inner.control.phase(RepairPhase::Refold);
         // Mark and fold the reconstructed slices so later solves see them as verified.
         for (ri, &g) in rows.iter().enumerate() {
             let fi = self
@@ -3485,11 +3530,17 @@ impl StreamingParSession {
             self.fold(g, data)?;
             report.repaired_slices.push((f.file_id, b));
         }
+        drop(refold);
         for id in target_file_ids {
-            let (st, ok) = self.check_target(id)?;
+            let (st, ok) = self.check_target_timed(id)?;
             report.files.push((*id, st, ok));
         }
         Ok(report)
+    }
+
+    fn check_target_timed(&self, id: &FileId) -> Result<(VolumeStatus, bool), RepairError> {
+        let _verify = self.inner.control.phase(RepairPhase::Verify);
+        self.check_target(id)
     }
 
     /// Volume status plus whole-file MD5 check (only performed when all slices are verified).

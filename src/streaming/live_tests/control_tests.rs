@@ -367,6 +367,7 @@ fn live_part40_global_repair_needs_rank_and_no_other_sources() {
         },
     )
     .unwrap();
+    assert_eq!(s.repair_phase_stats(), RepairPhaseStats::default());
     for (name, data) in &fx.files[..39] {
         write_at(&fx.dir.join(name), 0, data);
         s.on_article_finished(&fid(&fx, name), 0, 1024, crc32(data), Some(data))
@@ -384,6 +385,11 @@ fn live_part40_global_repair_needs_rank_and_no_other_sources() {
         })
     ));
     assert!(!fx.dir.join(&fx.files[39].0).exists());
+    let refused = s.repair_phase_stats();
+    assert_eq!(refused.attempts, 1);
+    assert_eq!(refused.completed, 0);
+    assert_eq!(refused.target_bytes_written, 0);
+    assert!(refused.total_ns > 0);
     for (name, data) in &fx.files[40..] {
         write_at(&fx.dir.join(name), 0, data);
         s.on_article_finished(&fid(&fx, name), 0, 1024, crc32(data), Some(data))
@@ -409,6 +415,15 @@ fn live_part40_global_repair_needs_rank_and_no_other_sources() {
     assert_eq!(io.source_bytes_read, 0);
     assert_eq!(io.backfill_bytes_read, 0);
     assert_eq!(io.target_verification_bytes_read, 1024);
+    let phases = s.repair_phase_stats();
+    assert_eq!(phases.attempts, 2);
+    assert_eq!(phases.completed, 1);
+    assert_eq!(phases.target_bytes_written, 1024);
+    assert!(phases.matrix_ns > 0 && phases.decode_ns > 0);
+    assert!(phases.target_write_ns > 0 && phases.target_sync_ns > 0);
+    assert!(phases.refold_ns > 0 && phases.target_verification_ns > 0);
+    assert!(phases.total_ns >= phases.decode_ns);
+    assert!(phases.decode_ns >= phases.target_write_ns);
     std::fs::remove_dir_all(&fx.dir).unwrap();
 }
 
@@ -624,4 +639,58 @@ fn live_ram_only_does_not_complete_coverage_previously_accepted_without_ram() {
         .unwrap();
     assert_eq!(s.status().verified, 1);
     std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn live_repair_phase_stats_preserve_the_verify_only_path() {
+    let fx = fixture(
+        "repair-phase-verify-only",
+        &[4096],
+        4096,
+        1,
+        VolumeScheme::Uniform(1),
+    );
+    let id = fid(&fx, &fx.files[0].0);
+    let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    write_at(&fx.dir.join(&fx.files[0].0), 0, &fx.files[0].1);
+    s.on_article_finished_memory_only(&id, 0, &fx.files[0].1, crc32(&fx.files[0].1))
+        .unwrap();
+    let report = s.repair_available_targets_now(&[id]).unwrap();
+    assert!(report.files[0].2);
+    let phases = s.repair_phase_stats();
+    assert_eq!(phases.attempts, 1);
+    assert_eq!(phases.completed, 1);
+    assert_eq!(phases.target_bytes_written, 0);
+    assert_eq!(phases.decode_ns, 0);
+    assert_eq!(phases.target_write_ns, 0);
+    assert!(phases.target_verification_ns > 0);
+    assert_eq!(s.io_stats().target_verification_bytes_read, 4096);
+    std::fs::remove_dir_all(&fx.dir).unwrap();
+}
+
+#[test]
+fn live_repair_phase_stats_count_cancelled_attempts_without_writes() {
+    let fx = fixture(
+        "repair-phase-cancelled",
+        &[4096],
+        4096,
+        1,
+        VolumeScheme::Uniform(1),
+    );
+    let id = fid(&fx, &fx.files[0].0);
+    let session = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    session.cancel();
+    assert!(matches!(
+        session.repair_available_targets_now(&[id]),
+        Err(RepairError::Cancelled)
+    ));
+    let phases = session.repair_phase_stats();
+    assert_eq!(phases.attempts, 1);
+    assert_eq!(phases.completed, 0);
+    assert_eq!(phases.target_bytes_written, 0);
+    assert_eq!(phases.matrix_ns, 0);
+    assert_eq!(phases.decode_ns, 0);
+    assert_eq!(phases.target_verification_ns, 0);
+    assert!(phases.total_ns > 0);
+    std::fs::remove_dir_all(&fx.dir).unwrap();
 }
