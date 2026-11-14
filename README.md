@@ -8,8 +8,8 @@ files without downloading the archives they protect (Atlas). It replaces `par2cm
 obfuscated-file resolution and an in-memory streaming repair API.
 
 ```
-rust-version = "1.99", edition 2024, lib name par_rs
-dependencies: md-5, memchr, crc32fast, sha1, regex, thiserror; optional rayon ("parallel"), memmap2 ("mmap") — both default on
+rust-version = "1.100", edition 2024, lib name par_rs
+dependencies: md-5, memchr, crc32fast, thiserror; optional rayon ("parallel"), memmap2 ("mmap") — both default on
 crate-type   = rlib + staticlib (C ABI in src/ffi.rs)
 ```
 
@@ -248,8 +248,16 @@ Or run through Cargo: `cargo run --release --example par-rs -- {create|verify|re
 
 ## Development
 
-Install Rust 1.99.1 with the `clippy` and `rustfmt` components, `just` 1.59.0, and Vale 3.26.0.
+Install Rust 1.100.0 with the `clippy` and `rustfmt` components, `just` 1.59.0, and Vale 3.26.0.
 GitHub CI also installs `par2cmdline-turbo` 1.5.0 for the differential compatibility tests.
+The repository pins Rust 1.100.0 in `rust-toolchain.toml`. If a system-installed
+compiler comes before Rustup on PATH, select the pinned binaries explicitly:
+
+```sh
+rustup toolchain install 1.100.0 --profile minimal --component clippy,rustfmt
+export PATH="$(dirname "$(rustup which --toolchain 1.100.0 rustc)"):$PATH"
+```
+
 Run these commands from the repository root:
 
 | Command | Purpose |
