@@ -1,6 +1,6 @@
 # Streaming PAR2 repair for `RustyGet`
 
-Status: draft for user review. Early bounded accumulation is the author's recommended default; the user has not selected a default or approved this design. No runtime implementation or deployment is authorized by this document alone.
+Status: approved by the user with “ok go” after reviewing this design on 2026-11-14. Implement early bounded accumulation under the stated resource and verification contracts. Existing deployment and coordination holds remain in force.
 
 RustyGet should do PAR2 verification and repair accumulation while articles arrive, so repairing a damaged archive volume does not require a new pass over the entire downloaded set. It should fetch useful recovery volumes alongside data and release a held unpack volume as soon as that volume is repaired and verified.
 
@@ -35,7 +35,7 @@ There is no promise of zero milliseconds of final work or 20–50 GB/s end-to-en
 | Start on damage and backfill the known prefix | Saves GF work on healthy downloads and follows the supplied example directly | Needs retained source bytes and a prefix read after damage; later damage can require more backfill |
 | Replace the caller with the memory-only assembler | Gives the caller direct control of source I/O | Duplicates existing scheduling, persistence, file verification, and concurrency integration |
 
-The recommendation is the first approach. It is an author proposal, not a recorded user selection. Keep the second as a supported fallback; do not replace the live engine with a second implementation.
+The approved approach is early bounded accumulation. Keep damage-triggered backfill as a supported fallback; do not replace the live engine with a second implementation.
 
 ## Proposed default and resource policy
 
@@ -103,4 +103,4 @@ Implement in isolated work with an explicit caller owner; preserve the active re
 
 The builder may choose internal bookkeeping and additive API details after measuring the actual gaps. The implementation plan must settle the budget-owner mapping, cancellation interface, and downloader write-barrier hook from current source. If any cannot be provided safely, narrow the deliverable to the corresponding library/caller preparation and report the exact remaining integration limitation.
 
-The user-facing default policy remains open. This draft recommends early bounded accumulation; it does not claim that the user has approved that choice or the proposed resource and healthy-path guardrails.
+The user approved the early bounded default and this design's proposed guardrails. Internal bookkeeping and additive API details remain engineering choices under these contracts.
