@@ -192,6 +192,82 @@ fn live_counted_short_read_retains_successful_prefix_bytes() {
 }
 
 #[test]
+fn live_hosted_verified_donor_releases_crc_metadata_for_remaining_files() {
+    let fx = fixture(
+        "donor-crc-release",
+        &[65536; 5],
+        65536,
+        1,
+        VolumeScheme::Uniform(1),
+    );
+    let s = StreamingParSession::new(
+        &fx.set,
+        &fx.dir,
+        SessionOptions {
+            max_working_bytes: (crate::hasher::READ_CHUNK + crate::packet::RESYNC_WINDOW) as u64,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    for (name, data) in &fx.files {
+        let id = fid(&fx, name);
+        for offset in 0..3000 {
+            s.on_article_finished(&id, offset, 1, 0, None).unwrap();
+        }
+        assert_eq!(
+            s.try_splice_live_slice(&id, ByteRange::new(0, 65536), data, &fx.dir.join(name))
+                .unwrap(),
+            vec![0]
+        );
+    }
+    assert_eq!(s.status().verified, 5);
+    std::fs::remove_dir_all(&fx.dir).unwrap();
+}
+
+#[test]
+fn live_hosted_verified_rs_target_releases_crc_metadata_for_remaining_files() {
+    let fx = fixture(
+        "rs-crc-release",
+        &[65536; 2],
+        65536,
+        2,
+        VolumeScheme::Uniform(1),
+    );
+    let s = StreamingParSession::new(
+        &fx.set,
+        &fx.dir,
+        SessionOptions {
+            preallocated_syndrome_slots: 2,
+            max_working_bytes: (crate::hasher::READ_CHUNK + crate::packet::RESYNC_WINDOW) as u64,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    let first = fid(&fx, &fx.files[0].0);
+    let second = fid(&fx, &fx.files[1].0);
+    for offset in 0..6000 {
+        s.on_article_finished(&first, offset, 1, 0, None).unwrap();
+    }
+    for path in &fx.vols {
+        s.on_recovery_volume_arrived(path, None).unwrap();
+    }
+    assert!(s.repair_available_targets_now(&[first]).unwrap().files[0].2);
+    for offset in 0..3000 {
+        s.on_article_finished(&second, offset, 1, 0, None).unwrap();
+    }
+    assert!(s.repair_available_targets_now(&[second]).unwrap().files[0].2);
+    assert_eq!(
+        std::fs::read(fx.dir.join(&fx.files[0].0)).unwrap(),
+        fx.files[0].1
+    );
+    assert_eq!(
+        std::fs::read(fx.dir.join(&fx.files[1].0)).unwrap(),
+        fx.files[1].1
+    );
+    std::fs::remove_dir_all(&fx.dir).unwrap();
+}
+
+#[test]
 fn live_cancel_refuses_work_without_writes() {
     let fx = fixture(
         "cancel-admission",

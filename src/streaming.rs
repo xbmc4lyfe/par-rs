@@ -2150,6 +2150,8 @@ impl StreamingParSession {
         if new == SliceState::VerifiedGood {
             t.metadata_entries -= t.covered[g].len();
             t.covered[g] = Vec::new();
+            t.metadata_entries -= t.article_crcs[g].len();
+            t.article_crcs[g] = Vec::new();
         }
         t.counts[old as usize] -= 1;
         t.counts[new.tag() as usize] += 1;
