@@ -9,6 +9,9 @@ use crate::crc::Crc32;
 use md5::{Digest, Md5};
 use std::io::{self, Read};
 
+mod slices;
+pub use slices::FileSliceHasher;
+
 /// Size of the PAR2 "16k" hash prefix.
 pub const HASH_16K_LEN: u64 = 16 * 1024;
 
