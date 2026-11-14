@@ -791,3 +791,132 @@ fn ordered_donor_policy_cross_repairs_with_reference() {
         }
     }
 }
+
+#[test]
+fn rename_cycles_match_reference_bytes_backups_and_live_leftovers() {
+    let explicit = std::env::var_os("PAR2_RENAME_REFERENCE");
+    if explicit.is_none() && !par2_available() {
+        eprintln!("par2 not available; skipping rename-cycle comparison");
+        return;
+    }
+    let reference = explicit.unwrap_or_else(|| "par2".into());
+    let artifacts = std::env::var_os("PAR2_RENAME_ARTIFACT_DIR").map(PathBuf::from);
+    let root = artifacts.clone().unwrap_or_else(|| tmpdir("rename-cycles"));
+    std::fs::create_dir_all(&root).unwrap();
+    let invoke = |dir: &Path, args: &[&str]| {
+        let out = Command::new(&reference)
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        eprintln!(
+            "RENAME_REFERENCE cwd={} argv={reference:?} {args:?} status={:?}\n{}{}",
+            dir.display(),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.status.code().unwrap()
+    };
+    let files = [
+        ("a.bin", b"abcdefghABCDEFGH".as_slice()),
+        ("b.bin", b"12345678!@#$%^&*".as_slice()),
+        ("c.bin", b"QWERTYUIOPasdfgh".as_slice()),
+    ];
+    for creator in ["library", "reference"] {
+        for count in [2, 3] {
+            let case = root.join(format!("{creator}-{count}"));
+            std::fs::create_dir(&case).unwrap();
+            let created = case.join("created");
+            std::fs::create_dir(&created).unwrap();
+            for (name, bytes) in &files[..count] {
+                std::fs::write(created.join(name), bytes).unwrap();
+            }
+            if creator == "library" {
+                par_rs::build_set(
+                    "set",
+                    &files[..count],
+                    &par_rs::SetOptions {
+                        slice_size: 16,
+                        recovery_blocks: 0,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .write_to(&created, "set")
+                .unwrap();
+            } else {
+                let mut args = vec![
+                    "c", "-qq", "-t1", "-T1", "-m16", "-s16", "-c0", "set.par2", "a.bin", "b.bin",
+                ];
+                if count == 3 {
+                    args.push("c.bin");
+                }
+                assert_eq!(invoke(&created, &args), 0);
+            }
+            for repairer in ["library", "reference"] {
+                let dir = case.join(repairer);
+                std::fs::create_dir(&dir).unwrap();
+                for entry in std::fs::read_dir(&created).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.path().extension().is_some_and(|e| e == "par2") {
+                        std::fs::copy(entry.path(), dir.join(entry.file_name())).unwrap();
+                    }
+                }
+                for i in 0..count {
+                    std::fs::write(dir.join(files[i].0), files[(i + 1) % count].1).unwrap();
+                }
+                std::fs::write(dir.join("b.bin.1"), b"caller-owned prior backup").unwrap();
+                let mut before: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect();
+                before.sort();
+                if repairer == "reference" {
+                    assert_eq!(invoke(&dir, &["v", "-q", "-O", "set.par2"]), 1);
+                    assert_eq!(
+                        invoke(&dir, &["r", "-q", "-t1", "-T1", "-O", "set.par2"]),
+                        0
+                    );
+                } else {
+                    let mut engine = Par2Repairer::new(
+                        &dir,
+                        RepairOptions {
+                            full_file_md5: true,
+                            num_threads: 1,
+                            ..Default::default()
+                        },
+                    );
+                    engine.load_par2_set(&dir.join("set.par2")).unwrap();
+                    engine.finalize().unwrap();
+                    let status = engine.verify(None, &mut NullObserver).unwrap();
+                    assert!(status.repair_possible);
+                    assert!(status.repair_needed);
+                    let RepairResult::Repaired { leftovers, .. } =
+                        engine.repair(&mut NullObserver).unwrap()
+                    else {
+                        panic!("repair expected")
+                    };
+                    assert!(leftovers.is_empty());
+                }
+                assert_eq!(invoke(&dir, &["v", "-q", "-O", "set.par2"]), 0);
+                for (name, bytes) in &files[..count] {
+                    assert_eq!(std::fs::read(dir.join(name)).unwrap(), *bytes);
+                }
+                assert_eq!(
+                    std::fs::read(dir.join("b.bin.1")).unwrap(),
+                    b"caller-owned prior backup"
+                );
+                let mut after: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect();
+                after.sort();
+                assert_eq!(before, after);
+            }
+        }
+    }
+    if artifacts.is_none() {
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
