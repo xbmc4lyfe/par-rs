@@ -582,3 +582,212 @@ fn limited_volumes_match_reference_and_cross_repair() {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[test]
+fn ordered_donor_policy_cross_repairs_with_reference() {
+    use par_rs::ExtraFileScanPolicy;
+    let explicit = std::env::var_os("PAR2_DONOR_REFERENCE");
+    if explicit.is_none() && !par2_available() {
+        eprintln!("par2 not available; skipping donor comparison");
+        return;
+    }
+    let reference = explicit.unwrap_or_else(|| "par2".into());
+    let artifact_root = std::env::var_os("PAR2_DONOR_ARTIFACT_DIR").map(PathBuf::from);
+    if let Some(root) = &artifact_root {
+        std::fs::create_dir_all(root).unwrap();
+    }
+    let invoke = |dir: &Path, args: &[&str]| {
+        let out = Command::new(&reference)
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        eprintln!(
+            "DONOR_REFERENCE cwd={} argv={reference:?} {args:?} status={:?}\n{}{}",
+            dir.display(),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.status.code().unwrap()
+    };
+    for creator in ["library", "reference"] {
+        for scenario in [
+            "prefix",
+            "shifted-ordered",
+            "shifted-full",
+            "perfect-and-damaged",
+        ] {
+            let tag = format!("ordered-{creator}-{scenario}-{}", std::process::id());
+            let root = match &artifact_root {
+                Some(root) => root.join(&tag),
+                None => std::env::temp_dir().join(format!("par-rs-{tag}")),
+            };
+            std::fs::create_dir(&root).unwrap();
+            eprintln!("ORDERED_REFERENCE_FIXTURE {}", root.display());
+            let created = root.join("created");
+            std::fs::create_dir(&created).unwrap();
+            let a: Vec<u8> = if scenario == "perfect-and-damaged" {
+                (0..16).collect()
+            } else {
+                (0..64).collect()
+            };
+            let b: Vec<u8> = (100..116).collect();
+            let files = if scenario == "perfect-and-damaged" {
+                vec![
+                    ("a.bin".to_owned(), a.clone()),
+                    ("b.bin".to_owned(), b.clone()),
+                ]
+            } else {
+                vec![("a.bin".to_owned(), a.clone())]
+            };
+            let recovery = match scenario {
+                "prefix" => 2,
+                "perfect-and-damaged" => 1,
+                _ => 0,
+            };
+            for (name, data) in &files {
+                std::fs::write(created.join(name), data).unwrap();
+            }
+            if creator == "reference" {
+                let count = format!("-c{recovery}");
+                let mut args = vec![
+                    "c",
+                    "-qq",
+                    "-t1",
+                    "-T1",
+                    "-m16",
+                    "-s16",
+                    count.as_str(),
+                    "set.par2",
+                    "a.bin",
+                ];
+                if files.len() == 2 {
+                    args.push("b.bin");
+                }
+                assert_eq!(invoke(&created, &args), 0);
+            } else {
+                let sources: Vec<_> = files
+                    .iter()
+                    .map(|(name, _)| SourceFile::new(created.join(name)))
+                    .collect();
+                create(
+                    &sources,
+                    &created,
+                    "set",
+                    &CreateOptions {
+                        slice_size: 16,
+                        recovery_blocks: recovery,
+                        engine: par_rs::EngineConfig {
+                            num_threads: 1,
+                            mem_limit_bytes: 16 << 20,
+                            ..Default::default()
+                        },
+                        ..CreateOptions::default()
+                    },
+                    None,
+                    &mut |_, _, _| {},
+                )
+                .unwrap();
+            }
+            let ours = root.join("ours");
+            let theirs = root.join("theirs");
+            let donor = match scenario {
+                "prefix" => [a[..32].to_vec(), vec![255; 16]].concat(),
+                "perfect-and-damaged" => a.clone(),
+                _ => [vec![255; 7], a.clone()].concat(),
+            };
+            for dir in [&ours, &theirs] {
+                std::fs::create_dir(dir).unwrap();
+                for entry in std::fs::read_dir(&created).unwrap() {
+                    let entry = entry.unwrap();
+                    std::fs::copy(entry.path(), dir.join(entry.file_name())).unwrap();
+                }
+                std::fs::remove_file(dir.join("a.bin")).unwrap();
+                std::fs::write(dir.join("donor.bin"), &donor).unwrap();
+                if files.len() == 2 {
+                    std::fs::write(dir.join("b.bin"), vec![255; 16]).unwrap();
+                }
+            }
+            let policy = if scenario == "shifted-full" {
+                ExtraFileScanPolicy::Full
+            } else {
+                ExtraFileScanPolicy::OrderedPrefix
+            };
+            let mut repairer = Par2Repairer::new(
+                &ours,
+                RepairOptions {
+                    num_threads: 1,
+                    mem_limit_bytes: 16 << 20,
+                    full_file_md5: true,
+                    ..RepairOptions::default()
+                },
+            );
+            repairer.load_par2_set(&ours.join("set.par2")).unwrap();
+            repairer.finalize().unwrap();
+            repairer.verify(None, &mut NullObserver).unwrap();
+            let newly = repairer
+                .add_extra_file_with_policy(&ours.join("donor.bin"), policy, &mut NullObserver)
+                .unwrap();
+            let expected_offsets: Vec<u64> = match scenario {
+                "prefix" => vec![0, 16],
+                "shifted-full" => vec![7, 23, 39, 55],
+                "perfect-and-damaged" => vec![0],
+                _ => vec![],
+            };
+            let mut located: Vec<_> = repairer
+                .block_locations()
+                .iter()
+                .flatten()
+                .map(|location| {
+                    assert_eq!(repairer.disk_files()[location.file], ours.join("donor.bin"));
+                    location.offset
+                })
+                .collect();
+            located.sort_unstable();
+            assert_eq!(located, expected_offsets);
+            assert_eq!(newly, expected_offsets.len());
+            assert_eq!(std::fs::read(ours.join("donor.bin")).unwrap(), donor);
+            assert!(!ours.join("a.bin").exists());
+            let verdict = repairer.verify_result();
+            let expected_status = if scenario == "shifted-ordered" { 2 } else { 1 };
+            assert_eq!(verdict.repair_possible, expected_status == 1);
+            let mut verify = vec!["v", "-qq", "-t1", "-T1", "-m16"];
+            if policy == ExtraFileScanPolicy::OrderedPrefix {
+                verify.push("-O");
+            }
+            verify.extend(["set.par2", "donor.bin"]);
+            assert_eq!(invoke(&theirs, &verify), expected_status);
+            verify[0] = "r";
+            let ref_status = invoke(&theirs, &verify);
+            if expected_status == 2 {
+                assert_eq!(ref_status, 2);
+                assert!(matches!(
+                    repairer.repair(&mut NullObserver),
+                    Err(par_rs::RepairError::NotEnoughRecovery { .. })
+                ));
+                assert!(!ours.join("a.bin").exists());
+                assert!(!theirs.join("a.bin").exists());
+            } else {
+                assert_eq!(ref_status, 0);
+                repairer.repair(&mut NullObserver).unwrap();
+                check(&ours, &files);
+                check(&theirs, &files);
+                for dir in [&ours, &theirs] {
+                    if scenario == "perfect-and-damaged" {
+                        assert!(!dir.join("donor.bin").exists());
+                        assert_eq!(std::fs::read(dir.join("b.bin.1")).unwrap(), vec![255; 16]);
+                    } else {
+                        assert_eq!(std::fs::read(dir.join("donor.bin")).unwrap(), donor);
+                    }
+                }
+            }
+            eprintln!(
+                "DONOR_CASE_PASS creator={creator} scenario={scenario} newly={newly} reference_verify={expected_status} reference_repair={ref_status} bytes_and_effects_checked=true"
+            );
+            if artifact_root.is_none() {
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+}

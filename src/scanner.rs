@@ -238,7 +238,7 @@ impl Default for ScanConfig<'_> {
 }
 
 /// Streaming buffer over a [`PacketSource`] that keeps `[base, base + len)` loaded.
-struct Window<'a, S: PacketSource + ?Sized> {
+pub(crate) struct Window<'a, S: PacketSource + ?Sized> {
     src: &'a S,
     file_len: u64,
     buf: Vec<u8>,
@@ -250,7 +250,7 @@ struct Window<'a, S: PacketSource + ?Sized> {
 }
 
 impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
-    fn new(src: &'a S, cap: usize, hash: bool) -> Self {
+    pub(crate) fn new(src: &'a S, cap: usize, hash: bool) -> Self {
         Self {
             src,
             file_len: src.source_len(),
@@ -286,14 +286,27 @@ impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
     }
 
     /// Hash a padded slice using bounded reads.
-    fn checksums(
+    pub(crate) fn checksums(
         &mut self,
         pos: u64,
         size: u64,
         want_digest: impl FnOnce(u32) -> bool,
         cancel: Option<&AtomicBool>,
     ) -> io::Result<Option<(u32, [u8; 16])>> {
-        let available = self.file_len.saturating_sub(pos).min(size);
+        self.padded_checksums(pos, size, size, want_digest, cancel)
+    }
+
+    /// Hash a declared payload and virtual padding through the same fused window.
+    pub(crate) fn padded_checksums(
+        &mut self,
+        pos: u64,
+        payload: u64,
+        size: u64,
+        want_digest: impl FnOnce(u32) -> bool,
+        cancel: Option<&AtomicBool>,
+    ) -> io::Result<Option<(u32, [u8; 16])>> {
+        debug_assert!(payload <= size);
+        let available = self.file_len.saturating_sub(pos).min(payload);
         let mut done = 0;
         let mut raw = INIT;
         let mut digest = Md5::new();
@@ -327,7 +340,7 @@ impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
     }
 
     /// Advance the fused file hash without repeating slice checksums.
-    fn hash_until(&mut self, end: u64, cancel: Option<&AtomicBool>) -> io::Result<bool> {
+    pub(crate) fn hash_until(&mut self, end: u64, cancel: Option<&AtomicBool>) -> io::Result<bool> {
         if self.hasher.is_some() {
             while self.hashed_to < end.min(self.file_len) {
                 if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -360,6 +373,13 @@ impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
             }
         }
         self.hasher.map(|h| h.finish())
+    }
+
+    /// Finish only a complete fused hash, without reading any trailing bytes.
+    pub(crate) fn complete_hash(self) -> Option<FileHashes> {
+        (self.hashed_to == self.file_len)
+            .then(|| self.hasher.map(|hasher| hasher.finish()))
+            .flatten()
     }
 }
 

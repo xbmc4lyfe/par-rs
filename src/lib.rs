@@ -249,8 +249,9 @@ pub use repair::{
     repair_on_disk, repair_selected_slices, repair_slices,
 };
 pub use repairer::{
-    BackupPolicy, FileStatus, Level, NullObserver, Par2Repairer, QuickInfo, QuickVerifier,
-    RepairError, RepairObserver, RepairOptions, RepairResult, SourceFileState, Stage, VerifyResult,
+    BackupPolicy, ExtraFileScanPolicy, FileStatus, Level, NullObserver, Par2Repairer, QuickInfo,
+    QuickVerifier, RepairError, RepairObserver, RepairOptions, RepairResult, SourceFileState,
+    Stage, VerifyResult,
 };
 pub use scanner::{ChecksumIndex, ScanConfig, ScanReport, scan_file};
 pub use stream::{FileLayout, StreamEvent, StreamStatus, StreamingSliceAssembler, SyndromeBank};
