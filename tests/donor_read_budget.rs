@@ -122,6 +122,7 @@ fn literal_options() -> RepairOptions {
     // Complete external literal; no field was added for the new capability.
     RepairOptions {
         num_threads: 1,
+        file_threads: 0,
         mem_limit_bytes: 16 << 20,
         backup: par_rs::BackupPolicy::RenameNumbered,
         verify_repaired: true,

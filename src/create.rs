@@ -73,6 +73,9 @@ pub struct CreateOptions {
     pub creator: String,
     /// Engine tuning.
     pub engine: EngineConfig,
+    /// Threads that read and hash whole source files (par2cmdline `-T`), separate from the
+    /// engine's `num_threads`. 0 = use `engine.num_threads`. The output does not depend on it.
+    pub file_threads: usize,
     /// SIMD kernel.
     pub kernel: Kernel,
 }
@@ -86,6 +89,7 @@ impl Default for CreateOptions {
             volumes: VolumeScheme::Exponential,
             creator: format!("par-rs {}", env!("CARGO_PKG_VERSION")),
             engine: EngineConfig::default(),
+            file_threads: 0,
             kernel: Kernel::detect(),
         }
     }
@@ -561,7 +565,10 @@ pub fn create_with_volume_naming(
         .map(|s| std::fs::metadata(&s.path).map(|m| m.len()))
         .collect::<io::Result<_>>()?;
     let total_bytes: u64 = sizes.iter().sum();
-    let threads = opts.engine.num_threads;
+    let threads = match opts.file_threads {
+        0 => opts.engine.num_threads,
+        n => n,
+    };
     let hash_16k: Vec<[u8; 16]> = paths
         .iter()
         .map(|p| crate::hasher::file_md5_16k(p))
