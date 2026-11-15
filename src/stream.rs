@@ -8,7 +8,7 @@
 //!
 //! can be accumulated one verified slice at a time. [`SyndromeBank`] keeps one `slice_size`
 //! buffer per tracked exponent: a verified input slice is multiplied into every buffer in a
-//! single cache-tiled SIMD pass and then dropped; a recovery slice is XORed into its buffer
+//! single cache-tiled SIMD pass and then dropped; a recovery slice is `XORed` into its buffer
 //! whenever it arrives (before, during or after the data). The moment the unknown slices
 //! (damaged *or not yet downloaded*) are no more numerous than the buffers whose recovery slice
 //! has arrived, the whole set is solvable from the bank alone—no byte is read twice, and the

@@ -349,7 +349,7 @@ fn _seek_read_marker(mut f: &File) -> io::Result<u64> {
 /// Options for [`PacketIter`].
 #[derive(Clone, Copy, Debug)]
 pub struct ScanOptions {
-    /// Verify the MD5 of metadata packets (Main, FileDesc, IFSC, Creator, unknown).
+    /// Verify the MD5 of metadata packets (Main, `FileDesc`, IFSC, Creator, unknown).
     pub verify_md5: bool,
     /// Verify the MD5 of recovery slice packets (streams the whole payload). Turn off for
     /// metadata-only scans; the repair engine verifies lazily before use.
@@ -1118,7 +1118,7 @@ pub fn encode_main_body(
     body
 }
 
-/// Serialise a FileDesc body.
+/// Serialise a `FileDesc` body.
 pub fn encode_file_desc_body(
     file_id: &FileId,
     hash_full: &[u8; 16],
@@ -1531,7 +1531,7 @@ impl PacketSet {
         }
     }
 
-    /// Total number of input slices across the recoverable files (requires Main + FileDescs).
+    /// Total number of input slices across the recoverable files (requires Main + `FileDescs`).
     pub fn total_input_slices(&self) -> Option<u64> {
         let m = self.main.as_ref()?;
         let mut total = 0u64;

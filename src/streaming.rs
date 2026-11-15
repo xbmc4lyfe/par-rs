@@ -31,7 +31,7 @@
 //! # Repair-while-downloading session
 //!
 //! [`StreamingParSession`] is the thread-safe (`Send + Sync`, cloneable) integration point for
-//! NZBGet's `ArticleWriter` / `DirectRenamer` / `DirectUnpack` / `StreamRepairController`:
+//! `NZBGet`'s `ArticleWriter` / `DirectRenamer` / `DirectUnpack` / `StreamRepairController`:
 //!
 //! 1. **Live slice state machine + `.vol` unpause scheduler**—every slice is `Unarrived`,
 //!    `PartiallyArrived`, `VerifiedGood` or `Damaged`; permanent article failures mark slices
@@ -438,7 +438,7 @@ impl Par2Repairer {
         let ss = self.block_size();
         let file_len = f.file_length;
         let first_block = f.first_block;
-        let block_count = f.block_count as u64;
+        let block_count = u64::from(f.block_count);
         let target = f.target_path.clone();
         let mut events = Vec::new();
         if len == 0 || ss == 0 || offset >= file_len {
@@ -604,7 +604,7 @@ impl Par2Repairer {
             },
             BlockLocation {
                 file: di,
-                offset: b as u64 * ss as u64,
+                offset: u64::from(b) * ss as u64,
             },
         );
         let f = &mut self.files[file_index];
@@ -655,7 +655,7 @@ impl Par2Repairer {
                 if self.locations[g].is_some() {
                     continue;
                 }
-                let off = b as u64 * ss;
+                let off = u64::from(b) * ss;
                 let len = (expected_len - off).min(ss) as usize;
                 let mut buf = vec![0u8; len];
                 read_exact_at(&fh, off, &mut buf)
@@ -761,7 +761,7 @@ impl Par2Repairer {
             if self.locations[g].is_some() {
                 continue;
             }
-            let off = b as u64 * ss;
+            let off = u64::from(b) * ss;
             if off >= disk_len {
                 break;
             }
@@ -1497,7 +1497,7 @@ pub struct UnpauseAction {
 /// A queued recovery volume known to the scheduler.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedVolume {
-    /// Host-defined id (for example, NZBGet `FileInfo::GetId()`).
+    /// Host-defined id (for example, `NZBGet` `FileInfo::GetId()`).
     pub id: u64,
     /// Recovery blocks it carries (from the `+YY` name part or an estimate).
     pub blocks: i32,
@@ -1760,7 +1760,7 @@ struct Tracker {
     /// Slice-relative coverage by successful articles (kept across the `Damaged` state so a
     /// damaged slice that later becomes fully covered by retries is re-verified).
     covered: Vec<Vec<ByteRange>>,
-    /// Article CRCs per slice for the ParQuick pre-check: `(slice-relative offset, len, crc)`.
+    /// Article CRCs per slice for the `ParQuick` pre-check: `(slice-relative offset, len, crc)`.
     article_crcs: Vec<Vec<(u64, u64, u32)>>,
     staging: HashMap<usize, LiveStaged>,
     staging_bytes: u64,
@@ -1927,7 +1927,7 @@ pub struct StreamingParSession {
 }
 
 impl StreamingParSession {
-    /// Create a session from the metadata packets of a set (Main + FileDesc + IFSC; recovery
+    /// Create a session from the metadata packets of a set (Main + `FileDesc` + IFSC; recovery
     /// packets, if any are loaded already, seed the syndrome exponents). Target files live in
     /// `base_dir`.
     pub fn new(
@@ -2344,7 +2344,7 @@ impl StreamingParSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ready = t.ready_exponents.len();
-        let in_flight: i64 = t.unpaused_in_flight.values().map(|&b| b as i64).sum();
+        let in_flight: i64 = t.unpaused_in_flight.values().map(|&b| i64::from(b)).sum();
         let damaged = t.counts[3] as i64;
         let unarrived = t.counts[0] + t.counts[1];
         let slots = self
@@ -2378,7 +2378,7 @@ impl StreamingParSession {
     fn schedule_unpause(t: &mut Tracker) -> Option<UnpauseAction> {
         let damaged = t.counts[3] as i64;
         let ready = t.ready_exponents.len() as i64;
-        let in_flight: i64 = t.unpaused_in_flight.values().map(|&b| b as i64).sum();
+        let in_flight: i64 = t.unpaused_in_flight.values().map(|&b| i64::from(b)).sum();
         let needed = damaged - ready - in_flight;
         if needed <= 0 {
             return None;
@@ -2391,13 +2391,14 @@ impl StreamingParSession {
             .collect();
         paused.sort_unstable();
         let counts: Vec<i32> = paused.iter().map(|(b, _)| *b).collect();
-        let (selected, _available) = select_more_pars(&counts, needed.min(i32::MAX as i64) as i32);
+        let (selected, _available) =
+            select_more_pars(&counts, needed.min(i64::from(i32::MAX)) as i32);
         let mut ids = Vec::new();
         let mut blocks = 0i64;
         for i in selected {
             let (b, id) = paused[i];
             ids.push(id);
-            blocks += b as i64;
+            blocks += i64::from(b);
             t.unpaused_in_flight.insert(id, b);
             if let Some(v) = t.queued_volumes.iter_mut().find(|v| v.id == id) {
                 v.paused = false;
@@ -2832,7 +2833,7 @@ impl StreamingParSession {
     }
 
     /// Verify slice `b` of file `fi`: `staged` bytes if available, otherwise read from the
-    /// target file. `quick` is the pre-combined article CRC (ParQuick). Returns the slice data
+    /// target file. `quick` is the pre-combined article CRC (`ParQuick`). Returns the slice data
     /// (unpadded) when valid. Does not hold the tracker lock.
     fn verify_slice_bytes(
         &self,

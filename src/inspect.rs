@@ -201,15 +201,15 @@ pub fn detect_format(data: &[u8]) -> Option<ParFormat> {
 /// Which tool wrote a set, from its `Creator` packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreatorTool {
-    /// `par2cmdline` (original or BlackIkeEagle fork).
+    /// `par2cmdline` (original or `BlackIkeEagle` fork).
     Par2Cmdline,
     /// `par2cmdline-turbo`.
     Par2CmdlineTurbo,
-    /// QuickPar.
+    /// `QuickPar`.
     QuickPar,
-    /// MultiPar / par2j.
+    /// `MultiPar` / par2j.
     MultiPar,
-    /// ParPar.
+    /// `ParPar`.
     ParPar,
     /// nzbfast / parfast.
     Nzbfast,

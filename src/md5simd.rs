@@ -9,7 +9,7 @@
 //! lockstep; mixed lengths are sorted and lanes idle once their message is finished.
 //!
 //! Results are bit-identical to the scalar `md5` implementation ([`md5_many`] is checked
-//! against it in the tests). NEON is used on AArch64, SSE2 on x86_64, a portable lane array
+//! against it in the tests). NEON is used on `AArch64`, SSE2 on `x86_64`, a portable lane array
 //! elsewhere.
 
 /// Interleaved 4-lane groups per kernel invocation.

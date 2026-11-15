@@ -1172,7 +1172,7 @@ impl Par2Repairer {
                                 },
                                 BlockLocation {
                                     file: di,
-                                    offset: b as u64 * ss,
+                                    offset: u64::from(b) * ss,
                                 },
                             );
                         }
@@ -1256,7 +1256,12 @@ impl Par2Repairer {
             for (k, &fi) in with_cs.iter().enumerate() {
                 let size = std::fs::metadata(paths[k]).map_or(0, |m| m.len());
                 sizes.push(size);
-                ranges.extend(slice_ranges(k, size, ss, self.files[fi].block_count as u64));
+                ranges.extend(slice_ranges(
+                    k,
+                    size,
+                    ss,
+                    u64::from(self.files[fi].block_count),
+                ));
             }
             let total_bytes = sizes.iter().sum::<u64>().max(1);
             let results = hash_ranges_parallel_with_budget(
@@ -1576,7 +1581,7 @@ impl Par2Repairer {
                                 if self.locations[g].is_none() {
                                     self.locations[g] = Some(BlockLocation {
                                         file: di,
-                                        offset: b as u64 * self.block_size(),
+                                        offset: u64::from(b) * self.block_size(),
                                     });
                                     self.files[fi].available_blocks += 1;
                                 }
@@ -1590,7 +1595,7 @@ impl Par2Repairer {
                                 if self.locations[g].is_none() {
                                     self.locations[g] = Some(BlockLocation {
                                         file: di,
-                                        offset: b as u64 * self.block_size(),
+                                        offset: u64::from(b) * self.block_size(),
                                     });
                                     self.files[fi].available_blocks += 1;
                                 }
@@ -1914,7 +1919,7 @@ impl Par2Repairer {
         let mut targets: HashMap<usize, File> = HashMap::new();
         let mut copy_total: u64 = 0;
         for &fi in &to_rebuild {
-            copy_total += self.files[fi].available_blocks as u64;
+            copy_total += u64::from(self.files[fi].available_blocks);
         }
         let mut copied: u64 = 0;
         let mut buf = vec![0u8; (ss as usize).clamp(4, 4 << 20)];
@@ -1942,7 +1947,7 @@ impl Par2Repairer {
                 let Some(loc) = self.locations[g].clone() else {
                     continue;
                 };
-                if cloned_from == Some(loc.file) && loc.offset == b as u64 * ss {
+                if cloned_from == Some(loc.file) && loc.offset == u64::from(b) * ss {
                     // Already in place through the clone.
                     copied += 1;
                     continue;
@@ -1958,7 +1963,7 @@ impl Par2Repairer {
                         &sources[&loc.file]
                     }
                 };
-                let dst_off = b as u64 * ss;
+                let dst_off = u64::from(b) * ss;
                 let want = (f.file_length - dst_off).min(ss);
                 let src_len = src.metadata().map_or(0, |m| m.len());
                 let avail = src_len.saturating_sub(loc.offset).min(want);
@@ -2190,7 +2195,12 @@ impl Par2Repairer {
                 let size = std::fs::metadata(paths[k]).map_or(0, |m| m.len());
                 sizes.push(size);
                 if self.checksums[fi].is_some() {
-                    ranges.extend(slice_ranges(k, size, ss, self.files[fi].block_count as u64));
+                    ranges.extend(slice_ranges(
+                        k,
+                        size,
+                        ss,
+                        u64::from(self.files[fi].block_count),
+                    ));
                 }
                 if self.checksums[fi].is_none() || self.options.full_file_md5 {
                     full_idx.push(k);

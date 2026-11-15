@@ -88,7 +88,7 @@ pub enum RenamerEvent {
     /// A loaded par2 file described a file (local name) not described before in this
     /// directory; emitted once per distinct 16k hash.
     Described {
-        /// Local filename from the FileDesc packet.
+        /// Local filename from the `FileDesc` packet.
         name: String,
     },
 }

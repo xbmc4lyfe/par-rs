@@ -519,7 +519,7 @@ impl RollingCrc32 {
     /// CRC-32 of the window after dropping `out_byte` at its front and appending `in_byte`.
     pub fn roll(&self, crc: u32, out_byte: u8, in_byte: u8) -> u32 {
         let raw = crc ^ 0xFFFF_FFFF;
-        let stepped = (raw >> 8) ^ table(((raw ^ in_byte as u32) & 0xFF) as u8);
+        let stepped = (raw >> 8) ^ table(((raw ^ u32::from(in_byte)) & 0xFF) as u8);
         let removed = self.removal.get(out_byte as usize).copied().unwrap_or(0);
         (stepped ^ removed ^ self.init_fix) ^ 0xFFFF_FFFF
     }

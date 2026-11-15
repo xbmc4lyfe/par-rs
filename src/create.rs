@@ -1,6 +1,6 @@
 //! PAR2 recovery set creation.
 //!
-//! Produces an index file (`<base>.par2`) holding the critical packets (Main, FileDesc, IFSC,
+//! Produces an index file (`<base>.par2`) holding the critical packets (Main, `FileDesc`, IFSC,
 //! Creator) and recovery volumes (`<base>.volXX+YY.par2`) whose recovery slices are computed
 //! by the streaming [`Engine`]. Recovery packets are written first in every volume followed by
 //! repeated copies of the critical packets, as `par2cmdline` does, so a volume alone still
@@ -545,7 +545,7 @@ pub fn create_with_volume_naming(
     if sources.is_empty() {
         return Err(CreateError::NoSources);
     }
-    if (opts.first_exponent as u64 + opts.recovery_blocks as u64) > 65535 {
+    if (u64::from(opts.first_exponent) + u64::from(opts.recovery_blocks)) > 65535 {
         return Err(CreateError::TooManyRecoveryBlocks);
     }
     let layout = checked_volume_layout(opts.volumes, opts.recovery_blocks)?;
@@ -663,9 +663,9 @@ pub fn create_with_volume_naming(
             let path = out_dir.join(&name);
             let copies = 1 + (31 - count.max(1).leading_zeros()); // 1 + floor(log2(count))
             for i in 0..count {
-                sink.locations[(first + i) as usize] = (vi, i as u64 * packet_len);
+                sink.locations[(first + i) as usize] = (vi, u64::from(i) * packet_len);
             }
-            let size = count as u64 * packet_len + copies as u64 * critical_len;
+            let size = u64::from(count) * packet_len + u64::from(copies) * critical_len;
             let f = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -686,7 +686,7 @@ pub fn create_with_volume_naming(
                 prefix[..HEADER_LEN].copy_from_slice(&header.to_bytes());
                 prefix[HEADER_LEN..]
                     .copy_from_slice(&exponents[(first + i) as usize].to_le_bytes());
-                write_all_at(&f, i as u64 * packet_len, &prefix)?;
+                write_all_at(&f, u64::from(i) * packet_len, &prefix)?;
             }
             sink.files.push(f);
             files_written.push(path.clone());
@@ -818,7 +818,7 @@ pub fn create_with_volume_naming(
         }
         for (vi, plan) in plans.iter().enumerate() {
             let f = &sink.files[vi];
-            let mut off = plan.count as u64 * packet_len;
+            let mut off = u64::from(plan.count) * packet_len;
             for _ in 0..plan.copies {
                 write_all_at(f, off, &critical)?;
                 off += critical.len() as u64;
@@ -1007,7 +1007,7 @@ pub fn encode_unicode_name_body(file_id: &FileId, name: &str) -> Vec<u8> {
     body
 }
 
-/// Build a complete PAR2 set (Main, FileDesc, IFSC, Creator, optional UniFileN, RecvSlic)
+/// Build a complete PAR2 set (Main, `FileDesc`, IFSC, Creator, optional `UniFileN`, `RecvSlic`)
 /// for in-memory `(name, contents)` sources, laid out like `par2cmdline` (`base` is used for
 /// the volume file names). Replaces the single-buffer [`create_in_memory`] where an index and
 /// separate volumes are wanted.
@@ -1036,7 +1036,7 @@ pub fn build_set_with_volume_naming(
     if sources.is_empty() {
         return Err(CreateError::NoSources);
     }
-    if (opts.first_exponent as u64 + opts.recovery_blocks as u64) > 65535 {
+    if (u64::from(opts.first_exponent) + u64::from(opts.recovery_blocks)) > 65535 {
         return Err(CreateError::TooManyRecoveryBlocks);
     }
     let layout = checked_volume_layout(opts.volumes, opts.recovery_blocks)?;
