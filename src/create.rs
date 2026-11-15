@@ -93,15 +93,23 @@ impl Default for CreateOptions {
 
 /// Whether `name` may be stored as a source name by [`create`] and [`build_set`]: a
 /// non-empty relative path of at most [`MAX_FILENAME_LEN`](crate::packet::MAX_FILENAME_LEN)
-/// bytes whose components are separated by `/`. Refused: a leading `/` (absolute path), a
-/// `\` (use `/` as the separator), a NUL byte, and empty, `.` or `..` components (so no
-/// trailing or doubled `/`, and nothing that escapes the base directory). Any other bytes,
-/// including non-UTF-8 ones, are kept as given.
+/// bytes whose components are separated by `/`, stored so that readers (libpar2, nzbget and
+/// [`translate_filename_from_par2_to_local`](crate::packet::translate_filename_from_par2_to_local))
+/// give back the same local name. Refused:
+/// - a leading `/` (absolute path) or a drive prefix such as `C:`;
+/// - a `\` (use `/` as the separator);
+/// - control bytes below `0x20`, NUL included (readers rewrite them as `%XX`);
+/// - empty, `.` or `..` components (so no trailing or doubled `/`);
+/// - any `../`, even inside a component such as `a../b` (readers rewrite every `../`).
+///
+/// Any other bytes, including non-UTF-8 ones, are kept as given.
 pub fn valid_par2_name(name: &[u8]) -> bool {
+    let drive = name.len() >= 2 && name[0].is_ascii_alphabetic() && name[1] == b':';
     !name.is_empty()
         && name.len() <= crate::packet::MAX_FILENAME_LEN
-        && !name.contains(&0)
-        && !name.contains(&b'\\')
+        && !drive
+        && !name.iter().any(|&b| b < 0x20 || b == b'\\')
+        && memchr::memmem::find(name, b"../").is_none()
         && name
             .split(|&b| b == b'/')
             .all(|c| !c.is_empty() && c != b"." && c != b"..")
@@ -1726,6 +1734,10 @@ mod tests {
             b".hidden",
             b"dir.d/x",
             b"\xff\xfe raw",
+            b"ab:c",
+            b"sub/c:d",
+            b"1:x",
+            b"dir/name..",
         ] {
             assert!(valid_par2_name(ok), "{:?}", String::from_utf8_lossy(ok));
         }
@@ -1743,6 +1755,14 @@ mod tests {
             b"a/..",
             b"win\\path",
             b"nul\0byte",
+            b"a../x",
+            b"dir../file.bin",
+            b"tab\tname",
+            b"new\nline",
+            b"\x1f",
+            b"C:/x",
+            b"c:x",
+            b"a:b",
             &long,
         ] {
             assert!(!valid_par2_name(bad), "{:?}", String::from_utf8_lossy(bad));
