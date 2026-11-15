@@ -208,7 +208,7 @@ pub use crc::{Crc32, Crc32Combiner, WindowTable};
 pub use create::{
     CreateError, CreateOptions, CreateReport, CreateStage, Par2Set, SetOptions, SourceFile,
     VolumeNaming, VolumeScheme, build_set, build_set_with_volume_naming, checked_volume_layout,
-    create, create_in_memory, create_with_volume_naming,
+    create, create_in_memory, create_with_volume_naming, valid_par2_name,
 };
 pub use damage::{
     ByteRange, DownloadStatus, FileDamage, QuickVerdict, RangeReader, Segment, blocks_touched,

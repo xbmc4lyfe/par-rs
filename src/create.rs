@@ -91,12 +91,30 @@ impl Default for CreateOptions {
     }
 }
 
+/// Whether `name` may be stored as a source name by [`create`] and [`build_set`]: a
+/// non-empty relative path of at most [`MAX_FILENAME_LEN`](crate::packet::MAX_FILENAME_LEN)
+/// bytes whose components are separated by `/`. Refused: a leading `/` (absolute path), a
+/// `\` (use `/` as the separator), a NUL byte, and empty, `.` or `..` components (so no
+/// trailing or doubled `/`, and nothing that escapes the base directory). Any other bytes,
+/// including non-UTF-8 ones, are kept as given.
+pub fn valid_par2_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.len() <= crate::packet::MAX_FILENAME_LEN
+        && !name.contains(&0)
+        && !name.contains(&b'\\')
+        && name
+            .split(|&b| b == b'/')
+            .all(|c| !c.is_empty() && c != b"." && c != b"..")
+}
+
 /// A file to protect.
 #[derive(Clone, Debug)]
 pub struct SourceFile {
     /// Location on disk.
     pub path: PathBuf,
-    /// Name stored in the PAR2 set (relative, `/` separated, raw bytes).
+    /// Name stored in the PAR2 set (raw bytes): a relative path with `/` separators, for
+    /// example `sub/dir/file.bin` for a file below the base directory. See
+    /// [`valid_par2_name`] for the names [`create`] accepts.
     pub par2_name: Vec<u8>,
 }
 
@@ -137,7 +155,7 @@ pub enum CreateError {
         /// Available recovery slices.
         recovery_blocks: u32,
     },
-    /// Empty or invalid PAR2 name for a source.
+    /// Invalid PAR2 name for a source (see [`valid_par2_name`]).
     BadSourceName(PathBuf),
     /// Two sources resolve to the same file id.
     DuplicateSource(PathBuf),
@@ -525,7 +543,7 @@ pub fn create_with_volume_naming(
     // The file order (and so the Main packet and set id) only needs each file's length and its
     // 16k hash, so the expensive digests run concurrently with the recovery computation.
     for s in sources {
-        if s.par2_name.is_empty() || s.par2_name.len() > crate::packet::MAX_FILENAME_LEN {
+        if !valid_par2_name(&s.par2_name) {
             return Err(CreateError::BadSourceName(s.path.clone()));
         }
     }
@@ -1016,7 +1034,7 @@ pub fn build_set_with_volume_naming(
     }
     let mut mems: Vec<Mem<'_>> = Vec::with_capacity(sources.len());
     for (name, data) in sources {
-        if name.is_empty() || name.len() > crate::packet::MAX_FILENAME_LEN {
+        if !valid_par2_name(name.as_bytes()) {
             return Err(CreateError::BadSourceName(PathBuf::from(name)));
         }
         let h16 = crate::hasher::md5_16k(data);
@@ -1694,6 +1712,82 @@ mod tests {
         ] {
             assert!(!e.to_string().is_empty());
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn par2_name_rules() {
+        for ok in [
+            &b"a.bin"[..],
+            b"sub/a.bin",
+            b"deep/er/a.bin",
+            b"..a",
+            b"a..",
+            b".hidden",
+            b"dir.d/x",
+            b"\xff\xfe raw",
+        ] {
+            assert!(valid_par2_name(ok), "{:?}", String::from_utf8_lossy(ok));
+        }
+        let long = vec![b'a'; crate::packet::MAX_FILENAME_LEN + 1];
+        for bad in [
+            &b""[..],
+            b"/abs",
+            b"sub/",
+            b"a//b",
+            b"./a",
+            b"a/./b",
+            b"..",
+            b"../a",
+            b"a/../b",
+            b"a/..",
+            b"win\\path",
+            b"nul\0byte",
+            &long,
+        ] {
+            assert!(!valid_par2_name(bad), "{:?}", String::from_utf8_lossy(bad));
+        }
+        let opts = SetOptions::default();
+        assert!(matches!(
+            build_set("x", &[("../escape.bin", b"data")], &opts),
+            Err(CreateError::BadSourceName(_))
+        ));
+        assert!(build_set("x", &[("sub/ok.bin", b"data")], &opts).is_ok());
+    }
+
+    #[test]
+    fn create_stores_relative_subdirectory_names() {
+        let dir = std::env::temp_dir().join(format!("par-rs-create-subdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("a.bin"), vec![7u8; 5000]).unwrap();
+        let opts = CreateOptions {
+            slice_size: 1024,
+            recovery_blocks: 1,
+            ..Default::default()
+        };
+        let src = vec![SourceFile {
+            path: dir.join("sub").join("a.bin"),
+            par2_name: b"sub/a.bin".to_vec(),
+        }];
+        create(&src, &dir, "set", &opts, None, &mut |_, _, _| {}).unwrap();
+        let mut set = crate::packet::PacketSet::new();
+        set.load_file(
+            &dir.join("set.par2"),
+            0,
+            crate::packet::ScanOptions::METADATA,
+        )
+        .unwrap();
+        let names: Vec<String> = set.file_descs.values().map(|fd| fd.local_name()).collect();
+        assert_eq!(names, ["sub/a.bin"]);
+        let bad = vec![SourceFile {
+            path: dir.join("sub").join("a.bin"),
+            par2_name: b"/sub/a.bin".to_vec(),
+        }];
+        assert!(matches!(
+            create(&bad, &dir, "bad", &opts, None, &mut |_, _, _| {}),
+            Err(CreateError::BadSourceName(_))
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
