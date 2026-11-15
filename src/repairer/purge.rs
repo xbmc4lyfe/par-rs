@@ -116,6 +116,30 @@ impl Par2Repairer {
         out
     }
 
+    /// Register `path` as a PAR2 file of this set that [`purge`](Self::purge) may remove,
+    /// for files the repairer did not load itself (for example when the caller loaded a
+    /// verified private copy of a damaged set). The file is re-read and accepted only when
+    /// every valid packet in it belongs to this set and it has at least one; damaged packets
+    /// are ignored, as when loading. Returns whether it was accepted. Accepting a path does not
+    /// make purging safe: the verdict and the identity guards of `purge` still apply.
+    ///
+    /// # Errors
+    /// [`RepairError::NoMainPacket`] when no set is loaded yet, or an I/O error reading `path`.
+    pub fn add_purge_candidate(&mut self, path: &Path) -> Result<bool, RepairError> {
+        let Some(set_id) = self.packets.set_id else {
+            return Err(RepairError::NoMainPacket);
+        };
+        let mut probe = PacketSet::for_set(set_id);
+        let stats = probe
+            .load_file(path, 0, ScanOptions::METADATA)
+            .map_err(io_ctx(format!("reading {}", path.display())))?;
+        let accepted = stats.foreign == 0 && stats.added + stats.duplicates > 0;
+        if accepted && !self.purge_state.par_files.iter().any(|p| p == path) {
+            self.purge_state.par_files.push(path.to_path_buf());
+        }
+        Ok(accepted)
+    }
+
     /// Remove the repair backups and the PAR2 files once every protected file is verified
     /// complete (par2cmdline `-p`). Every candidate from
     /// [`purge_candidates`](Self::purge_candidates) is reported as removed or kept:

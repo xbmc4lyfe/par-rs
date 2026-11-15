@@ -360,3 +360,69 @@ fn removal_failures_are_reported_and_keep_the_file() {
     assert!(obs.0.iter().all(|m| m.starts_with("Could not purge")));
     assert_eq!(fx.par_files(), pars);
 }
+
+#[test]
+fn caller_registered_originals_are_checked_then_purged() {
+    let fx = Fx::new("register");
+    // The repairer loads a private copy of the index; the originals stay unknown to it.
+    let private = fx.dir.join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::copy(fx.dir.join("set.par2"), private.join("copy.par2")).unwrap();
+    let mut r = Par2Repairer::new(&fx.dir, RepairOptions::default());
+    assert!(matches!(
+        r.add_purge_candidate(&fx.dir.join("set.par2")),
+        Err(RepairError::NoMainPacket)
+    ));
+    r.load_par2_file(&private.join("copy.par2")).unwrap();
+    r.finalize().unwrap();
+    let originals = fx.par_files();
+    // A damaged original (one packet's bytes flipped) still holds valid packets of the set.
+    let vol = originals
+        .iter()
+        .find(|p| p.to_string_lossy().contains(".vol"))
+        .unwrap();
+    let mut bytes = std::fs::read(vol).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(vol, &bytes).unwrap();
+    for p in &originals {
+        assert!(r.add_purge_candidate(p).unwrap(), "{p:?}");
+    }
+    assert!(
+        r.add_purge_candidate(&originals[0]).unwrap(),
+        "re-adding is harmless"
+    );
+    // Rejected: another set's file, an empty file, garbage; a missing file is an error.
+    let other = build_set(
+        "other",
+        &[("z.bin", &[9u8; 3000][..])],
+        &SetOptions {
+            slice_size: 1024,
+            recovery_blocks: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let odir = fx.dir.join("other");
+    std::fs::create_dir(&odir).unwrap();
+    let foreign = other.write_to(&odir, "other").unwrap().remove(0);
+    let empty = fx.dir.join("empty.dat");
+    std::fs::write(&empty, b"").unwrap();
+    let garbage = fx.dir.join("garbage.dat");
+    std::fs::write(&garbage, vec![0x5Au8; 4096]).unwrap();
+    assert!(!r.add_purge_candidate(&foreign).unwrap());
+    assert!(!r.add_purge_candidate(&empty).unwrap());
+    assert!(!r.add_purge_candidate(&garbage).unwrap());
+    assert!(r.add_purge_candidate(&fx.dir.join("nope.par2")).is_err());
+    // Registering does not make purging safe on its own.
+    assert!(kept_all(
+        &r.purge(&mut NullObserver),
+        &PurgeKept::NotVerified
+    ));
+    assert_eq!(fx.par_files(), originals);
+    assert!(r.verify(None, &mut NullObserver).unwrap().all_complete);
+    let report = r.purge(&mut NullObserver);
+    assert!(report.all_removed(), "{report:?}");
+    assert!(fx.par_files().is_empty());
+    assert!(foreign.exists() && empty.exists() && garbage.exists());
+}
