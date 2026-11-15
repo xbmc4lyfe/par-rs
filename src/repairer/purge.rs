@@ -123,8 +123,9 @@ impl Par2Repairer {
     /// - nothing is removed unless the last [`verify`](Self::verify) hashed every target
     ///   itself and found it complete, or such a verify was followed by a
     ///   [`repair`](Self::repair) that succeeded with `verify_repaired` on. A verify that skips
-    ///   files already marked complete (after streaming, quick verification or a repair
-    ///   without `verify_repaired`) does not count: verify again with a new repairer;
+    ///   files already marked complete (after quick verification or a repair without
+    ///   `verify_repaired`), or that runs with streaming enabled, does not count: verify
+    ///   again with a new repairer;
     /// - a path that is a protected file, or another name for one (a hard link, or a spelling
     ///   that resolves to it), is kept, as is anything that is not a regular file or symbolic
     ///   link (a symbolic link itself is removed, never its target).

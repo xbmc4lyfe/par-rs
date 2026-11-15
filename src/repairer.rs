@@ -1063,10 +1063,12 @@ impl Par2Repairer {
         }
         observer.stage(Stage::Verifying);
         // Purging needs a verify that hashed every target itself: none already marked
-        // complete (by streaming, an unverified repair or an earlier verify) and no
-        // quick verification from download checksums.
-        let hashes_everything =
-            quick.is_none() && self.files.iter().all(|f| f.status != FileStatus::Complete);
+        // complete (by streaming, an unverified repair or an earlier verify), no quick
+        // verification from download checksums, and no streaming session.
+        // Streaming probes only the blocks still unlocated (no size check), so it never counts.
+        let hashes_everything = quick.is_none()
+            && self.streaming.is_none()
+            && self.files.iter().all(|f| f.status != FileStatus::Complete);
         self.purge_state.reset_verdict();
         let ss = self.block_size();
         let total_files = self.files.len().max(1);

@@ -302,3 +302,25 @@ fn guards_keep_targets_aliases_directories_and_missing_paths() {
     // The par2 files themselves were purged.
     assert!(fx.par_files().is_empty());
 }
+
+#[test]
+fn streaming_verify_never_enables_purge() {
+    let fx = Fx::new("streaming");
+    let mut r = fx.repairer(RepairOptions::default());
+    r.enable_streaming(&crate::streaming::StreamingOptions::default())
+        .unwrap();
+    let ai = r
+        .source_files()
+        .iter()
+        .position(|f| f.target_filename == "a.bin")
+        .unwrap();
+    // Stream the first 19 KiB from memory, then corrupt the file on disk inside that range.
+    r.streaming_segment_data(ai, 0, &fx.a[..19 * 1024]).unwrap();
+    fx.damage_a();
+    let _ = r.verify(None, &mut NullObserver).unwrap();
+    assert!(kept_all(
+        &r.purge(&mut NullObserver),
+        &PurgeKept::NotVerified
+    ));
+    assert!(!fx.par_files().is_empty());
+}
