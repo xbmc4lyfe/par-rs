@@ -2154,6 +2154,19 @@ impl Par2Repairer {
         drop(targets);
         lap(observer, "sync");
 
+        // Split fragments that supplied blocks, taken before rebuilt files are re-pointed at
+        // their targets (which drops every location on a fragment).
+        let used_fragments: Vec<PathBuf> = self
+            .split_fragments
+            .iter()
+            .filter(|frag| {
+                self.disk_index
+                    .get(*frag)
+                    .is_some_and(|&di| self.locations.iter().flatten().any(|l| l.file == di))
+            })
+            .cloned()
+            .collect();
+
         // ---- 4. verify repaired files ----
         let mut failed: Vec<String> = Vec::new();
         if self.options.verify_repaired {
@@ -2230,13 +2243,9 @@ impl Par2Repairer {
         }
         // Leftovers: backups plus split fragments whose blocks were used and that are not targets.
         let mut leftovers: Vec<PathBuf> = backups;
-        for frag in &self.split_fragments {
-            let used = self
-                .disk_index
-                .get(frag)
-                .is_some_and(|&di| self.locations.iter().flatten().any(|l| l.file == di));
+        for frag in &used_fragments {
             let is_target = self.files.iter().any(|f| &f.target_path == frag);
-            if used && !is_target && frag.is_file() && !leftovers.contains(frag) {
+            if !is_target && frag.is_file() && !leftovers.contains(frag) {
                 leftovers.push(frag.clone());
             }
         }
@@ -3133,5 +3142,65 @@ mod tests {
         assert_eq!(make(8, 3).scan_resources(2).0, 2);
         assert_eq!(make(1, 6).scan_resources(10).0, 6);
         assert!(make(8, 0).file_hash_threads() >= 1);
+    }
+
+    #[test]
+    fn used_split_fragments_are_leftovers_after_rebuild() {
+        for policy in [
+            BackupPolicy::RenameNumbered,
+            BackupPolicy::DeleteAfterRepair,
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "par-rs-frag-leftovers-{:?}-{}",
+                policy,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let b: Vec<u8> = (0..9_000u32).map(|i| (i * 13 + 1) as u8).collect();
+            crate::create::build_set(
+                "set",
+                &[("b.bin", &b)],
+                &crate::create::SetOptions {
+                    slice_size: 1024,
+                    recovery_blocks: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .write_to(&dir, "set")
+            .unwrap();
+            // b.bin only exists as two fragments, plus an unrelated "fragment" with no blocks.
+            std::fs::write(dir.join("b.bin.001"), &b[..4096]).unwrap();
+            std::fs::write(dir.join("b.bin.002"), &b[4096..]).unwrap();
+            std::fs::write(dir.join("b.bin.003"), vec![0xEEu8; 2000]).unwrap();
+            let mut r = Par2Repairer::new(
+                &dir,
+                RepairOptions {
+                    backup: policy,
+                    ..RepairOptions::default()
+                },
+            );
+            r.load_par2_set(&dir.join("set.par2")).unwrap();
+            r.finalize().unwrap();
+            r.verify(None, &mut NullObserver).unwrap();
+            r.add_split_fragments(&dir.clone(), &mut NullObserver)
+                .unwrap();
+            let RepairResult::Repaired { leftovers, .. } = r.repair(&mut NullObserver).unwrap()
+            else {
+                panic!("expected a repair");
+            };
+            assert_eq!(
+                leftovers,
+                vec![dir.join("b.bin.001"), dir.join("b.bin.002")],
+                "{policy:?}"
+            );
+            assert_eq!(std::fs::read(dir.join("b.bin")).unwrap(), b);
+            let deleted = policy == BackupPolicy::DeleteAfterRepair;
+            assert_eq!(dir.join("b.bin.001").exists(), !deleted, "{policy:?}");
+            assert_eq!(dir.join("b.bin.002").exists(), !deleted, "{policy:?}");
+            assert!(dir.join("b.bin.003").exists());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }
