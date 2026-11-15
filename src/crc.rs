@@ -796,4 +796,31 @@ mod tests {
         let k = kernel();
         assert!(matches!(k, CrcKernel::Hardware | CrcKernel::Software));
     }
+
+    #[test]
+    fn streaming_hasher_accessors_and_resume() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 31 + 7) as u8).collect();
+        let mut h = Crc32::default();
+        assert!(h.is_empty());
+        assert_eq!(h.len(), 0);
+        assert_eq!(h.raw(), INIT);
+        h.update(&data[..4000]);
+        let mid = h.finish();
+        // Resuming from the finished CRC of the first part continues the same stream.
+        let mut resumed = Crc32::from_crc(mid, 4000);
+        assert_eq!(resumed.len(), 4000);
+        assert!(!resumed.is_empty());
+        resumed.update(&data[4000..]);
+        h.update(&data[4000..]);
+        assert_eq!(resumed.finish(), h.finish());
+        assert_eq!(h.finish(), crc32(&data));
+        assert_eq!(h.len(), data.len() as u64);
+        assert_eq!(h.raw() ^ INIT, h.finish());
+        // The software kernel agrees with the selected one.
+        assert_eq!(update_slice8_raw(INIT, &data) ^ INIT, crc32(&data));
+        assert!(matches!(
+            kernel(),
+            CrcKernel::Hardware | CrcKernel::Software
+        ));
+    }
 }

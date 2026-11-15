@@ -433,3 +433,73 @@ pub fn checked_source_geometry(
         limits,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_error_has_a_message() {
+        let cases = [
+            (GeometryError::BadLimits, "invalid geometry limits"),
+            (GeometryError::NoSources, "no source geometry records"),
+            (
+                GeometryError::Overflow,
+                "source geometry arithmetic overflow",
+            ),
+            (
+                GeometryError::AllocationFailed,
+                "source geometry allocation refused",
+            ),
+            (
+                GeometryError::NoAlignedSliceSize,
+                "no feasible aligned slice size",
+            ),
+            (
+                GeometryError::BadSliceSize {
+                    requested: 6,
+                    limit: 4,
+                },
+                "invalid slice size 6 with ceiling 4",
+            ),
+            (
+                GeometryError::BadAlignment(0),
+                "invalid alignment quantum 0",
+            ),
+            (
+                GeometryError::TooManyFiles { files: 9, limit: 8 },
+                "9 files exceed limit 8",
+            ),
+            (
+                GeometryError::TooManySourceSlices {
+                    slices: 70_000,
+                    limit: 32_768,
+                },
+                "70000 source slices exceed limit 32768",
+            ),
+            (GeometryError::DuplicateKey(3), "duplicate source key 3"),
+            (
+                GeometryError::MetadataLimit {
+                    requested: 100,
+                    limit: 10,
+                },
+                "requested metadata 100 bytes exceed limit 10",
+            ),
+            (
+                GeometryError::RangeLimit {
+                    ranges: 5,
+                    limit: 4,
+                },
+                "5 ranges exceed limit 4",
+            ),
+            (GeometryError::UnknownKey(7), "unknown source key 7"),
+            (
+                GeometryError::InvalidRange { index: 2 },
+                "invalid physical range at index 2",
+            ),
+        ];
+        for (e, text) in cases {
+            assert_eq!(e.to_string(), text);
+        }
+    }
+}
