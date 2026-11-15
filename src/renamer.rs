@@ -42,7 +42,7 @@ pub struct RenamerOptions {
     /// Plan only; do not rename anything.
     pub dry_run: bool,
     /// Host-supplied ignore rule for missing files. When set it replaces the
-    /// [`ignore_extensions`](Self::ignore_extensions) suffix match, e.g. to apply nzbget's
+    /// [`ignore_extensions`](Self::ignore_extensions) suffix match, for example to apply nzbget's
     /// `MatchFileExt` wildcard semantics.
     pub is_ignored: Option<IgnorePredicate>,
 }
@@ -75,8 +75,9 @@ pub enum RenamerEvent {
         /// New path.
         to: PathBuf,
     },
-    /// Progress: `(files checked, files total)`. Emitted right after [`Checking`](Self::Checking)
-    /// for the same file.
+    /// Progress: `(checks done, checks total)`. Every file is checked twice (a par2 pass and a
+    /// rename pass), so the total is twice the file count and `checks done` stays below it.
+    /// Emitted right after [`Checking`](Self::Checking) for the same file.
     Progress(usize, usize),
     /// The file about to be checked (emitted just before [`Progress`](Self::Progress)).
     Checking {
@@ -86,7 +87,7 @@ pub enum RenamerEvent {
     /// A loaded par2 file described a file (local name) not described before in this
     /// directory; emitted once per distinct 16k hash.
     Described {
-        /// Local file name from the FileDesc packet.
+        /// Local filename from the FileDesc packet.
         name: String,
     },
 }
@@ -173,8 +174,11 @@ impl ParRenamer {
     }
 
     /// Run the renamer, polling `stopped` for cancellation. Once it returns `true` the run
-    /// stops before the next file and performs no further stage (no renames) for the
-    /// directory in progress; the report covers the work done so far.
+    /// checks no further file and starts no further loading or renaming stage. Renames
+    /// already made stay; if any were made, par2 files found damaged in the directory in
+    /// progress are still renamed to `*.bad` (as nzbget does), so data and par2 names stay
+    /// consistent. Missing files are not reported for an interrupted directory. The report
+    /// covers the work done so far, including that directory's loaded and bad par2 files.
     pub fn run_with_stop(
         mut self,
         stopped: &mut dyn FnMut() -> bool,
@@ -190,22 +194,20 @@ impl ParRenamer {
             self.bad_pars.clear();
             self.loaded_pars.clear();
             self.check_files(&dir, true, stopped, events)?;
-            if stopped() {
-                break;
+            let mut stop = stopped();
+            if !stop {
+                self.rename_par_files(&dir, events);
+                self.load_main_par_files(&dir, stopped, events);
+                if self.report.has_damaged_par_files && !stopped() {
+                    self.load_extra_par_files(&dir, stopped, events);
+                }
+                stop = stopped();
             }
-            self.rename_par_files(&dir, events);
-            self.load_main_par_files(&dir, stopped, events);
-            if self.report.has_damaged_par_files && !stopped() {
-                self.load_extra_par_files(&dir, stopped, events);
+            if !stop {
+                self.check_files(&dir, false, stopped, events)?;
+                stop = stopped();
             }
-            if stopped() {
-                break;
-            }
-            self.check_files(&dir, false, stopped, events)?;
-            if stopped() {
-                break;
-            }
-            if self.options.detect_missing {
+            if !stop && self.options.detect_missing {
                 self.check_missing(events);
             }
             if !self.report.renamed.is_empty() && !self.bad_pars.is_empty() {
@@ -213,6 +215,9 @@ impl ParRenamer {
             }
             self.report.loaded_par_files.append(&mut self.loaded_pars);
             self.report.bad_par_files.append(&mut self.bad_pars);
+            if stop {
+                break;
+            }
         }
         Ok(self.report)
     }
@@ -231,7 +236,8 @@ impl ParRenamer {
                 if entry.is_dir() {
                     dirs.push(entry);
                 } else {
-                    self.file_count += 1;
+                    // Checked twice: once in the par2 pass, once in the rename pass.
+                    self.file_count += 2;
                 }
             }
         }
@@ -908,6 +914,7 @@ mod tests {
         std::fs::write(dir.join("set.par2"), &index).unwrap();
         std::fs::write(dir.join("set.vol00+01.par2"), &vols[0]).unwrap();
         std::fs::write(dir.join("garbled"), &a).unwrap();
+        let mut checking = Vec::new();
         let rep = ParRenamer::new(
             &dir,
             RenamerOptions {
@@ -915,8 +922,21 @@ mod tests {
                 ..Default::default()
             },
         )
-        .run(None, &mut |_| {})
+        .run(None, &mut |e| {
+            if let RenamerEvent::Checking { path } = e {
+                checking.push(path);
+            }
+        })
         .unwrap();
+        // The data file is checked under its disk name in both passes (its rename is
+        // planned during the second check).
+        assert_eq!(
+            checking
+                .iter()
+                .filter(|p| *p == &dir.join("garbled"))
+                .count(),
+            2
+        );
         assert_eq!(
             rep.renamed,
             vec![(dir.join("garbled"), dir.join("data.bin"))]
@@ -1122,15 +1142,18 @@ mod tests {
         std::fs::write(dir.join("set.par2"), &bytes).unwrap();
         let mut described = Vec::new();
         let mut checking = Vec::new();
-        let mut progress = 0;
+        let mut progress = Vec::new();
         ParRenamer::new(&dir, RenamerOptions::default())
             .run(None, &mut |e| match e {
                 RenamerEvent::Described { name } => described.push(name),
                 RenamerEvent::Checking { path } => checking.push(path),
-                RenamerEvent::Progress(..) => progress += 1,
+                RenamerEvent::Progress(cur, total) => progress.push((cur, total)),
                 _ => {}
             })
             .unwrap();
+        // One file, checked in both passes: progress runs 0/2, 1/2 and never past the total.
+        assert_eq!(progress, [(0, 2), (1, 2)]);
+        let progress = progress.len();
         assert_eq!(described.len(), 2, "{described:?}");
         assert!(described.contains(&"three.bin".to_string()));
         // One Checking event (with the path) per Progress event.
@@ -1203,6 +1226,91 @@ mod tests {
             "File sample-x.mkv is missing, ignoring".into()
         )));
         assert!(events.contains(&RenamerEvent::Info("File readme.nfo is missing".into())));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stop_during_rename_pass_keeps_bookkeeping_and_marks_bad() {
+        let dir = tmpdir("stopmid");
+        let a = rnd(9_000, 51);
+        let b = rnd(7_000, 52);
+        let c = rnd(5_000, 53);
+        let (bytes, _) = create_in_memory(
+            &[(b"a.bin", &a), (b"b.bin", &b), (b"c.bin", &c)],
+            1024,
+            &[0],
+            Kernel::detect(),
+        )
+        .unwrap();
+        let (_, vols) = split_set(&bytes);
+        std::fs::write(dir.join("set.par2"), index_without_descs(&bytes, 2)).unwrap();
+        std::fs::write(dir.join("set.vol00+01.par2"), &vols[0]).unwrap();
+        std::fs::write(dir.join("o1"), &a).unwrap();
+        std::fs::write(dir.join("o2"), &b).unwrap();
+        std::fs::write(dir.join("o3"), &c).unwrap();
+        let renamed = std::cell::Cell::new(false);
+        let mut events = Vec::new();
+        let rep = ParRenamer::new(
+            &dir,
+            RenamerOptions {
+                detect_missing: true,
+                ..Default::default()
+            },
+        )
+        .run_with_stop(&mut || renamed.get(), &mut |e| {
+            if matches!(e, RenamerEvent::Renamed { .. }) {
+                renamed.set(true);
+            }
+            events.push(e);
+        })
+        .unwrap();
+        // Stopped after o1 → a.bin; o2/o3 untouched, damaged main still marked bad.
+        assert_eq!(
+            rep.renamed,
+            vec![
+                (dir.join("o1"), dir.join("a.bin")),
+                (dir.join("set.par2"), dir.join("set.par2.bad")),
+            ],
+            "{events:?}"
+        );
+        assert!(dir.join("o2").exists() && dir.join("o3").exists());
+        assert_eq!(rep.bad_par_files, vec![dir.join("set.par2")]);
+        assert_eq!(
+            rep.loaded_par_files,
+            vec![dir.join("set.par2"), dir.join("set.vol00+01.par2")]
+        );
+        // Unchecked files are not reported missing.
+        assert!(rep.missing.is_empty());
+        assert!(!rep.has_missed_files);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dry_run_checking_reports_planned_par_names() {
+        let dir = tmpdir("drypar");
+        let a = rnd(4_000, 61);
+        let (bytes, set_id) =
+            create_in_memory(&[(b"d.bin", &a)], 1024, &[], Kernel::detect()).unwrap();
+        // A par2 file without a .par2 extension gets renamed to its set id in pass 1.
+        std::fs::write(dir.join("idx.dat"), &bytes).unwrap();
+        let mut checking = Vec::new();
+        let rep = ParRenamer::new(
+            &dir,
+            RenamerOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .run(None, &mut |e| {
+            if let RenamerEvent::Checking { path } = e {
+                checking.push(path);
+            }
+        })
+        .unwrap();
+        let planned = dir.join(format!("{}.vol001+01.PAR2", set_id.to_hex()));
+        assert_eq!(rep.renamed, vec![(dir.join("idx.dat"), planned.clone())]);
+        assert_eq!(checking, vec![dir.join("idx.dat"), planned]);
+        assert!(dir.join("idx.dat").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
