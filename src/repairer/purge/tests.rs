@@ -324,3 +324,39 @@ fn streaming_verify_never_enables_purge() {
     ));
     assert!(!fx.par_files().is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn removal_failures_are_reported_and_keep_the_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fx::new("readonly");
+    let mut r = fx.repairer(RepairOptions::default());
+    assert!(r.verify(None, &mut NullObserver).unwrap().all_complete);
+    let pars = fx.par_files();
+    std::fs::set_permissions(&fx.dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    struct Warnings(Vec<String>);
+    impl RepairObserver for Warnings {
+        fn message(&mut self, level: Level, text: &str) {
+            if level == Level::Warning {
+                self.0.push(text.to_owned());
+            }
+        }
+    }
+    let mut obs = Warnings(Vec::new());
+    let report = r.purge(&mut obs);
+    std::fs::set_permissions(&fx.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if report.all_removed() {
+        // Running as root: permissions are not enforced, nothing to test.
+        return;
+    }
+    assert_eq!(report.entries.len(), pars.len());
+    assert!(
+        report
+            .kept()
+            .all(|(_, k)| matches!(k, PurgeKept::Failed(_))),
+        "{report:?}"
+    );
+    assert_eq!(obs.0.len(), pars.len());
+    assert!(obs.0.iter().all(|m| m.starts_with("Could not purge")));
+    assert_eq!(fx.par_files(), pars);
+}

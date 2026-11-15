@@ -1189,4 +1189,78 @@ mod tests {
             PacketKind::Unknown
         );
     }
+
+    #[test]
+    fn optional_packets_are_decoded() {
+        use crate::packet::{SetId, encode_packet};
+        let sid = SetId([0x42; 16]);
+        let mut buf = Vec::new();
+        // CommASCI: NUL-padded text.
+        buf.extend(encode_packet(&sid, b"PAR 2.0\0CommASCI", b"hello\0\0\0"));
+        // CommUni: 16-byte MD5 of the ASCII comment, then UTF-16LE text padded with NULs.
+        let mut uni = vec![0u8; 16];
+        for u in "h\u{e9}llo".encode_utf16() {
+            uni.extend_from_slice(&u.to_le_bytes());
+        }
+        uni.extend_from_slice(&[0, 0]);
+        buf.extend(encode_packet(&sid, b"PAR 2.0\0CommUni\0", &uni));
+        // FileSlic: file id, slice index, then the slice data.
+        let mut slic = vec![7u8; 16];
+        slic.extend_from_slice(&3u64.to_le_bytes());
+        slic.extend_from_slice(&[9u8; 8]);
+        let slic_at = buf.len();
+        buf.extend(encode_packet(&sid, b"PAR 2.0\0FileSlic", &slic));
+        // RFSC: (MD5, CRC-32) pairs.
+        let mut rfsc = Vec::new();
+        for (m, c) in [(1u8, 0xAABB_CCDDu32), (2, 0x0102_0304)] {
+            rfsc.extend_from_slice(&[m; 16]);
+            rfsc.extend_from_slice(&c.to_le_bytes());
+        }
+        buf.extend(encode_packet(&sid, b"PAR 2.0\0RFSC\0\0\0\0", &rfsc));
+
+        let r = inspect_par2(&buf, true);
+        assert_eq!(r.bad_md5, 0);
+        assert_eq!(r.packets.len(), 4);
+        assert_eq!(
+            r.comments,
+            vec![
+                CommentInfo {
+                    set_id: sid.0,
+                    text: "hello".into(),
+                    unicode: false,
+                },
+                CommentInfo {
+                    set_id: sid.0,
+                    text: "h\u{e9}llo".into(),
+                    unicode: true,
+                },
+            ]
+        );
+        assert_eq!(
+            r.file_slices,
+            vec![FileSliceInfo {
+                set_id: sid.0,
+                file_id: [7; 16],
+                slice_index: 3,
+                data_offset: slic_at + 64 + 24,
+                data_len: 8,
+            }]
+        );
+        assert_eq!(&buf[slic_at + 64 + 24..slic_at + 64 + 32], &[9u8; 8]);
+        assert_eq!(
+            r.recovery_checksums,
+            vec![RecoveryChecksumInfo {
+                set_id: sid.0,
+                slices: vec![([1; 16], 0xAABB_CCDD), ([2; 16], 0x0102_0304)],
+            }]
+        );
+        // Truncated bodies are skipped without panicking.
+        let mut short = Vec::new();
+        short.extend(encode_packet(&sid, b"PAR 2.0\0FileSlic", &[1u8; 12]));
+        short.extend(encode_packet(&sid, b"PAR 2.0\0RFSC\0\0\0\0", &[1u8; 12]));
+        let r = inspect_par2(&short, true);
+        assert!(r.file_slices.is_empty());
+        assert_eq!(r.recovery_checksums.len(), 1);
+        assert!(r.recovery_checksums[0].slices.is_empty());
+    }
 }

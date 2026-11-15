@@ -2251,4 +2251,75 @@ pub(crate) mod tests {
         assert_eq!(hex(&[0x00, 0xAB, 0xFF]), "00abff");
         assert_eq!(hex(&[]), "");
     }
+
+    #[test]
+    fn recovery_hasher_matches_prefix_encoder() {
+        let sid = SetId([0x11; 16]);
+        let data: Vec<u8> = (0..4096u32).map(|i| (i * 7) as u8).collect();
+        let mut h = RecoveryPacketHasher::new(sid, 5);
+        for chunk in data.chunks(1000) {
+            h.update(chunk);
+        }
+        assert_eq!(h.finish(), encode_recovery_packet_prefix(&sid, 5, &data));
+    }
+
+    #[test]
+    fn file_lookup_by_name_and_hash16k() {
+        let (bytes, _) = crate::create::create_in_memory(
+            &[
+                (b"Dir\\Movie.MKV", &[1u8; 3000][..]),
+                (b"other.bin", &[2u8; 2000][..]),
+            ],
+            1024,
+            &[],
+            crate::gf16::simd::Kernel::detect(),
+        )
+        .unwrap();
+        let set = load_par2_bytes(&bytes, ScanOptions::METADATA).unwrap();
+        let movie = set.file_id_by_name(b"Dir\\Movie.MKV").unwrap();
+        // Translated local name, then ASCII case-insensitive forms of both.
+        assert_eq!(set.file_id_by_name(b"Dir/Movie.MKV"), Some(movie));
+        assert_eq!(set.file_id_by_name(b"dir/movie.mkv"), Some(movie));
+        assert_eq!(set.file_id_by_name(b"DIR\\MOVIE.mkv"), Some(movie));
+        assert_eq!(set.file_id_by_name(b"missing.bin"), None);
+        let other = set.file_id_by_name(b"other.bin").unwrap();
+        let h16 = set.file_descs[&other].hash_16k;
+        assert_eq!(set.file_id_by_hash16k(&h16), Some(other));
+        assert_eq!(set.file_id_by_hash16k(&[0; 16]), None);
+    }
+
+    #[test]
+    fn collection_loads_files_from_disk() {
+        let dir = std::env::temp_dir().join(format!("par-rs-collection-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &[u8], fill: u8| {
+            crate::create::create_in_memory(
+                &[(name, &vec![fill; 2048][..])],
+                1024,
+                &[0],
+                crate::gf16::simd::Kernel::detect(),
+            )
+            .unwrap()
+        };
+        let (a, sid_a) = mk(b"a.bin", 1);
+        let (b, sid_b) = mk(b"b.bin", 2);
+        std::fs::write(dir.join("a.par2"), &a).unwrap();
+        std::fs::write(dir.join("b.par2"), &b).unwrap();
+        let mut c = Par2Collection::new();
+        let sa = c
+            .load_file(&dir.join("a.par2"), 0, ScanOptions::METADATA)
+            .unwrap();
+        let sb = c
+            .load_file(&dir.join("b.par2"), 1, ScanOptions::METADATA)
+            .unwrap();
+        assert!(sa.added > 0 && sb.added > 0);
+        assert!(c.sets.contains_key(&sid_a) && c.sets.contains_key(&sid_b));
+        assert!(c.primary_set().is_some());
+        assert!(
+            c.load_file(&dir.join("missing.par2"), 2, ScanOptions::METADATA)
+                .is_err()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
