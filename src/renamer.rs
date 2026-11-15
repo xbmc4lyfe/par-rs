@@ -474,7 +474,7 @@ impl ParRenamer {
         let disk = self.disk_path(path);
         let mut set = PacketSet::new();
         // Like libpar2's LoadPacketsFromFile, a file counts as loaded when it yielded any
-        // usable packet: a Main or at least one FileDesc. Packets read before an error count.
+        // usable packet: a Main or at least one FileDesc. A read error leaves the set empty.
         let _ = set.load_file(&disk, 0, ScanOptions::METADATA);
         let loaded = (set.main.is_some() || !set.file_descs.is_empty())
             && std::fs::metadata(&disk)
