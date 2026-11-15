@@ -775,6 +775,7 @@ pub unsafe extern "C" fn nzbpar_rename_dir(
         detect_missing: detect_missing != 0,
         dry_run: dry_run != 0,
         ignore_extensions: Vec::new(),
+        is_ignored: None,
     };
     let res = std::panic::catch_unwind(|| {
         crate::renamer::ParRenamer::new(d, opts).run(None, &mut |ev| {
@@ -786,7 +787,7 @@ pub unsafe extern "C" fn nzbpar_rename_dir(
                     crate::renamer::RenamerEvent::Renamed { from, to } => {
                         (1, format!("Renamed {} to {}", from.display(), to.display()))
                     }
-                    crate::renamer::RenamerEvent::Progress(_, _) => return,
+                    _ => return,
                 };
                 let c = CString::new(text.replace('\0', " ")).unwrap_or_default();
                 // SAFETY: caller-provided callback.

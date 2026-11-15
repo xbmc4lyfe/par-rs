@@ -270,7 +270,9 @@ fn cmd_rename(args: &[String]) -> ExitCode {
         ..Default::default()
     };
     match ParRenamer::new(PathBuf::from(dir), opts).run(None, &mut |e| match e {
-        RenamerEvent::Progress(_, _) => {}
+        RenamerEvent::Progress(_, _)
+        | RenamerEvent::Checking { .. }
+        | RenamerEvent::Described { .. } => {}
         other => eprintln!("   {other:?}"),
     }) {
         Ok(rep) => {
