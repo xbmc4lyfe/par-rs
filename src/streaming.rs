@@ -1919,6 +1919,10 @@ struct SessionInner {
     /// Runtime slot cap (starts at `opts.max_syndrome_slots`), see
     /// [`StreamingParSession::set_max_syndrome_slots`].
     max_slots: AtomicUsize,
+    /// Runtime RAM staging cap for partial slices (starts at
+    /// `opts.max_staging_bytes`), see
+    /// [`StreamingParSession::set_max_staging_bytes`].
+    max_staging: AtomicU64,
     /// Highest cap the slice metadata budget (`max_working_bytes`) allows.
     slot_limit: usize,
     /// Arrived volumes that had valid recovery packets turned away because the
@@ -2184,6 +2188,7 @@ impl StreamingParSession {
             logs,
             slots,
             max_slots: AtomicUsize::new(opts.max_syndrome_slots),
+            max_staging: AtomicU64::new(opts.max_staging_bytes),
             slot_limit,
             cap_rejected: Mutex::new(Vec::new()),
             needs_backfill: AtomicBool::new(false),
@@ -2694,11 +2699,12 @@ impl StreamingParSession {
                         }
                     }
                 }
-                if required > self.inner.opts.max_staging_bytes {
+                let limit = self.inner.max_staging.load(Ordering::Acquire);
+                if required > limit {
                     return Err(RepairError::StreamingMemoryLimit {
                         context: "RAM-only partial staging",
                         required_bytes: required,
-                        limit_bytes: self.inner.opts.max_staging_bytes,
+                        limit_bytes: limit,
                     });
                 }
             }
@@ -2785,7 +2791,10 @@ impl StreamingParSession {
                     && (!payload.memory_only || offset > sstart || end < send)
                 {
                     let have = t.staging.contains_key(&g);
-                    if have || t.staging_bytes + slen as u64 <= self.inner.opts.max_staging_bytes {
+                    if have
+                        || t.staging_bytes + slen as u64
+                            <= self.inner.max_staging.load(Ordering::Acquire)
+                    {
                         if !have {
                             t.staging_bytes += slen as u64;
                         }
@@ -3204,6 +3213,34 @@ impl StreamingParSession {
             .iter()
             .map(|(_, n)| n)
             .sum()
+    }
+
+    /// Current RAM staging cap for partial slices (starts at
+    /// `SessionOptions::max_staging_bytes`).
+    #[must_use]
+    pub fn max_staging_bytes(&self) -> u64 {
+        self.inner.max_staging.load(Ordering::Acquire)
+    }
+
+    /// RAM currently held by partially received slices.
+    #[must_use]
+    pub fn staging_bytes(&self) -> u64 {
+        self.inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .staging_bytes
+    }
+
+    /// Change the RAM staging cap of a running session, so a caller can lend
+    /// free memory to partial slices when many files arrive at once instead of
+    /// reserving it up front. Memory-only payloads that would exceed the cap are
+    /// refused (the caller replays them from committed disk later); lowering the
+    /// cap below what is staged only stops further staging, nothing is evicted.
+    /// The caller budgets this memory. Returns the new cap.
+    pub fn set_max_staging_bytes(&self, bytes: u64) -> u64 {
+        self.inner.max_staging.store(bytes, Ordering::Release);
+        bytes
     }
 
     /// Current syndrome slot cap (starts at `SessionOptions::max_syndrome_slots`).
@@ -4747,6 +4784,49 @@ mod live_tests {
         assert!(!fx.dir.join("part00.rar").exists());
         s.on_article_finished(&id, 0, data.len() as u64, crc32(data), Some(data))
             .unwrap();
+        assert_eq!(s.status().verified, 2);
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn session_staging_cap_can_be_raised_at_runtime() {
+        let fx = fixture(
+            "session_staging_raise",
+            &[8192, 8192],
+            4096,
+            0,
+            VolumeScheme::Single,
+        );
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                max_staging_bytes: 4096,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (a, b) = (fid(&fx, "part00.rar"), fid(&fx, "part01.rar"));
+        let (da, db) = (&fx.files[0].1, &fx.files[1].1);
+        // One partial slice fits the one-slice cap; a second is refused.
+        s.on_article_finished_memory_only(&a, 0, &da[..2048], crc32(&da[..2048]))
+            .unwrap();
+        assert_eq!(s.staging_bytes(), 4096);
+        assert!(matches!(
+            s.on_article_finished_memory_only(&b, 0, &db[..2048], crc32(&db[..2048])),
+            Err(RepairError::StreamingMemoryLimit { .. })
+        ));
+        assert_eq!(s.set_max_staging_bytes(8192), 8192);
+        assert_eq!(s.max_staging_bytes(), 8192);
+        s.on_article_finished_memory_only(&b, 0, &db[..2048], crc32(&db[..2048]))
+            .unwrap();
+        assert_eq!(s.staging_bytes(), 8192);
+        // Completing both slices releases their staging.
+        s.on_article_finished_memory_only(&a, 2048, &da[2048..4096], crc32(&da[2048..4096]))
+            .unwrap();
+        s.on_article_finished_memory_only(&b, 2048, &db[2048..4096], crc32(&db[2048..4096]))
+            .unwrap();
+        assert_eq!(s.staging_bytes(), 0);
         assert_eq!(s.status().verified, 2);
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
