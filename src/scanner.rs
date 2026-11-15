@@ -537,6 +537,7 @@ pub fn scan_source<S: PacketSource + ?Sized>(
                 block: e.block,
             });
             report.aligned_hits += 1;
+            anchor = pos;
             pos += ss;
             progress(pos.min(file_len));
             continue;
@@ -632,7 +633,7 @@ pub fn scan_source<S: PacketSource + ?Sized>(
             anchor = pos;
             pos += ss;
         } else if let Some(next) = jump_to {
-            report.skipped_bytes += next - pos;
+            report.skipped_bytes += next.min(file_len) - pos;
             if !win.hash_until(next.min(file_len), cancel)? {
                 report.cancelled = true;
                 break;
@@ -1377,5 +1378,44 @@ mod tests {
         assert!(r.found.len() <= full.found.len());
         assert!(r.slid_bytes <= full.slid_bytes);
         assert_eq!(r.file_hashes, full.file_hashes);
+    }
+
+    #[test]
+    fn data_skipping_anchor_follows_reused_aligned_matches() {
+        let ss = 4096usize;
+        let data = rnd(ss * 8, 44);
+        let es = entries(0, &data, ss);
+        let index = ChecksumIndex::new(ss as u64, es.clone());
+        // 8 junk bytes + S0, S1 minus its first 8 bytes, S2 (now aligned at 2ss), S3 minus its
+        // first 8 bytes, then S4.. at 4ss - 8 (-8 from the grid of the S2 match).
+        let s = |i: usize| &data[i * ss..(i + 1) * ss];
+        let mut file = vec![0x33u8; 8];
+        file.extend_from_slice(s(0));
+        file.extend_from_slice(&s(1)[8..]);
+        file.extend_from_slice(s(2));
+        file.extend_from_slice(&s(3)[8..]);
+        for i in 4..8 {
+            file.extend_from_slice(s(i));
+        }
+        let run = |expected: Option<&[ChecksumEntry]>| {
+            let cfg = ScanConfig {
+                buffer_size: 64 << 10,
+                skip_leeway: Some(8),
+                ..ScanConfig::default()
+            };
+            scan_source(&file[..], &index, expected, &cfg, None, &mut |_| {}).unwrap()
+        };
+        let without = run(None);
+        let with = run(Some(&es));
+        let blocks = |r: &ScanReport| {
+            let mut v: Vec<u32> = r.found.iter().map(|f| f.block.block_index).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert_eq!(blocks(&without), [0, 2, 4, 5, 6, 7]);
+        assert_eq!(blocks(&with), blocks(&without));
+        assert_eq!(with.file_hashes, without.file_hashes);
+        assert!(with.skipped_bytes <= file.len() as u64);
     }
 }
