@@ -70,31 +70,37 @@ impl SyndromeBank {
     }
 
     /// Slice size.
+    #[must_use]
     pub fn slice_size(&self) -> usize {
         self.slice_size
     }
 
     /// Total input slices.
+    #[must_use]
     pub fn total_slices(&self) -> usize {
         self.folded.len()
     }
 
     /// Tracked exponents (ascending).
+    #[must_use]
     pub fn exponents(&self) -> &[u32] {
         &self.exponents
     }
 
     /// Whether input slice `global` has been folded.
+    #[must_use]
     pub fn is_folded(&self, global: usize) -> bool {
         self.folded.get(global).copied().unwrap_or(false)
     }
 
     /// Number of folded (verified) slices.
+    #[must_use]
     pub fn folded_count(&self) -> usize {
         self.folded_count
     }
 
     /// Input slices not yet folded (damaged or pending).
+    #[must_use]
     pub fn unknown_slices(&self) -> Vec<usize> {
         self.folded
             .iter()
@@ -105,6 +111,7 @@ impl SyndromeBank {
     }
 
     /// Exponents whose recovery slice has arrived: their buffers are complete syndromes.
+    #[must_use]
     pub fn ready_syndromes(&self) -> Vec<u32> {
         self.exponents
             .iter()
@@ -115,6 +122,7 @@ impl SyndromeBank {
     }
 
     /// `unknown_slices().len() <= ready_syndromes().len()`.
+    #[must_use]
     pub fn can_solve_now(&self) -> bool {
         self.folded.len().saturating_sub(self.folded_count)
             <= self.have_recovery.iter().filter(|h| **h).count()
@@ -374,36 +382,43 @@ impl StreamingSliceAssembler {
     }
 
     /// The underlying bank.
+    #[must_use]
     pub fn bank(&self) -> &SyndromeBank {
         &self.bank
     }
 
     /// Files in file-id order.
+    #[must_use]
     pub fn files(&self) -> &[FileLayout] {
         &self.files
     }
 
     /// Slice size.
+    #[must_use]
     pub fn slice_size(&self) -> usize {
         self.bank.slice_size()
     }
 
     /// Total input slices.
+    #[must_use]
     pub fn total_slices(&self) -> usize {
         self.state.len()
     }
 
     /// State of a global slice.
+    #[must_use]
     pub fn slice_state(&self, global: usize) -> Option<SliceState> {
         self.state.get(global).copied()
     }
 
     /// Bytes currently held in partial-slice staging buffers.
+    #[must_use]
     pub fn staging_bytes(&self) -> usize {
         self.staging_bytes
     }
 
     /// Global slice number of `(file, slice)`.
+    #[must_use]
     pub fn global_slice(&self, file: usize, slice: usize) -> Option<usize> {
         (slice < self.files.get(file)?.slices.len()).then(|| {
             self.first_slice
@@ -415,6 +430,7 @@ impl StreamingSliceAssembler {
     }
 
     /// `(file, slice)` of a global slice.
+    #[must_use]
     pub fn locate_global(&self, global: usize) -> Option<(usize, usize)> {
         let fi = self
             .first_slice
@@ -429,6 +445,7 @@ impl StreamingSliceAssembler {
     }
 
     /// Current status.
+    #[must_use]
     pub fn status(&self) -> StreamStatus {
         let unknown = self.state.len().saturating_sub(self.bank.folded_count());
         let ready = self.bank.ready_syndromes().len();
@@ -444,6 +461,7 @@ impl StreamingSliceAssembler {
     }
 
     /// Whether every unknown slice can be solved now.
+    #[must_use]
     pub fn can_solve_now(&self) -> bool {
         self.bank.can_solve_now()
     }
@@ -650,6 +668,7 @@ impl StreamingSliceAssembler {
     }
 
     /// Global indices of damaged slices.
+    #[must_use]
     pub fn damaged_slices(&self) -> Vec<usize> {
         self.state
             .iter()
@@ -660,6 +679,7 @@ impl StreamingSliceAssembler {
     }
 
     /// Global indices of pending slices.
+    #[must_use]
     pub fn pending_slices(&self) -> Vec<usize> {
         self.state
             .iter()

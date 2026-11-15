@@ -48,6 +48,7 @@ impl Default for FileHasher {
 
 impl FileHasher {
     /// New hasher.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             crc: Crc32::new(),
@@ -69,21 +70,25 @@ impl FileHasher {
     }
 
     /// Bytes processed so far.
+    #[must_use]
     pub fn len(&self) -> u64 {
         self.len
     }
 
     /// Whether nothing has been hashed yet.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Current CRC-32 (does not consume).
+    #[must_use]
     pub fn crc32(&self) -> u32 {
         self.crc.finish()
     }
 
     /// Finish and return all digests.
+    #[must_use]
     pub fn finish(self) -> FileHashes {
         FileHashes {
             crc32: self.crc.finish(),
@@ -95,17 +100,20 @@ impl FileHasher {
 }
 
 /// MD5 of `data`.
+#[must_use]
 pub fn md5(data: &[u8]) -> [u8; 16] {
     Md5::digest(data).into()
 }
 
 /// MD5 of the first `min(len, 16384)` bytes of `data`.
+#[must_use]
 pub fn md5_16k(data: &[u8]) -> [u8; 16] {
     let n = data.len().min(HASH_16K_LEN as usize);
     md5(&data[..n])
 }
 
 /// CRC-32 and MD5 of a slice buffer (the IFSC checksum pair).
+#[must_use]
 pub fn slice_checksums(slice: &[u8]) -> (u32, [u8; 16]) {
     (crate::crc::crc32(slice), md5(slice))
 }

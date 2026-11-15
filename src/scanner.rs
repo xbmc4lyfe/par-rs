@@ -69,6 +69,7 @@ fn mix(crc: u32) -> u64 {
 
 impl ChecksumIndex {
     /// Build the index for slices of `slice_size` bytes.
+    #[must_use]
     pub fn new(slice_size: u64, entries: Vec<ChecksumEntry>) -> Self {
         assert!(slice_size > 0, "slice size must be positive");
         let n = entries.len().max(1);
@@ -109,33 +110,39 @@ impl ChecksumIndex {
     }
 
     /// Slice size.
+    #[must_use]
     pub fn slice_size(&self) -> u64 {
         self.slice_size
     }
 
     /// Number of indexed slices.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the index is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// All entries.
+    #[must_use]
     pub fn entries(&self) -> &[ChecksumEntry] {
         &self.entries
     }
 
     /// Number of entries whose CRC collides with an earlier entry (identical slices or true
     /// CRC collisions). When zero, a CRC match identifies a slice uniquely.
+    #[must_use]
     pub fn duplicate_crcs(&self) -> usize {
         self.duplicate_crcs
     }
 
     /// One-bit pre-filter: `false` means the CRC is definitely not indexed.
     #[inline(always)]
+    #[must_use]
     pub fn might_contain(&self, crc: u32) -> bool {
         let bit = (crc as usize) & self.filter_mask;
         (self.filter[bit / 64] >> (bit % 64)) & 1 != 0
@@ -204,6 +211,7 @@ pub struct ScanReport {
 impl ScanReport {
     /// Whether every block of `expected` (the slices of one file, in order) was found at its
     /// natural offset.
+    #[must_use]
     pub fn is_full_match(&self, expected: &[ChecksumEntry], slice_size: u64) -> bool {
         expected.iter().enumerate().all(|(i, e)| {
             self.found
@@ -668,6 +676,7 @@ pub fn scan_file(
 }
 
 /// Build the checksum entries of one file from its slice checksums.
+#[must_use]
 pub fn entries_for_file(
     file_index: u32,
     slices: &[crate::packet::SliceChecksum],

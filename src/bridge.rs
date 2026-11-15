@@ -73,6 +73,7 @@ pub struct Par2Bridge {
 
 impl Par2Bridge {
     /// Resolver for every file in `inventory`.
+    #[must_use]
     pub fn new(inventory: &Inventory) -> Self {
         Self {
             files: inventory.files.clone(),
@@ -80,11 +81,13 @@ impl Par2Bridge {
     }
 
     /// Resolver for an explicit file list.
+    #[must_use]
     pub fn from_files(files: Vec<Par2File>) -> Self {
         Self { files }
     }
 
     /// The files being resolved against.
+    #[must_use]
     pub fn files(&self) -> &[Par2File] {
         &self.files
     }
@@ -244,6 +247,7 @@ impl Par2Bridge {
 
 /// Part number of a RAR volume name: `name.partNN.rar` → `NN`, `name.rNN` → `NN + 1`,
 /// `name.rar` (old-style first volume) → `0`. `None` for non-RAR names.
+#[must_use]
 pub fn rar_part_number(name: &str) -> Option<u64> {
     let lower = name.to_ascii_lowercase();
     if let Some(stem) = lower.strip_suffix(".rar") {
@@ -270,6 +274,7 @@ pub fn rar_part_number(name: &str) -> Option<u64> {
 pub const RAR5_SIGNATURE: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
 
 /// Read a RAR5 variable-length integer at `off`: `(value, bytes consumed)`.
+#[must_use]
 pub fn rar5_vint(data: &[u8], off: usize) -> Option<(u64, usize)> {
     let mut value: u64 = 0;
     for i in 0..10usize {
@@ -285,6 +290,7 @@ pub fn rar5_vint(data: &[u8], off: usize) -> Option<(u64, usize)> {
 /// Volume number from the RAR5 main archive header at the start of `head`: `0` for the first
 /// volume (the header carries no number), `n` for `.part(n+1)`. `None` if `head` is not a
 /// RAR5 archive or the header is incomplete.
+#[must_use]
 pub fn rar5_volume_number(head: &[u8]) -> Option<u64> {
     if head.get(..8)? != RAR5_SIGNATURE {
         return None;

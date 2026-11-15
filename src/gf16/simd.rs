@@ -40,6 +40,7 @@ pub enum Isa {
 
 impl Isa {
     /// Candidate instruction sets in preference order for this target.
+    #[must_use]
     pub fn candidates() -> &'static [Isa] {
         #[cfg(target_arch = "x86_64")]
         {
@@ -56,6 +57,7 @@ impl Isa {
     }
 
     /// Whether the running CPU supports this instruction set.
+    #[must_use]
     pub fn is_supported(self) -> bool {
         match self {
             Isa::Scalar => true,
@@ -76,6 +78,7 @@ impl Isa {
     }
 
     /// Vector width in bytes (per plane) processed per iteration.
+    #[must_use]
     pub const fn vector_bytes(self) -> usize {
         match self {
             Isa::Scalar => 1,
@@ -109,22 +112,26 @@ pub struct Plane<'a> {
 
 impl<'a> Plane<'a> {
     /// Split a buffer whose first half is the low plane and second half the high plane.
+    #[must_use]
     pub fn from_halves(buf: &'a [u8]) -> Self {
         let (lo, hi) = buf.split_at(buf.len() / 2);
         Self { lo, hi }
     }
 
     /// Words in the plane.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.lo.len()
     }
 
     /// Whether the plane is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lo.is_empty()
     }
 
     /// Sub-range `[start, end)` of words.
+    #[must_use]
     pub fn slice(&self, start: usize, end: usize) -> Plane<'a> {
         Plane {
             lo: &self.lo[start..end],
@@ -150,16 +157,19 @@ impl<'a> PlaneMut<'a> {
     }
 
     /// Words in the plane.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.lo.len()
     }
 
     /// Whether the plane is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lo.is_empty()
     }
 
     /// Reborrow as read-only planes.
+    #[must_use]
     pub fn as_plane(&self) -> Plane<'_> {
         Plane {
             lo: self.lo,
@@ -193,6 +203,7 @@ impl Default for Kernel {
 
 impl Kernel {
     /// Pick the best supported and self-verified instruction set.
+    #[must_use]
     pub fn detect() -> Self {
         for &isa in Isa::candidates() {
             if let Some(k) = Self::with_isa(isa) {
@@ -204,6 +215,7 @@ impl Kernel {
 
     /// Kernel for a specific instruction set, if supported by the CPU and passing the
     /// self-test. `Isa::Scalar` always succeeds.
+    #[must_use]
     pub fn with_isa(isa: Isa) -> Option<Self> {
         if !isa.is_supported() {
             return None;
@@ -217,11 +229,13 @@ impl Kernel {
     }
 
     /// Scalar reference kernel.
+    #[must_use]
     pub const fn scalar() -> Self {
         Self { isa: Isa::Scalar }
     }
 
     /// Instruction set in use.
+    #[must_use]
     pub fn isa(&self) -> Isa {
         self.isa
     }

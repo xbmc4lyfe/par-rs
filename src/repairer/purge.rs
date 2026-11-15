@@ -53,6 +53,7 @@ impl PurgeReport {
     }
 
     /// Every candidate was removed (an empty report counts as complete).
+    #[must_use]
     pub fn all_removed(&self) -> bool {
         self.entries.iter().all(|e| e.kept.is_none())
     }
@@ -101,6 +102,7 @@ impl Par2Repairer {
     /// not deleted yet, then every loaded PAR2 file of this set, without duplicates. Split
     /// fragments, files of other sets (or without packets) and the temporary copies made by
     /// [`load_par2_bytes`](Self::load_par2_bytes) are never candidates.
+    #[must_use]
     pub fn purge_candidates(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
         for p in self

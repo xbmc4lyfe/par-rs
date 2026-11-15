@@ -560,6 +560,7 @@ fn stream_blocks<L: Lanes, const G: usize>(states: &mut [[u32; 4]], blocks: &[&[
 }
 
 /// MD5 of every message, in input order.
+#[must_use]
 pub fn md5_many(msgs: &[&[u8]]) -> Vec<[u8; 16]> {
     let mut out = vec![[0u8; 16]; msgs.len()];
     md5_many_into(msgs, &mut out);
@@ -591,6 +592,7 @@ pub fn md5_many_into(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
 }
 
 /// Portable reference (lane arrays, no SIMD); exposed for tests and self-checks.
+#[must_use]
 pub fn md5_many_portable(msgs: &[&[u8]]) -> Vec<[u8; 16]> {
     let mut out = vec![[0u8; 16]; msgs.len()];
     run::<[u32; 4], 2>(msgs, &mut out);

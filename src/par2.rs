@@ -119,6 +119,7 @@ fn is_volume_stem(stem: &[u8]) -> bool {
 /// quote or opening bracket; a closing bracket is part of it, so `Show (2026).par2` and
 /// `Movie[rartv].par2` are par2 files, and so is the bare `".par2"` of an obfuscated post.
 /// No allocation: one pass over the bytes.
+#[must_use]
 pub fn is_base_par2(subject: &str) -> bool {
     let s = subject.as_bytes();
     memchr::memchr_iter(b'.', s).any(|dot| {
@@ -151,6 +152,7 @@ pub fn is_base_par2(subject: &str) -> bool {
 /// batch; a buffer with a failed MD5 or an unverifiable packet falls back to the full
 /// resynchronising scanner, so the result always equals
 /// `inventory_from(&inspect_par2_with(data, VerifyMode::Metadata))`.
+#[must_use]
 pub fn inventory(data: &[u8]) -> Inventory {
     match crate::inspect::inspect_for_inventory(data) {
         Some(lean) => inventory_from(&lean),
@@ -280,6 +282,7 @@ pub fn inventory_from(insp: &Par2Inspection) -> Inventory {
 }
 
 /// `(name, size)` of every file in [`inventory`] order.
+#[must_use]
 pub fn file_descriptions(data: &[u8]) -> Vec<(String, u64)> {
     inventory(data)
         .files
@@ -290,6 +293,7 @@ pub fn file_descriptions(data: &[u8]) -> Vec<(String, u64)> {
 
 /// A name for the set: the largest bound file of the primary set (ties broken by file id),
 /// else the largest file of any set. `None` when the buffer describes no file.
+#[must_use]
 pub fn display_name(data: &[u8]) -> Option<String> {
     let inv = inventory(data);
     let primary = inv.files.first()?.set_id;
@@ -306,6 +310,7 @@ pub fn display_name(data: &[u8]) -> Option<String> {
 }
 
 /// Hex rendering of a set or file id (handy for indexer keys).
+#[must_use]
 pub fn id_hex(id: &[u8; 16]) -> String {
     hex(id)
 }

@@ -62,11 +62,13 @@ pub static TABLES: [[u32; 256]; 8] = make_tables();
 
 /// Process one byte through the raw register.
 #[inline(always)]
+#[must_use]
 pub fn update_byte_raw(state: u32, byte: u8) -> u32 {
     (state >> 8) ^ TABLES[0][((state ^ u32::from(byte)) & 0xFF) as usize]
 }
 
 /// Slice-by-8 software update of the raw register.
+#[must_use]
 pub fn update_slice8_raw(mut crc: u32, data: &[u8]) -> u32 {
     let (chunks, remainder) = data.as_chunks::<8>();
     for c in chunks {
@@ -94,6 +96,7 @@ pub fn update_slice8_raw(mut crc: u32, data: &[u8]) -> u32 {
 /// Multiply two polynomials modulo P(x), both in reflected representation
 /// (bit 31 is `x^0`, bit 0 is `x^31`). Equivalent to zlib's `multmodp`.
 #[inline]
+#[must_use]
 pub const fn multmodp(a: u32, b: u32) -> u32 {
     let mut m: u32 = 1 << 31;
     let mut p: u32 = 0;
@@ -128,6 +131,7 @@ const fn make_x2n_table() -> [u32; 32] {
 static X2N_TABLE: [u32; 32] = make_x2n_table();
 
 /// `x^(n * 2^k) mod P(x)` in reflected representation. Equivalent to zlib's `x2nmodp`.
+#[must_use]
 pub fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
     let mut p: u32 = 1 << 31; // x^0 == 1
     while n != 0 {
@@ -143,12 +147,14 @@ pub fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
 /// The linear operator that advances a raw register by `n_bytes` zero bytes, as a
 /// polynomial (`x^(8 * n_bytes) mod P(x)`). Apply with [`multmodp`].
 #[inline]
+#[must_use]
 pub fn zero_operator(n_bytes: u64) -> u32 {
     x2nmodp(n_bytes, 3)
 }
 
 /// Advance a raw register through `n_bytes` zero bytes: `L^n(state)`.
 #[inline]
+#[must_use]
 pub fn crc32_shift_raw(state: u32, n_bytes: u64) -> u32 {
     multmodp(zero_operator(n_bytes), state)
 }
@@ -156,6 +162,7 @@ pub fn crc32_shift_raw(state: u32, n_bytes: u64) -> u32 {
 /// Combine the CRC of `A` with the CRC of `B` to obtain the CRC of `A ‖ B`.
 /// `len_b` is the length of `B` in bytes. Both inputs and the result are final CRC values.
 #[inline]
+#[must_use]
 pub fn crc32_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
     multmodp(zero_operator(len_b), crc_a) ^ crc_b
 }
@@ -170,6 +177,7 @@ pub struct Crc32Combiner {
 
 impl Crc32Combiner {
     /// Create a combiner for blocks of `len_b` bytes.
+    #[must_use]
     pub fn new(len_b: u64) -> Self {
         Self {
             op: zero_operator(len_b),
@@ -178,29 +186,34 @@ impl Crc32Combiner {
     }
 
     /// Block length this combiner was built for.
+    #[must_use]
     pub fn block_len(&self) -> u64 {
         self.len
     }
 
     /// CRC of `A ‖ B` given `crc(A)` and `crc(B)` where `|B| == block_len()`.
     #[inline]
+    #[must_use]
     pub fn combine(&self, crc_a: u32, crc_b: u32) -> u32 {
         multmodp(self.op, crc_a) ^ crc_b
     }
 }
 
 /// CRC of `n` zero bytes.
+#[must_use]
 pub fn crc32_of_zeros(n: u64) -> u32 {
     crc32_shift_raw(INIT, n) ^ INIT
 }
 
 /// CRC of `data ‖ 0^n` given `crc = crc32(data)`.
+#[must_use]
 pub fn crc32_zeros(crc: u32, n: u64) -> u32 {
     crc32_shift_raw(crc ^ INIT, n) ^ INIT
 }
 
 /// Combine consecutive per-block CRCs (each block exactly `block_len` bytes) into the CRC
 /// of the concatenation. Returns `0` for an empty slice (CRC of empty data).
+#[must_use]
 pub fn combine_block_crcs(crcs: &[u32], block_len: u64) -> u32 {
     let mut it = crcs.iter();
     let Some(&first) = it.next() else {
@@ -472,6 +485,7 @@ pub fn kernel() -> CrcKernel {
 
 /// Update a raw register with `data` using the fastest available kernel.
 #[inline]
+#[must_use]
 pub fn update_raw(state: u32, data: &[u8]) -> u32 {
     match kernel() {
         CrcKernel::Hardware => hw::update_raw(state, data),
@@ -481,6 +495,7 @@ pub fn update_raw(state: u32, data: &[u8]) -> u32 {
 
 /// CRC-32 of `data`.
 #[inline]
+#[must_use]
 pub fn crc32(data: &[u8]) -> u32 {
     update_raw(INIT, data) ^ INIT
 }
@@ -500,6 +515,7 @@ impl Default for Crc32 {
 
 impl Crc32 {
     /// New hasher (empty input).
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             state: INIT,
@@ -508,6 +524,7 @@ impl Crc32 {
     }
 
     /// Resume from a previously finished CRC value (the CRC of the data seen so far).
+    #[must_use]
     pub const fn from_crc(crc: u32, len: u64) -> Self {
         Self {
             state: crc ^ INIT,
@@ -530,21 +547,25 @@ impl Crc32 {
 
     /// Current CRC value (does not consume the hasher).
     #[inline]
+    #[must_use]
     pub const fn finish(&self) -> u32 {
         self.state ^ INIT
     }
 
     /// Raw register value.
+    #[must_use]
     pub const fn raw(&self) -> u32 {
         self.state
     }
 
     /// Number of bytes processed.
+    #[must_use]
     pub const fn len(&self) -> u64 {
         self.len
     }
 
     /// Whether no data has been processed.
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -566,6 +587,7 @@ pub struct WindowTable {
 
 impl WindowTable {
     /// Build the removal table for windows of `window` bytes (must be `>= 1`).
+    #[must_use]
     pub fn new(window: u64) -> Self {
         assert!(window >= 1, "window must be at least one byte");
         let xn = zero_operator(window);
@@ -579,6 +601,7 @@ impl WindowTable {
     }
 
     /// Window length in bytes.
+    #[must_use]
     pub fn window(&self) -> u64 {
         self.window
     }
@@ -586,12 +609,14 @@ impl WindowTable {
     /// Slide the raw register: append `new_byte`, remove `old_byte` (the byte that was
     /// exactly `window` bytes before `new_byte`).
     #[inline(always)]
+    #[must_use]
     pub fn slide_raw(&self, state: u32, new_byte: u8, old_byte: u8) -> u32 {
         update_byte_raw(state, new_byte) ^ self.table[old_byte as usize]
     }
 
     /// Slide a final CRC value instead of a raw register.
     #[inline(always)]
+    #[must_use]
     pub fn slide(&self, crc: u32, new_byte: u8, old_byte: u8) -> u32 {
         self.slide_raw(crc ^ INIT, new_byte, old_byte) ^ INIT
     }

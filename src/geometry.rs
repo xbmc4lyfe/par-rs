@@ -154,18 +154,22 @@ pub struct FileGeometry {
 
 impl FileGeometry {
     /// Opaque caller identifier, not a PAR2 file ID.
+    #[must_use]
     pub fn key(&self) -> u64 {
         self.key
     }
     /// Physical byte length, excluding logical padding.
+    #[must_use]
     pub fn length(&self) -> u64 {
         self.length
     }
     /// Number of local source slices.
+    #[must_use]
     pub fn source_slices(&self) -> u32 {
         self.source_slices
     }
     /// Logical zero padding at this file's tail; zero for an empty file.
+    #[must_use]
     pub fn padding_bytes(&self) -> u64 {
         self.padding_bytes
     }
@@ -189,31 +193,38 @@ pub struct SourceGeometry {
 
 impl SourceGeometry {
     /// Selected slice bytes.
+    #[must_use]
     pub fn slice_bytes(&self) -> u64 {
         self.slice_bytes
     }
     /// Aggregate source-slice count with each physical tail counted separately.
+    #[must_use]
     pub fn total_source_slices(&self) -> u32 {
         self.total_source_slices
     }
     /// Checked sum of physical source lengths.
+    #[must_use]
     pub fn total_source_bytes(&self) -> u64 {
         self.total_source_bytes
     }
     /// Checked sum of logical padding across physical file tails.
+    #[must_use]
     pub fn total_padding_bytes(&self) -> u64 {
         self.total_padding_bytes
     }
     /// Files in ascending opaque-key order. This is not Main-packet or RS order.
+    #[must_use]
     pub fn files(&self) -> &[FileGeometry] {
         &self.files
     }
     /// Retained requested dynamic capacity: file count times record size.
+    #[must_use]
     pub fn requested_metadata_bytes(&self) -> usize {
         self.requested_metadata_bytes
     }
     /// Actual advertised vector capacity times record size. This excludes
     /// allocator bookkeeping and is not a process-memory bound.
+    #[must_use]
     pub fn vec_capacity_bytes(&self) -> usize {
         self.vec_capacity_bytes
     }
