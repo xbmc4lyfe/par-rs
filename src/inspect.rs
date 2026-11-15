@@ -616,15 +616,12 @@ fn parse_main(set_id: [u8; 16], body: &[u8], packed: bool) -> Option<MainInfo> {
     let mut recovery_set = Vec::with_capacity(count.min(body.len() / 16));
     let mut truncated = false;
     for _ in 0..count {
-        match array::<16>(body, off) {
-            Some(id) => {
-                recovery_set.push(id);
-                off = off.checked_add(16)?;
-            }
-            None => {
-                truncated = true;
-                break;
-            }
+        if let Some(id) = array::<16>(body, off) {
+            recovery_set.push(id);
+            off = off.checked_add(16)?;
+        } else {
+            truncated = true;
+            break;
         }
     }
     let mut non_recovery_set = Vec::new();
