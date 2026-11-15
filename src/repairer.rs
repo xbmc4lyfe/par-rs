@@ -78,6 +78,9 @@ pub struct RepairOptions {
     /// scanning, slice checksums and whole-file hashes. 0 = use `num_threads`. Results do not
     /// depend on it, and the verification memory budget still bounds the buffers.
     pub file_threads: usize,
+    /// Data skipping for the sliding scans of targets and extra files (par2cmdline `-N` with
+    /// `-S<n>`): see [`ScanConfig::skip_leeway`]. `None` (the default) slides over every byte.
+    pub skip_leeway: Option<u64>,
     /// Buffer budget per verification or repair phase (minimum 16 MiB).
     /// Recovery-matrix planning has a separate cap of the same size. Metadata,
     /// retained inverse matrices, thread stacks, and allocator overhead are additional.
@@ -173,6 +176,7 @@ impl Default for RepairOptions {
         Self {
             num_threads: 0,
             file_threads: 0,
+            skip_leeway: None,
             mem_limit_bytes: 256 << 20,
             backup: BackupPolicy::RenameNumbered,
             verify_repaired: true,
@@ -1423,6 +1427,7 @@ impl Par2Repairer {
                 buffer_size,
                 known_aligned: known.as_deref(),
                 hash_file,
+                skip_leeway: self.options.skip_leeway,
                 ..ScanConfig::default()
             };
             let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0).max(1);
@@ -1507,6 +1512,7 @@ impl Par2Repairer {
         let exp_entries = expected.and_then(|fi| self.checksums[fi].as_deref());
         let cfg = ScanConfig {
             buffer_size: self.scan_resources(1).1,
+            skip_leeway: self.options.skip_leeway,
             ..ScanConfig::default()
         };
         let cancel = self.cancel.clone();
