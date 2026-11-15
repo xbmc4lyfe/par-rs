@@ -928,3 +928,637 @@ fn late_backfill_checks_md5_even_when_crc_matches() {
 fn late_backfill_rejects_short_source_then_retries() {
     late_backfill_refuses_stale_disk_then_retries("truncated");
 }
+
+fn admitted_target(fx: &Fx, index: usize, data: &[u8]) -> crate::RepairTargetFile {
+    let (name, _) = &fx.files[index];
+    let path = fx.dir.join(name);
+    std::fs::write(&path, data).unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    std::fs::rename(&path, fx.dir.join(format!("admitted-{index}"))).unwrap();
+    crate::RepairTargetFile {
+        file_id: fid(fx, name),
+        file,
+    }
+}
+
+#[test]
+fn live_target_files_repair_and_hash_actual_descriptors() {
+    let fx = fixture(
+        "target-fds-repair",
+        &[777, 1024],
+        1024,
+        1,
+        VolumeScheme::Single,
+    );
+    let session = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    let targets = [
+        admitted_target(&fx, 0, &[]),
+        admitted_target(&fx, 1, &fx.files[1].1),
+    ];
+    session
+        .on_article_finished_memory_only(
+            &targets[1].file_id,
+            0,
+            &fx.files[1].1,
+            crc32(&fx.files[1].1),
+        )
+        .unwrap();
+    session
+        .on_recovery_volume_arrived(&fx.vols[0], None)
+        .unwrap();
+    for (name, data) in &fx.files {
+        std::fs::write(fx.dir.join(name), vec![0x55; data.len()]).unwrap();
+    }
+    let ids = [targets[0].file_id, targets[1].file_id];
+    let (report, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&ids, &targets)
+        .unwrap();
+    assert_eq!(report.repaired_slices, vec![(ids[0], 0)]);
+    assert_eq!(hashes.len(), 2);
+    assert!(
+        report
+            .files
+            .iter()
+            .all(|(_, status, ok)| *ok && *status == VolumeStatus::CompleteAndVerified)
+    );
+    for (index, (name, data)) in fx.files.iter().enumerate() {
+        assert_eq!(
+            std::fs::read(fx.dir.join(format!("admitted-{index}"))).unwrap(),
+            *data
+        );
+        assert_eq!(
+            std::fs::read(fx.dir.join(name)).unwrap(),
+            vec![0x55; data.len()]
+        );
+        assert_eq!(hashes[index].0, ids[index]);
+        assert_eq!(hashes[index].1.crc32, crc32(data));
+    }
+    assert_eq!(session.io_stats().target_verification_bytes_read, 1801);
+    assert_eq!(session.io_stats().source_bytes_read, 0);
+    assert_eq!(session.repair_phase_stats().target_bytes_written, 777);
+    // A retry is verify-only and repeated requests preserve report/hash multiplicity.
+    let (retry, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&[ids[0], ids[0]], &targets[..1])
+        .unwrap();
+    assert!(retry.repaired_slices.is_empty());
+    assert_eq!(retry.files.len(), 2);
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(session.io_stats().target_verification_bytes_read, 3355);
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn live_target_files_verify_only_rewinds_and_checks_whole_length() {
+    use std::io::{Seek, SeekFrom};
+    let fx = fixture("target-fds-verify", &[777], 1024, 1, VolumeScheme::Single);
+    let session = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    let targets = [admitted_target(&fx, 0, &fx.files[0].1)];
+    let id = targets[0].file_id;
+    session
+        .on_article_finished_memory_only(&id, 0, &fx.files[0].1, crc32(&fx.files[0].1))
+        .unwrap();
+    // No pathname remains; reopening or depending on the inherited cursor fails.
+    targets[0]
+        .file
+        .try_clone()
+        .unwrap()
+        .seek(SeekFrom::Start(733))
+        .unwrap();
+    let (report, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&[id], &targets)
+        .unwrap();
+    assert!(report.files[0].2);
+    assert_eq!(hashes[0].1.len, 777);
+    assert_eq!(hashes[0].1.md5_full, fx.set.file_descs[&id].hash_full);
+    assert_eq!(session.io_stats().target_verification_bytes_read, 777);
+    assert_eq!(session.repair_phase_stats().target_bytes_written, 0);
+    assert_eq!(session.repair_phase_stats().decode_ns, 0);
+    for (len, corrupt) in [(778, false), (776, false), (777, true)] {
+        targets[0].file.set_len(len).unwrap();
+        if corrupt {
+            write_all_at(&targets[0].file, 0, &vec![0; 777]).unwrap();
+        }
+        let (report, hashes) = session
+            .repair_available_targets_with_files_and_hashes_now(&[id], &targets)
+            .unwrap();
+        assert!(!report.files[0].2);
+        assert!(hashes.is_empty());
+        assert_eq!(targets[0].file.metadata().unwrap().len(), len);
+    }
+    // A write-only FD cannot authorize hashes even if tracked slice states are good.
+    let unreadable = [crate::RepairTargetFile {
+        file_id: id,
+        file: OpenOptions::new()
+            .write(true)
+            .open(fx.dir.join("admitted-0"))
+            .unwrap(),
+    }];
+    let (report, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&[id], &unreadable)
+        .unwrap();
+    assert!(!report.files[0].2);
+    assert!(hashes.is_empty());
+    assert!(!fx.dir.join(&fx.files[0].0).exists());
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn live_target_files_zero_length_and_renamed_parent_never_reopen() {
+    let fx = fixture("target-fds-empty", &[0, 512], 1024, 1, VolumeScheme::Single);
+    let session = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    let targets = [
+        admitted_target(&fx, 0, &[]),
+        admitted_target(&fx, 1, &fx.files[1].1),
+    ];
+    session
+        .on_article_finished_memory_only(
+            &targets[1].file_id,
+            0,
+            &fx.files[1].1,
+            crc32(&fx.files[1].1),
+        )
+        .unwrap();
+    let renamed = fx.dir.with_extension("renamed");
+    std::fs::rename(&fx.dir, &renamed).unwrap();
+    let ids = [targets[0].file_id, targets[1].file_id];
+    let (report, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&ids, &targets)
+        .unwrap();
+    assert!(report.files.iter().all(|(_, _, ok)| *ok));
+    assert_eq!(hashes[0].1.len, 0);
+    assert_eq!(hashes[0].1.md5_full, fx.set.file_descs[&ids[0]].hash_full);
+    assert!(!fx.dir.exists());
+    assert_eq!(session.io_stats().target_verification_bytes_read, 512);
+    std::fs::remove_dir_all(renamed).unwrap();
+}
+
+#[test]
+fn live_target_files_reject_entire_bad_batch_before_mutation() {
+    let fx = fixture(
+        "target-fds-admission",
+        &[777, 512],
+        1024,
+        2,
+        VolumeScheme::Single,
+    );
+    let session = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    session
+        .on_recovery_volume_arrived(&fx.vols[0], None)
+        .unwrap();
+    let targets = [admitted_target(&fx, 0, &[]), admitted_target(&fx, 1, &[])];
+    let ids = [targets[0].file_id, targets[1].file_id];
+    assert!(
+        session
+            .repair_available_targets_with_files_and_hashes_now(&ids, &targets[..1])
+            .is_err()
+    );
+    assert!(
+        session
+            .repair_available_targets_with_files_and_hashes_now(&ids[..1], &targets)
+            .is_err()
+    );
+    assert!(
+        session
+            .repair_available_targets_with_files_and_hashes_now(&[], &targets)
+            .is_err()
+    );
+    let duplicate = [
+        crate::RepairTargetFile {
+            file_id: ids[0],
+            file: targets[0].file.try_clone().unwrap(),
+        },
+        crate::RepairTargetFile {
+            file_id: ids[0],
+            file: targets[0].file.try_clone().unwrap(),
+        },
+    ];
+    assert!(
+        session
+            .repair_available_targets_with_files_and_hashes_now(&ids, &duplicate)
+            .is_err()
+    );
+    let invalid = [crate::RepairTargetFile {
+        file_id: FileId([0xff; 16]),
+        file: targets[0].file.try_clone().unwrap(),
+    }];
+    assert!(
+        session
+            .repair_available_targets_with_files_and_hashes_now(&[FileId([0xff; 16])], &invalid)
+            .is_err()
+    );
+    let directory = [
+        crate::RepairTargetFile {
+            file_id: ids[0],
+            file: targets[0].file.try_clone().unwrap(),
+        },
+        crate::RepairTargetFile {
+            file_id: ids[1],
+            file: File::open(&fx.dir).unwrap(),
+        },
+    ];
+    assert!(
+        session
+            .repair_available_targets_with_files_and_hashes_now(&ids, &directory)
+            .is_err()
+    );
+    for target in &targets {
+        assert_eq!(target.file.metadata().unwrap().len(), 0);
+    }
+    assert_eq!(session.repair_phase_stats().target_bytes_written, 0);
+    assert_eq!(session.io_stats().target_verification_bytes_read, 0);
+    for (name, _) in &fx.files {
+        assert!(!fx.dir.join(name).exists());
+    }
+    assert_eq!(session.repair_phase_stats().attempts, 6);
+    assert_eq!(session.repair_phase_stats().completed, 0);
+    // Invalid admission has not consumed any syndromes.
+    let (report, _) = session
+        .repair_available_targets_with_files_and_hashes_now(&ids, &targets)
+        .unwrap();
+    assert!(report.files.iter().all(|(_, _, ok)| *ok));
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+fn target_files_backfill_retry(mode: &str) {
+    let fx = fixture(
+        &format!("target-fds-backfill-{mode}"),
+        &[777, 1000],
+        1024,
+        2,
+        VolumeScheme::Uniform(1),
+    );
+    let session = StreamingParSession::new(
+        &fx.set,
+        &fx.dir,
+        SessionOptions {
+            preallocated_syndrome_slots: 1,
+            max_syndrome_slots: 2,
+            fold_threads: 0,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    let targets = [
+        admitted_target(&fx, 0, &fx.files[0].1),
+        admitted_target(&fx, 1, &[]),
+    ];
+    let ids = [targets[0].file_id, targets[1].file_id];
+    session
+        .on_article_finished_memory_only(&ids[0], 0, &fx.files[0].1, crc32(&fx.files[0].1))
+        .unwrap();
+    let late = fx
+        .vols
+        .iter()
+        .find(|p| {
+            load_par2_file(p, ScanOptions::FULL)
+                .unwrap()
+                .recovery
+                .contains_key(&1)
+        })
+        .unwrap();
+    assert!(session.on_recovery_volume_arrived(late, None).is_err());
+    // The pathname would authenticate, but the actual admitted description must refuse.
+    std::fs::write(fx.dir.join(&fx.files[0].0), &fx.files[0].1).unwrap();
+    match mode {
+        "same-crc" => write_all_at(
+            &targets[0].file,
+            0,
+            &different_bytes_with_same_crc(&fx.files[0].1),
+        )
+        .unwrap(),
+        "short" => targets[0].file.set_len(776).unwrap(),
+        "sparse" => {
+            targets[0].file.set_len(0).unwrap();
+            targets[0].file.set_len(777).unwrap();
+        }
+        _ => unreachable!(),
+    }
+    assert!(
+        session
+            .repair_available_targets_with_files_and_hashes_now(&ids, &targets)
+            .is_err()
+    );
+    assert_eq!(targets[1].file.metadata().unwrap().len(), 0);
+    assert_eq!(session.repair_phase_stats().target_bytes_written, 0);
+    write_all_at(&targets[0].file, 0, &fx.files[0].1).unwrap();
+    std::fs::remove_file(fx.dir.join(&fx.files[0].0)).unwrap();
+    let before = session.io_stats().backfill_bytes_read;
+    let (report, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&ids, &targets)
+        .unwrap();
+    assert!(report.files.iter().all(|(_, _, ok)| *ok));
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(session.io_stats().backfill_bytes_read - before, 777);
+    assert_eq!(
+        std::fs::read(fx.dir.join("admitted-1")).unwrap(),
+        fx.files[1].1
+    );
+    let before = session.io_stats().backfill_bytes_read;
+    session
+        .repair_available_targets_with_files_and_hashes_now(&ids, &targets)
+        .unwrap();
+    assert_eq!(session.io_stats().backfill_bytes_read, before);
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn live_target_files_backfill_checks_md5_and_retries() {
+    target_files_backfill_retry("same-crc");
+}
+
+#[test]
+fn live_target_files_backfill_rejects_short_and_retries() {
+    target_files_backfill_retry("short");
+}
+
+#[test]
+fn live_target_files_backfill_rejects_sparse_and_retries() {
+    target_files_backfill_retry("sparse");
+}
+
+#[test]
+fn live_target_files_write_failures_restore_syndromes_and_retry() {
+    for length in [0, 777] {
+        let fx = fixture(
+            &format!("target-fds-write-error-{length}"),
+            &[777],
+            1024,
+            1,
+            VolumeScheme::Single,
+        );
+        let session =
+            StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+        session
+            .on_recovery_volume_arrived(&fx.vols[0], None)
+            .unwrap();
+        let good = [admitted_target(&fx, 0, &vec![0; length])];
+        let ids = [good[0].file_id];
+        let readonly = [crate::RepairTargetFile {
+            file_id: ids[0],
+            file: File::open(fx.dir.join("admitted-0")).unwrap(),
+        }];
+        let before: Vec<_> = session
+            .inner
+            .slots
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| s.lock().unwrap().data.clone())
+            .collect();
+        assert!(
+            session
+                .repair_available_targets_with_files_and_hashes_now(&ids, &readonly)
+                .is_err()
+        );
+        let after: Vec<_> = session
+            .inner
+            .slots
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| s.lock().unwrap().data.clone())
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(session.repair_phase_stats().target_bytes_written, 0);
+        assert!(!fx.dir.join(&fx.files[0].0).exists());
+        let (report, hashes) = session
+            .repair_available_targets_with_files_and_hashes_now(&ids, &good)
+            .unwrap();
+        assert!(report.files[0].2);
+        assert_eq!(hashes.len(), 1);
+        std::fs::remove_dir_all(fx.dir).unwrap();
+    }
+}
+
+#[test]
+fn live_target_files_cancelled_admission_never_mutates() {
+    let fx = fixture("target-fds-cancel", &[777], 1024, 1, VolumeScheme::Single);
+    let session = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    let targets = [admitted_target(&fx, 0, &[])];
+    session.cancel();
+    assert!(matches!(
+        session.repair_available_targets_with_files_and_hashes_now(&[targets[0].file_id], &targets),
+        Err(RepairError::Cancelled)
+    ));
+    assert_eq!(targets[0].file.metadata().unwrap().len(), 0);
+    assert_eq!(session.repair_phase_stats().attempts, 1);
+    assert_eq!(session.repair_phase_stats().completed, 0);
+    assert_eq!(session.repair_phase_stats().target_bytes_written, 0);
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn live_target_files_empty_and_zero_row_requests_do_not_mutate() {
+    let fx = fixture(
+        "target-fds-zero-row",
+        &[777, 512],
+        1024,
+        1,
+        VolumeScheme::Single,
+    );
+    let session = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    let targets = [admitted_target(&fx, 0, &fx.files[0].1)];
+    let id = targets[0].file_id;
+    session
+        .on_article_finished_memory_only(&id, 0, &fx.files[0].1, crc32(&fx.files[0].1))
+        .unwrap();
+    session
+        .on_recovery_volume_arrived(&fx.vols[0], None)
+        .unwrap();
+    let (empty, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&[], &[])
+        .unwrap();
+    assert_eq!(empty.erasures, 1);
+    assert!(empty.files.is_empty() && hashes.is_empty());
+    let (report, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&[id], &targets)
+        .unwrap();
+    assert_eq!(report.erasures, 1);
+    assert!(report.repaired_slices.is_empty());
+    assert!(report.files[0].2);
+    assert_eq!(hashes.len(), 1);
+    assert_eq!(session.repair_phase_stats().target_bytes_written, 0);
+    assert!(!fx.dir.join(&fx.files[1].0).exists());
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn live_target_files_symlink_replacement_and_oversize_are_preserved() {
+    let fx = fixture("target-fds-symlink", &[777], 1024, 1, VolumeScheme::Single);
+    let session = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    session
+        .on_recovery_volume_arrived(&fx.vols[0], None)
+        .unwrap();
+    let targets = [admitted_target(&fx, 0, &vec![0x33; 778])];
+    let decoy = fx.dir.join("decoy");
+    std::fs::write(&decoy, b"do not alter").unwrap();
+    std::os::unix::fs::symlink(&decoy, fx.dir.join(&fx.files[0].0)).unwrap();
+    let (report, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&[targets[0].file_id], &targets)
+        .unwrap();
+    assert_eq!(report.repaired_slices.len(), 1);
+    assert!(!report.files[0].2);
+    assert!(hashes.is_empty());
+    let actual = std::fs::read(fx.dir.join("admitted-0")).unwrap();
+    assert_eq!(&actual[..777], &fx.files[0].1);
+    assert_eq!(actual[777], 0x33);
+    assert_eq!(std::fs::read(decoy).unwrap(), b"do not alter");
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+fn target_files_cancel_during_io(verify: bool) {
+    let tag = if verify {
+        "target-fds-cancel-verify"
+    } else {
+        "target-fds-cancel-decode"
+    };
+    let len = 8 << 20;
+    let fx = fixture(tag, &[len], len as u64, 1, VolumeScheme::Single);
+    let session = StreamingParSession::new(
+        &fx.set,
+        &fx.dir,
+        SessionOptions {
+            solve_threads: 1,
+            solve_mem_limit_bytes: 16 << 20,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    let targets = [admitted_target(
+        &fx,
+        0,
+        if verify { &fx.files[0].1 } else { &[] },
+    )];
+    let id = targets[0].file_id;
+    if verify {
+        session
+            .on_article_finished_memory_only(&id, 0, &fx.files[0].1, crc32(&fx.files[0].1))
+            .unwrap();
+    } else {
+        session
+            .on_recovery_volume_arrived(&fx.vols[0], None)
+            .unwrap();
+    }
+    let before: Vec<_> = session
+        .inner
+        .slots
+        .read()
+        .unwrap()
+        .iter()
+        .map(|s| s.lock().unwrap().data.clone())
+        .collect();
+    std::thread::scope(|scope| {
+        let op = scope
+            .spawn(|| session.repair_available_targets_with_files_and_hashes_now(&[id], &targets));
+        let reached = wait_until(|| {
+            if verify {
+                session.io_stats().target_verification_bytes_read > 0
+            } else {
+                session.repair_phase_stats().target_bytes_written > 0
+            }
+        });
+        session.cancel();
+        let result = op.join().unwrap();
+        assert!(reached, "operation never reached the requested I/O phase");
+        assert!(matches!(result, Err(RepairError::Cancelled)));
+    });
+    assert_eq!(session.repair_phase_stats().completed, 0);
+    let after: Vec<_> = session
+        .inner
+        .slots
+        .read()
+        .unwrap()
+        .iter()
+        .map(|s| s.lock().unwrap().data.clone())
+        .collect();
+    assert_eq!(before, after);
+    assert!(!fx.dir.join(&fx.files[0].0).exists());
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn live_target_files_cancel_during_decode_restores_syndromes() {
+    target_files_cancel_during_io(false);
+}
+
+#[test]
+fn live_target_files_cancel_during_verification_returns_no_receipts() {
+    target_files_cancel_during_io(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn live_target_files_clone_failure_and_one_transient_descriptor() {
+    const CHILD: &str = "PAR_TARGET_FD_LIMIT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("ulimit -n 96 || exit 90; exec \"$1\" --exact streaming::live_tests::control_tests::live_target_files_clone_failure_and_one_transient_descriptor --test-threads=1 --show-output")
+            .arg("par-target-fd-limit")
+            .arg(std::env::current_exe().unwrap())
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("descriptor-limit child stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(output.status.success());
+        assert!(stdout.contains("1 passed; 0 failed"));
+        return;
+    }
+    let fx = fixture(
+        "target-fds-limit",
+        &[777, 512],
+        1024,
+        1,
+        VolumeScheme::Single,
+    );
+    let session = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    let targets = [
+        admitted_target(&fx, 0, &fx.files[0].1),
+        admitted_target(&fx, 1, &fx.files[1].1),
+    ];
+    let ids = [targets[0].file_id, targets[1].file_id];
+    for (index, id) in ids.iter().enumerate() {
+        session
+            .on_article_finished_memory_only(id, 0, &fx.files[index].1, crc32(&fx.files[index].1))
+            .unwrap();
+    }
+    // Exhaust only this child's table; the caller-owned originals remain valid.
+    let mut fillers = Vec::new();
+    loop {
+        match File::open("/dev/null") {
+            Ok(file) => fillers.push(file),
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(24)); // EMFILE on supported Unix targets.
+                break;
+            }
+        }
+        assert!(
+            fillers.len() < 96,
+            "child descriptor limit was not installed"
+        );
+    }
+    let (report, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&ids, &targets)
+        .unwrap();
+    assert!(report.files.iter().all(|(_, _, ok)| !ok));
+    assert!(hashes.is_empty());
+    assert_eq!(session.io_stats().target_verification_bytes_read, 0);
+    drop(fillers.pop().unwrap());
+    // With just one free FD, every sequential target still hashes successfully.
+    let (report, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&ids, &targets)
+        .unwrap();
+    assert!(report.files.iter().all(|(_, _, ok)| *ok));
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(session.io_stats().target_verification_bytes_read, 1289);
+    assert_eq!(session.repair_phase_stats().target_bytes_written, 0);
+    drop(fillers);
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}

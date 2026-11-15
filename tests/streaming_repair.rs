@@ -190,3 +190,57 @@ fn out_of_order_yenc_streaming_with_early_cutoff() {
         assert_eq!(*d, expect_slice(*g));
     }
 }
+
+/// External callers retain the actual file after session drop, even when its
+/// original path is absent. Also checks the crate-root public type export.
+#[test]
+fn caller_owned_target_file_hashes_survive_session_drop() {
+    use par_rs::packet::{ScanOptions, load_par2_bytes};
+    use par_rs::{RepairTargetFile, SessionOptions, StreamingParSession};
+    use std::io::{Read, Seek, SeekFrom};
+    let bytes = data(777, 17);
+    let built = build_set(
+        "fd",
+        &[("target.bin", &bytes)],
+        &SetOptions {
+            slice_size: 1024,
+            recovery_blocks: 1,
+            volumes: VolumeScheme::Single,
+            ..SetOptions::default()
+        },
+    )
+    .unwrap();
+    let set = load_par2_bytes(&built.index, ScanOptions::FULL).unwrap();
+    let id = *set.file_descs.keys().next().unwrap();
+    let root = std::env::temp_dir().join(format!("par-public-target-fd-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let admitted = root.join("admitted.bin");
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&admitted)
+        .unwrap();
+    let targets = [RepairTargetFile { file_id: id, file }];
+    let session = StreamingParSession::new(&set, &root, SessionOptions::default()).unwrap();
+    let recovery = root.join("recovery.par2");
+    std::fs::write(&recovery, &built.volumes[0].1).unwrap();
+    session.on_recovery_volume_arrived(&recovery, None).unwrap();
+    let (report, hashes) = session
+        .repair_available_targets_with_files_and_hashes_now(&[id, id], &targets)
+        .unwrap();
+    assert_eq!(report.repaired_slices.len(), 1);
+    assert_eq!(report.files.len(), 2);
+    assert!(report.files.iter().all(|(_, _, ok)| *ok));
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(hashes[0].1.len, 777);
+    assert_eq!(hashes[0].1.crc32, crc32fast::hash(&bytes));
+    drop(session);
+    let mut retained = targets[0].file.try_clone().unwrap();
+    retained.seek(SeekFrom::Start(0)).unwrap();
+    let mut actual = Vec::new();
+    retained.read_to_end(&mut actual).unwrap();
+    assert_eq!(actual, bytes);
+    assert!(!root.join("target.bin").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
