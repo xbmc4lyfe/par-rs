@@ -755,3 +755,176 @@ fn live_repair_phase_stats_count_cancelled_attempts_without_writes() {
     assert!(phases.total_ns > 0);
     std::fs::remove_dir_all(&fx.dir).unwrap();
 }
+
+// Change bytes while preserving CRC32, so backfill must also check IFSC MD5.
+fn different_bytes_with_same_crc(data: &[u8]) -> Vec<u8> {
+    assert!(data.len() >= 5);
+    let mut changed = data.to_vec();
+    changed[0] ^= 1;
+    let tail = changed.len() - 4;
+    changed[tail..].fill(0);
+    let base = crc32(&changed);
+    let mut basis = [(0u32, 0u32); 32];
+    for bit in 0..32 {
+        changed[tail + bit / 8] ^= 1 << (bit % 8);
+        let mut value = crc32(&changed) ^ base;
+        changed[tail + bit / 8] ^= 1 << (bit % 8);
+        let mut patch = 1u32 << bit;
+        while value != 0 {
+            let pivot = (31 - value.leading_zeros()) as usize;
+            if basis[pivot].0 == 0 {
+                basis[pivot] = (value, patch);
+                break;
+            }
+            value ^= basis[pivot].0;
+            patch ^= basis[pivot].1;
+        }
+    }
+    let mut delta = crc32(data) ^ base;
+    let mut patch = 0u32;
+    while delta != 0 {
+        let pivot = (31 - delta.leading_zeros()) as usize;
+        assert_ne!(basis[pivot].0, 0);
+        delta ^= basis[pivot].0;
+        patch ^= basis[pivot].1;
+    }
+    changed[tail..].copy_from_slice(&patch.to_le_bytes());
+    assert_ne!(changed, data);
+    assert_eq!(crc32(&changed), crc32(data));
+    changed
+}
+
+fn late_backfill_refuses_stale_disk_then_retries(mode: &str) {
+    let fx = fixture(
+        &format!("authenticated-backfill-{mode}"),
+        &[2049, 777, 1000],
+        1024,
+        5,
+        VolumeScheme::Uniform(1),
+    );
+    let session = StreamingParSession::new(
+        &fx.set,
+        &fx.dir,
+        SessionOptions {
+            preallocated_syndrome_slots: 4,
+            max_syndrome_slots: 5,
+            fold_threads: 0,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    let late = fx
+        .vols
+        .iter()
+        .find(|path| {
+            load_par2_file(path, ScanOptions::FULL)
+                .unwrap()
+                .recovery
+                .contains_key(&4)
+        })
+        .unwrap();
+    let known = &fx.files[..2];
+    // Ensure at least one original row is successfully backfilled before refusal.
+    let stale = known
+        .iter()
+        .max_by_key(|(name, _)| {
+            session.inner.files[session.inner.file_index[&fid(&fx, name)]].first_slice
+        })
+        .unwrap();
+    for (name, data) in known {
+        let id = fid(&fx, name);
+        for (index, chunk) in data.chunks(1024).enumerate() {
+            session
+                .on_article_finished_memory_only(&id, (index * 1024) as u64, chunk, crc32(chunk))
+                .unwrap();
+        }
+        std::fs::write(fx.dir.join(name), data).unwrap();
+    }
+    assert_eq!(session.io_stats().source_bytes_read, 0);
+    let stale_path = fx.dir.join(&stale.0);
+    let stale_id = fid(&fx, &stale.0);
+    let stale_global = session.inner.files[session.inner.file_index[&stale_id]].first_slice;
+    match mode {
+        "sparse" => {
+            let file = std::fs::File::create(&stale_path).unwrap();
+            file.set_len(stale.1.len() as u64).unwrap();
+        }
+        "same-crc" => {
+            let mut bad = stale.1.clone();
+            let size = bad.len().min(1024);
+            bad[..size].copy_from_slice(&different_bytes_with_same_crc(&stale.1[..size]));
+            std::fs::write(&stale_path, bad).unwrap();
+        }
+        "truncated" => {
+            std::fs::File::create(&stale_path).unwrap();
+        }
+        _ => unreachable!(),
+    }
+    let (target_name, target_data) = &fx.files[2];
+    let target_id = fid(&fx, target_name);
+    let target = fx.dir.join(target_name);
+    let untouched = vec![0; target_data.len()];
+    std::fs::write(&target, &untouched).unwrap();
+    session
+        .on_article_failed_permanently(&target_id, 0, target_data.len() as u64)
+        .unwrap();
+    assert!(
+        session.on_recovery_volume_arrived(late, None).is_err(),
+        "stale source must not seed the fifth exponent"
+    );
+    let fifth = session
+        .inner
+        .slots
+        .read()
+        .unwrap()
+        .iter()
+        .find(|slot| slot.lock().unwrap().exponent == 4)
+        .unwrap()
+        .clone();
+    assert!(!fifth.lock().unwrap().folded_mask.get(stale_global));
+    assert!(fifth.lock().unwrap().folded_mask.count_ones() > 0);
+    assert!(session.repair_available_targets_now(&[target_id]).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), untouched);
+    assert_eq!(session.repair_phase_stats().target_bytes_written, 0);
+    // The real cache/committed writer eventually supplies the original bytes.
+    std::fs::write(&stale_path, &stale.1).unwrap();
+    let before = session.io_stats().backfill_bytes_read;
+    assert_eq!(session.on_recovery_volume_arrived(late, None).unwrap(), 0);
+    assert_eq!(
+        session.io_stats().backfill_bytes_read - before,
+        stale.1.len() as u64,
+        "deduplication must retry missing rows with exactly one source read"
+    );
+    assert!(fifth.lock().unwrap().folded_mask.get(stale_global));
+    let complete = fifth.lock().unwrap().data.clone();
+    let after = session.io_stats().backfill_bytes_read;
+    assert_eq!(session.on_recovery_volume_arrived(late, None).unwrap(), 0);
+    assert_eq!(session.io_stats().backfill_bytes_read, after);
+    assert_eq!(
+        fifth.lock().unwrap().data,
+        complete,
+        "successful rows must not be XORed twice"
+    );
+    // Exponent four is the only available recovery row: a good result proves its backfill.
+    assert_eq!(session.status().ready_recovery, 1);
+    let report = session.repair_available_targets_now(&[target_id]).unwrap();
+    assert_eq!(report.repaired_slices, vec![(target_id, 0)]);
+    assert!(report.files.iter().all(|(_, _, valid)| *valid));
+    assert_eq!(std::fs::read(&target).unwrap(), *target_data);
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn late_backfill_rejects_sparse_uncommitted_source_then_retries() {
+    late_backfill_refuses_stale_disk_then_retries("sparse");
+}
+
+#[test]
+fn late_backfill_checks_md5_even_when_crc_matches() {
+    late_backfill_refuses_stale_disk_then_retries("same-crc");
+}
+
+#[test]
+fn late_backfill_rejects_short_source_then_retries() {
+    late_backfill_refuses_stale_disk_then_retries("truncated");
+}

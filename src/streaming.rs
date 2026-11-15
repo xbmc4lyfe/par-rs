@@ -1445,7 +1445,7 @@ use crate::filenames::select_more_pars;
 use crate::packet::{FileId, PacketSet, ScanOptions, SetId};
 use crate::reed_solomon::{Engine, EngineConfig, InputKind, InputSpec, Matrix, OutputSink};
 use crate::repairer::{RepairReader, SliceSrc};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 
 /// State of one PAR2 slice during a live download.
@@ -1846,6 +1846,7 @@ struct SessionInner {
     logs: Vec<u16>,
     tracker: Mutex<Tracker>,
     slots: SlotList,
+    needs_backfill: AtomicBool,
     pool: Option<FoldPool>,
     /// Slices folded (counter for statistics).
     folds: AtomicU64,
@@ -2094,6 +2095,7 @@ impl StreamingParSession {
             file_index,
             logs,
             slots,
+            needs_backfill: AtomicBool::new(false),
             pool,
             folds: AtomicU64::new(0),
             inline_folds: AtomicUsize::new(0),
@@ -2892,7 +2894,8 @@ impl StreamingParSession {
 
     /// Bring every slot's `folded_mask` up to date with the verified slices by re-reading the
     /// missing ones from the target files (needed for slots allocated after slices were
-    /// verified and evicted from RAM).
+    /// verified and evicted from RAM). Every reread is authenticated against IFSC again;
+    /// a pending cache commit or source change must never seed a new syndrome.
     fn backfill_slots(&self) -> Result<(), RepairError> {
         self.inner.control.ensure_running()?;
         self.flush();
@@ -2946,6 +2949,8 @@ impl StreamingParSession {
             fold_lane(&self.inner.opts.kernel, &self.inner.slots, &job, 0, 1);
             self.inner.control.ensure_running()?;
         }
+        self.inner.control.ensure_running()?;
+        self.inner.needs_backfill.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -2972,7 +2977,19 @@ impl StreamingParSession {
                 .control
                 .io_error(format!("reading {}", f.target_path.display()), e)
         })?;
-        Ok(buf)
+        // Preserve the original logical read class: authentication consumes this
+        // same buffer and performs no second source read. Short final slices use
+        // exactly the normal IFSC zero-padding, CRC32, and MD5 rules.
+        self.verify_slice_bytes(fi, g - f.first_slice, Some(buf), None)?
+            .ok_or_else(|| {
+                io_ctx(format!(
+                    "authenticating backfill {} at {off}",
+                    f.target_path.display()
+                ))(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "backfill slice does not match IFSC",
+                ))
+            })
     }
 
     /// A recovery volume finished downloading: verify its recovery packets and XOR each
@@ -3008,7 +3025,6 @@ impl StreamingParSession {
         })?;
         let ss = self.inner.slice_size;
         let mut absorbed = 0usize;
-        let mut need_backfill = false;
         // Keep every framed candidate until its hash is known. PacketSet would
         // deduplicate exponents before a corrupt candidate can be rejected.
         let mut packets = crate::packet::PacketIter::new(&src, ScanOptions::METADATA);
@@ -3091,7 +3107,7 @@ impl StreamingParSession {
                         recovery_added: false,
                     }));
                     list.push(Arc::clone(&s));
-                    need_backfill = true;
+                    self.inner.needs_backfill.store(true, Ordering::Release);
                     s
                 }
             };
@@ -3127,7 +3143,9 @@ impl StreamingParSession {
                 }
             }
         }
-        if need_backfill {
+        // A failed read/authentication leaves missing rows and must be retried
+        // even when all recovery packets in this arrival are already absorbed.
+        if self.inner.needs_backfill.load(Ordering::Acquire) {
             self.backfill_slots()?;
         }
         Ok(absorbed)

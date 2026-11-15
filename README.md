@@ -236,6 +236,13 @@ the writer thread (with a `crc32_combine` pre-check over article CRCs), folding 
 syndrome slot plus an optional bounded folder pool (full queue ⇒ inline fold, never blocking the
 writer), and each slot keeps a `folded_mask` bitset so slots allocated when a late volume arrives
 are back-filled from disk for exactly the slices they lack.
+Each reread must pass IFSC CRC32 and MD5 before that buffer enters a new
+syndrome. Stale, corrupt, or incomplete disk bytes refuse backfill without marking
+that row folded. Once the original bytes are committed, the same recovery
+volume can retry missing rows even when its parity packets were already absorbed;
+completed rows are not added twice. This authenticates the reread itself and does
+not flush an external downloader cache. Source writers still require caller
+coordination.
 
 Use `session.io_stats()` to distinguish verified RAM input, source verification
 reads, late-exponent backfill, recovery-file reads, and repaired-target hash reads.
