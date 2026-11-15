@@ -145,6 +145,8 @@ pub struct ParRenamer {
     file_count: usize,
     /// Directories still to be processed after the current one (scanned later).
     pending_dirs: Vec<PathBuf>,
+    /// Directories already reported as unreadable (warned about once).
+    unreadable_dirs: Vec<PathBuf>,
 }
 
 impl ParRenamer {
@@ -161,6 +163,7 @@ impl ParRenamer {
             cur_file: 0,
             file_count: 0,
             pending_dirs: Vec::new(),
+            unreadable_dirs: Vec::new(),
         }
     }
 
@@ -183,12 +186,17 @@ impl ParRenamer {
     /// progress are still renamed to `*.bad` (as nzbget does), so data and par2 names stay
     /// consistent. Missing files are not reported for an interrupted directory. The report
     /// covers the work done so far, including that directory's loaded and bad par2 files.
+    ///
+    /// A directory that cannot be listed (the destination included: missing, no permission,
+    /// removed mid-run) produces one `Warning("Could not read directory …")` and is treated
+    /// as empty, so the run carries on and returns `Ok`; the `io::Result` is kept for API
+    /// compatibility.
     pub fn run_with_stop(
         mut self,
         stopped: &mut dyn FnMut() -> bool,
         events: &mut dyn FnMut(RenamerEvent),
     ) -> io::Result<RenamerReport> {
-        let dirs = self.build_dir_list(stopped)?;
+        let dirs = self.build_dir_list(stopped, events);
         for (i, dir) in dirs.iter().enumerate() {
             if stopped() {
                 break;
@@ -199,7 +207,7 @@ impl ParRenamer {
             self.par_infos.clear();
             self.bad_pars.clear();
             self.loaded_pars.clear();
-            self.check_files(&dir, true, stopped, events)?;
+            self.check_files(&dir, true, stopped, events);
             let mut stop = stopped();
             if !stop {
                 self.rename_par_files(&dir, events);
@@ -210,7 +218,7 @@ impl ParRenamer {
                 stop = stopped();
             }
             if !stop {
-                self.check_files(&dir, false, stopped, events)?;
+                self.check_files(&dir, false, stopped, events);
                 stop = stopped();
             }
             if !stop && self.options.detect_missing {
@@ -228,16 +236,39 @@ impl ParRenamer {
         Ok(self.report)
     }
 
+    /// Sorted entries of `dir`. A directory that cannot be listed (missing, no permission,
+    /// removed mid-run) is treated as empty after one warning, as nzbget does, so it never
+    /// aborts the run.
+    fn list_dir(&mut self, dir: &Path, events: &mut dyn FnMut(RenamerEvent)) -> Vec<PathBuf> {
+        match sorted_entries(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if !self.unreadable_dirs.iter().any(|d| d == dir) {
+                    events(RenamerEvent::Warning(format!(
+                        "Could not read directory {}: {e}",
+                        dir.display()
+                    )));
+                    self.unreadable_dirs.push(dir.to_path_buf());
+                }
+                Vec::new()
+            }
+        }
+    }
+
     /// Destination directory and all sub-directories (recursively); also counts files.
-    fn build_dir_list(&mut self, stopped: &mut dyn FnMut() -> bool) -> io::Result<Vec<PathBuf>> {
+    fn build_dir_list(
+        &mut self,
+        stopped: &mut dyn FnMut() -> bool,
+        events: &mut dyn FnMut(RenamerEvent),
+    ) -> Vec<PathBuf> {
         let mut dirs = vec![self.dest_dir.clone()];
         let mut i = 0;
         while i < dirs.len() {
             let dir = dirs[i].clone();
             i += 1;
-            for entry in sorted_entries(&dir)? {
+            for entry in self.list_dir(&dir, events) {
                 if stopped() {
-                    return Ok(dirs);
+                    return dirs;
                 }
                 if entry.is_dir() {
                     dirs.push(entry);
@@ -247,7 +278,7 @@ impl ParRenamer {
                 }
             }
         }
-        Ok(dirs)
+        dirs
     }
 
     fn check_files(
@@ -256,8 +287,8 @@ impl ParRenamer {
         check_pars: bool,
         stopped: &mut dyn FnMut() -> bool,
         events: &mut dyn FnMut(RenamerEvent),
-    ) -> io::Result<()> {
-        for path in sorted_entries(dir)? {
+    ) {
+        for path in self.list_dir(dir, events) {
             if stopped() {
                 break;
             }
@@ -278,7 +309,6 @@ impl ParRenamer {
                 self.check_regular_file(dir, &path, events);
             }
         }
-        Ok(())
     }
 
     /// Identify par2 files by their first packet header.
@@ -372,9 +402,7 @@ impl ParRenamer {
         stopped: &mut dyn FnMut() -> bool,
         events: &mut dyn FnMut(RenamerEvent),
     ) {
-        let Ok(entries) = sorted_entries(dir) else {
-            return;
-        };
+        let entries = self.list_dir(dir, events);
         // Use the current (possibly just renamed) names.
         let names: Vec<Vec<u8>> = entries
             .iter()
@@ -400,9 +428,7 @@ impl ParRenamer {
         stopped: &mut dyn FnMut() -> bool,
         events: &mut dyn FnMut(RenamerEvent),
     ) {
-        let Ok(entries) = sorted_entries(dir) else {
-            return;
-        };
+        let entries = self.list_dir(dir, events);
         for p in entries.iter().filter(|p| !p.is_dir()) {
             if stopped() {
                 break;
@@ -1055,11 +1081,21 @@ mod tests {
             .run(Some(&cancel), &mut |_| {})
             .unwrap();
         assert_eq!(rep.renamed_count(), 0);
-        // Missing directory is an error.
-        assert!(
-            ParRenamer::new(dir.join("nope"), RenamerOptions::default())
-                .run(None, &mut |_| {})
-                .is_err()
+        // Missing directory: one warning, empty report.
+        let mut events = Vec::new();
+        let rep = ParRenamer::new(dir.join("nope"), RenamerOptions::default())
+            .run(None, &mut |e| events.push(e))
+            .unwrap();
+        assert_eq!(rep.renamed_count(), 0);
+        assert!(rep.missing.is_empty() && rep.loaded_par_files.is_empty());
+        assert!(!rep.has_damaged_par_files && !rep.has_missed_files);
+        assert_eq!(
+            events,
+            vec![RenamerEvent::Warning(format!(
+                "Could not read directory {}: {}",
+                dir.join("nope").display(),
+                std::fs::read_dir(dir.join("nope")).unwrap_err()
+            ))]
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1359,6 +1395,51 @@ mod tests {
         );
         // The total is raised when the file moves, not clamped up one check at a time.
         assert_eq!(&progress[6..], &[(6, 8), (7, 8)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subdirectory_does_not_abort_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("unreadable");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("inside"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Running as root: permissions are not enforced, nothing to test.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        let a = rnd(6_000, 81);
+        let (bytes, _) =
+            create_in_memory(&[(b"real.bin", &a)], 1024, &[], Kernel::detect()).unwrap();
+        std::fs::write(dir.join("set.par2"), &bytes).unwrap();
+        std::fs::write(dir.join("obf"), &a).unwrap();
+        let mut events = Vec::new();
+        let rep = ParRenamer::new(
+            &dir,
+            RenamerOptions {
+                detect_missing: true,
+                ..Default::default()
+            },
+        )
+        .run(None, &mut |e| events.push(e));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rep = rep.unwrap();
+        assert_eq!(rep.renamed, vec![(dir.join("obf"), dir.join("real.bin"))]);
+        assert!(!rep.has_missed_files);
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, RenamerEvent::Warning(m) if m.starts_with("Could not read directory")))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{events:?}");
+        assert!(
+            matches!(warnings[0], RenamerEvent::Warning(m) if m.contains(&locked.display().to_string()))
+        );
+        assert!(!events.iter().any(|e| matches!(e, RenamerEvent::Error(_))));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

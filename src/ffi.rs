@@ -756,7 +756,8 @@ pub unsafe extern "C" fn nzbpar_parse_par_filename(
     }
 }
 
-/// Run the par-renamer on `dir`. Returns the number of renames or -1 on error.
+/// Run the par-renamer on `dir`. Returns the number of renames or -1 on error, including
+/// when `dir` itself cannot be listed (unreadable sub-directories are only warned about).
 ///
 /// # Safety
 /// `dir` NUL-terminated; `message` callback optional.
@@ -771,6 +772,10 @@ pub unsafe extern "C" fn nzbpar_rename_dir(
     let Some(d) = cstr_to_path(dir) else {
         return -1;
     };
+    // The Rust API treats an unreadable destination as empty; the C contract reports it.
+    if std::fs::read_dir(&d).is_err() {
+        return -1;
+    }
     let opts = crate::renamer::RenamerOptions {
         detect_missing: detect_missing != 0,
         dry_run: dry_run != 0,
