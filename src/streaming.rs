@@ -1636,12 +1636,15 @@ const MAX_SYNDROME_SLOTS: usize = 65535;
 pub struct SessionOptions {
     /// Syndrome slots allocated up front (exponents from the loaded set or canonical `0..n`).
     pub preallocated_syndrome_slots: usize,
-    /// Byte cap for resident syndrome payloads and reconstructed output payloads separately.
+    /// Byte cap for resident syndrome payloads and reconstructed output payloads separately,
+    /// at session start. [`StreamingParSession::set_max_syndrome_slots`] may raise the slot
+    /// count past it later; that caller budgets the extra memory.
     pub max_syndrome_bytes: u64,
     /// Byte cap applied separately to staging, folding payloads, and per-call scratch.
     /// Concurrent calls and queued jobs share bounded admission; metadata and engine buffers are additional.
     pub max_working_bytes: u64,
-    /// Hard cap on slots, also limited by `max_syndrome_bytes / slice_size`.
+    /// Starting cap on slots, also limited by `max_syndrome_bytes / slice_size`.
+    /// [`StreamingParSession::set_max_syndrome_slots`] changes it at runtime.
     pub max_syndrome_slots: usize,
     /// Memory for in-RAM slice reassembly before falling back to reading the target file.
     pub max_staging_bytes: u64,
@@ -3203,7 +3206,8 @@ impl StreamingParSession {
     /// syndromes are kept) and at most what the slice metadata budget
     /// (`max_working_bytes`) and the 16-bit exponent space allow.
     ///
-    /// Raising the cap absorbs again every arrived recovery volume whose valid
+    /// Whenever the cap leaves room for more slots (a raise, or a retry after an
+    /// error), it absorbs again every arrived recovery volume whose valid
     /// recovery slices were turned away because the cap was full, and back-fills
     /// the new syndromes from the verified source slices already on disk (each
     /// reread is authenticated against IFSC). Lowering it only stops further
@@ -3215,7 +3219,7 @@ impl StreamingParSession {
     /// from the source files fails. The new cap stays in effect on error.
     pub fn set_max_syndrome_slots(&self, slots: usize) -> Result<usize, RepairError> {
         self.inner.control.ensure_running()?;
-        let (cap, raised) = {
+        let (cap, room) = {
             // The exclusive payload gate keeps the allocated slot count stable.
             let _payload = self
                 .inner
@@ -3229,10 +3233,14 @@ impl StreamingParSession {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len();
             let cap = slots.min(self.inner.slot_limit).max(allocated);
-            let old = self.inner.max_slots.swap(cap, Ordering::AcqRel);
-            (cap, cap > old)
+            self.inner.max_slots.store(cap, Ordering::Release);
+            (cap, cap > allocated)
         };
-        if raised {
+        // Retry turned-away volumes whenever there is room, not only on a raise,
+        // so a failed re-absorb can be retried at the same cap. A failing
+        // volume does not block the others; the first error is returned.
+        let mut first_error = None;
+        if room {
             let rejected = std::mem::take(
                 &mut *self
                     .inner
@@ -3240,22 +3248,26 @@ impl StreamingParSession {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
-            for (i, path) in rejected.iter().enumerate() {
+            for path in &rejected {
                 if let Err(e) = self.absorb_recovery_volume(path, None) {
-                    // Keep the rest for the next raise.
                     let mut list = self
                         .inner
                         .cap_rejected
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for p in &rejected[i..] {
-                        if !list.contains(p) {
-                            list.push(p.clone());
-                        }
+                    if !list.contains(path) {
+                        list.push(path.clone());
                     }
-                    return Err(e);
+                    drop(list);
+                    if matches!(e, RepairError::Cancelled) {
+                        return Err(e);
+                    }
+                    first_error.get_or_insert(e);
                 }
             }
+        }
+        if let Some(e) = first_error {
+            return Err(e);
         }
         self.inner.control.ensure_running()?;
         Ok(cap)
@@ -5178,7 +5190,17 @@ mod live_tests {
         ));
         // Lowering below the allocated slots keeps them.
         assert_eq!(s.set_max_syndrome_slots(0).unwrap(), 2);
-        // Raise: 3 more slices come from the already arrived volume.
+        // A turned-away volume that cannot be read keeps the raised cap and is
+        // retried by the next call at the same cap.
+        let moved = fx.dir.join("moved.par2");
+        std::fs::rename(&fx.vols[0], &moved).unwrap();
+        assert!(matches!(
+            s.set_max_syndrome_slots(5),
+            Err(RepairError::Io { .. })
+        ));
+        assert_eq!(s.max_syndrome_slots(), 5);
+        std::fs::rename(&moved, &fx.vols[0]).unwrap();
+        // 3 more slices come from the already arrived volume.
         assert_eq!(s.set_max_syndrome_slots(5).unwrap(), 5);
         let st = s.status();
         assert_eq!(st.syndrome_slots, 5);
