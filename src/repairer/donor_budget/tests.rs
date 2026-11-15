@@ -576,3 +576,67 @@ fn locked_seek_read_equivalent_is_checked_on_the_native_test_host() {
     assert_eq!(budget.charged_bytes(), 5);
     std::fs::remove_dir_all(dir).unwrap();
 }
+#[test]
+fn error_messages_sources_and_budget_accessors() {
+    let limit = DonorReadError::Limit {
+        scope: DonorReadScope::PerCall,
+        limit_bytes: 10,
+        charged_bytes: 8,
+        request_bytes: 4,
+    };
+    assert_eq!(
+        limit.to_string(),
+        "PerCall donor requested-byte limit 10: 8 charged, next request 4"
+    );
+    assert!(std::error::Error::source(&limit).is_none());
+    let overflow = DonorReadError::CounterOverflow {
+        counter: "aggregate donor counter",
+        value: 7,
+        request_bytes: 3,
+    };
+    assert_eq!(
+        overflow.to_string(),
+        "aggregate donor counter overflow adding 3 requested bytes to 7"
+    );
+    assert!(std::error::Error::source(&overflow).is_none());
+    let repair = DonorReadError::Repair(RepairError::Cancelled);
+    assert_eq!(repair.to_string(), RepairError::Cancelled.to_string());
+    assert!(std::error::Error::source(&repair).is_some());
+
+    let budget = DonorReadBudget::new(100);
+    assert_eq!(
+        (
+            budget.limit_bytes(),
+            budget.charged_bytes(),
+            budget.remaining_bytes()
+        ),
+        (100, 0, 100)
+    );
+}
+
+#[test]
+fn primitive_claiming_more_bytes_than_requested_is_invalid_data() {
+    struct Overlong;
+    impl Primitive for Overlong {
+        fn len(&self) -> u64 {
+            64
+        }
+        fn read_once(&self, _offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            Ok(buf.len() + 1)
+        }
+    }
+    let cancel = AtomicBool::new(false);
+    let mut budget = DonorReadBudget::new(1000);
+    let source = Metered::new(Overlong, &mut budget, None, &cancel);
+    assert!(source.read_at(0, &mut [0; 8]).is_err());
+    let error = source.resolve(Ok(())).unwrap_err();
+    assert!(
+        error.to_string().contains("more bytes than requested"),
+        "{error}"
+    );
+    assert!(matches!(
+        error,
+        DonorReadError::Repair(RepairError::Io { ref source, .. })
+            if source.kind() == io::ErrorKind::InvalidData
+    ));
+}
