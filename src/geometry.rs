@@ -335,7 +335,7 @@ fn aligned_slice(
 /// bytes, checked against the metadata budget before allocation. Borrowed input,
 /// stack objects, allocator rounding and other calls are outside that promise.
 /// Aligned scans allocate nothing; key sorting is allocation-free. Construction
-/// is O(F log F) plus O(F `log(max_slice_bytes` / alignment)) for aligned selection.
+/// is O(F log F) plus `O(F log(max_slice_bytes / alignment))` for aligned selection.
 ///
 /// Creation-scheme rules, first-exponent validation and recovery layouts remain
 /// separate: compose the creator's checked APIs without treating numeric source
