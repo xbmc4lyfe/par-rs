@@ -63,7 +63,7 @@ use crate::repairer::{
 use crate::scanner::{BlockRef, ChecksumEntry, entries_for_file};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 mod control;
@@ -1546,6 +1546,35 @@ pub struct EarlyRepairReport {
     pub files: Vec<(FileId, VolumeStatus, bool)>,
 }
 
+/// A caller-owned repair target, retained by the caller through publication.
+///
+/// Supply a readable, writable, non-append regular file. The caller establishes
+/// root/no-follow authority and rejects physical aliases between distinct IDs;
+/// PAR checks the batch mapping and file type, not filesystem ownership.
+/// Neither the caller nor its clones may seek, read, write or resize this file
+/// during repair. Temporary clones share its cursor, which is not restored.
+pub struct RepairTargetFile {
+    /// File in the PAR2 set.
+    pub file_id: FileId,
+    /// The actual admitted read/write, non-append file.
+    pub file: File,
+}
+
+// Own legacy pathname outputs, but borrow admitted outputs without extra FDs.
+enum RepairOutputFile<'a> {
+    Opened(File),
+    Admitted(&'a File),
+}
+
+impl RepairOutputFile<'_> {
+    fn file(&self) -> &File {
+        match self {
+            Self::Opened(file) => file,
+            Self::Admitted(file) => file,
+        }
+    }
+}
+
 /// Live counters.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LiveStatus {
@@ -2896,7 +2925,10 @@ impl StreamingParSession {
     /// missing ones from the target files (needed for slots allocated after slices were
     /// verified and evicted from RAM). Every reread is authenticated against IFSC again;
     /// a pending cache commit or source change must never seed a new syndrome.
-    fn backfill_slots(&self) -> Result<(), RepairError> {
+    fn backfill_slots(
+        &self,
+        target_files: Option<&HashMap<usize, &File>>,
+    ) -> Result<(), RepairError> {
         self.inner.control.ensure_running()?;
         self.flush();
         self.inner.control.ensure_running()?;
@@ -2927,7 +2959,7 @@ impl StreamingParSession {
             if needs.is_empty() {
                 continue;
             }
-            let data = self.read_slice_from_disk(g)?;
+            let data = self.read_slice_from_disk(g, target_files)?;
             let mut split = vec![0u8; ss];
             {
                 let (lo, hi) = split.split_at_mut(ss / 2);
@@ -2954,7 +2986,11 @@ impl StreamingParSession {
         Ok(())
     }
 
-    fn read_slice_from_disk(&self, g: usize) -> Result<Vec<u8>, RepairError> {
+    fn read_slice_from_disk(
+        &self,
+        g: usize,
+        target_files: Option<&HashMap<usize, &File>>,
+    ) -> Result<Vec<u8>, RepairError> {
         let fi = self
             .inner
             .files
@@ -2965,12 +3001,17 @@ impl StreamingParSession {
         let ss = self.inner.slice_size as u64;
         let off = (g - f.first_slice) as u64 * ss;
         let len = (f.length - off).min(ss) as usize;
-        let fh = CountedFile::open(&f.target_path, &self.inner.control, IoClass::Backfill)
-            .map_err(|e| {
-                self.inner
-                    .control
-                    .io_error(format!("opening {}", f.target_path.display()), e)
-            })?;
+        let fh = match target_files.and_then(|files| files.get(&fi)) {
+            Some(file) => file.try_clone().and_then(|file| {
+                CountedFile::from_file(file, &self.inner.control, IoClass::Backfill)
+            }),
+            None => CountedFile::open(&f.target_path, &self.inner.control, IoClass::Backfill),
+        }
+        .map_err(|e| {
+            self.inner
+                .control
+                .io_error(format!("opening {}", f.target_path.display()), e)
+        })?;
         let mut buf = vec![0u8; len];
         fh.read_at(off, &mut buf).map_err(|e| {
             self.inner
@@ -3146,7 +3187,7 @@ impl StreamingParSession {
         // A failed read/authentication leaves missing rows and must be retried
         // even when all recovery packets in this arrival are already absorbed.
         if self.inner.needs_backfill.load(Ordering::Acquire) {
-            self.backfill_slots()?;
+            self.backfill_slots(None)?;
         }
         Ok(absorbed)
     }
@@ -3284,7 +3325,7 @@ impl StreamingParSession {
         &self,
         target_file_ids: &[FileId],
     ) -> Result<EarlyRepairReport, RepairError> {
-        self.repair_targets_timed(target_file_ids, &mut None)
+        self.repair_targets_timed(target_file_ids, None, &mut None)
     }
 
     /// Repairs targets and returns the hashes from their required verification read.
@@ -3298,13 +3339,87 @@ impl StreamingParSession {
         target_file_ids: &[FileId],
     ) -> Result<(EarlyRepairReport, Vec<(FileId, crate::hasher::FileHashes)>), RepairError> {
         let mut hashes = Some(Vec::new());
-        let report = self.repair_targets_timed(target_file_ids, &mut hashes)?;
+        let report = self.repair_targets_timed(target_file_ids, None, &mut hashes)?;
         Ok((report, hashes.unwrap()))
+    }
+
+    /// Repairs caller-admitted files and returns their verified whole-file hashes.
+    ///
+    /// Supply exactly one binding per distinct requested ID, including complete
+    /// and empty files; repeated requested IDs retain report/hash multiplicity.
+    /// Unknown IDs, missing/extra/duplicate bindings and non-regular files are
+    /// rejected before backfill, sizing or writes. Empty requests need no bindings.
+    ///
+    /// Writes, whole-file verification and backfill of bound targets use these
+    /// actual files without reopening paths or creating directories. Backfill of
+    /// other sources retains the ordinary pathname behavior. Files needing writes
+    /// may grow but are never truncated; verify-only calls never resize files.
+    ///
+    /// See [`RepairTargetFile`] for caller ownership and cursor requirements. The
+    /// batch stays caller-owned on success and failure, with at most one transient
+    /// read clone. Keep descriptors, root authority and exclusive ownership through
+    /// publication, revalidating caller source/namespace authority as required.
+    /// Hash receipts require matching whole-file MD5 and actual length; a read
+    /// failure yields `ok = false`. Cancellation or other errors return no hashes
+    /// and can leave partial writes. This is not transactional or a filesystem
+    /// snapshot, and it does not exclude external writers.
+    pub fn repair_available_targets_with_files_and_hashes_now(
+        &self,
+        target_file_ids: &[FileId],
+        target_files: &[RepairTargetFile],
+    ) -> Result<(EarlyRepairReport, Vec<(FileId, crate::hasher::FileHashes)>), RepairError> {
+        let mut hashes = Some(Vec::new());
+        let report = self.repair_targets_timed(target_file_ids, Some(target_files), &mut hashes)?;
+        Ok((report, hashes.unwrap()))
+    }
+
+    fn admit_target_files<'a>(
+        &self,
+        target_file_ids: &[FileId],
+        target_files: &'a [RepairTargetFile],
+    ) -> Result<HashMap<usize, &'a File>, RepairError> {
+        let invalid = || {
+            io_ctx("repair target admission")(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected one regular file per requested target",
+            ))
+        };
+        if target_files.len() > self.inner.files.len() {
+            return Err(invalid());
+        }
+        let mut requested = BTreeSet::new();
+        for id in target_file_ids {
+            requested.insert(*self.inner.file_index.get(id).ok_or_else(invalid)?);
+        }
+        if requested.len() != target_files.len() {
+            return Err(invalid());
+        }
+        let mut admitted = HashMap::with_capacity(target_files.len());
+        for target in target_files {
+            let fi = *self
+                .inner
+                .file_index
+                .get(&target.file_id)
+                .ok_or_else(invalid)?;
+            if !requested.contains(&fi) || admitted.insert(fi, &target.file).is_some() {
+                return Err(invalid());
+            }
+            if !target
+                .file
+                .metadata()
+                .map_err(io_ctx("repair target metadata"))?
+                .is_file()
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(admitted)
     }
 
     fn repair_targets_timed(
         &self,
         target_file_ids: &[FileId],
+        target_files: Option<&[RepairTargetFile]>,
         hashes: &mut Option<Vec<(FileId, crate::hasher::FileHashes)>>,
     ) -> Result<EarlyRepairReport, RepairError> {
         let _total = self.inner.control.phase(RepairPhase::Total);
@@ -3312,7 +3427,7 @@ impl StreamingParSession {
             .control
             .repair_attempts
             .fetch_add(1, Ordering::Relaxed);
-        let result = self.repair_available_targets_inner(target_file_ids, hashes);
+        let result = self.repair_available_targets_inner(target_file_ids, target_files, hashes);
         if result.is_ok() {
             self.inner
                 .control
@@ -3325,6 +3440,7 @@ impl StreamingParSession {
     fn repair_available_targets_inner(
         &self,
         target_file_ids: &[FileId],
+        target_files: Option<&[RepairTargetFile]>,
         hashes: &mut Option<Vec<(FileId, crate::hasher::FileHashes)>>,
     ) -> Result<EarlyRepairReport, RepairError> {
         let wait = self.inner.control.phase(RepairPhase::PayloadWait);
@@ -3335,12 +3451,15 @@ impl StreamingParSession {
             .unwrap_or_else(|e| e.into_inner());
         drop(wait);
         self.inner.control.ensure_running()?;
+        let admitted = target_files
+            .map(|files| self.admit_target_files(target_file_ids, files))
+            .transpose()?;
         for id in target_file_ids {
             self.file(id)?;
         }
         {
             let _backfill = self.inner.control.phase(RepairPhase::Backfill);
-            self.backfill_slots()?;
+            self.backfill_slots(admitted.as_ref())?;
         }
         let ss = self.inner.slice_size;
         let (missing, present, ready_exps): (Vec<usize>, Vec<bool>, Vec<u32>) = {
@@ -3380,7 +3499,7 @@ impl StreamingParSession {
         };
         if rows.is_empty() || k == 0 {
             for id in target_file_ids {
-                let (st, ok) = self.check_target_timed(id, hashes)?;
+                let (st, ok) = self.check_target_timed(id, admitted.as_ref(), hashes)?;
                 report.files.push((*id, st, ok));
             }
             return Ok(report);
@@ -3458,7 +3577,7 @@ impl StreamingParSession {
         };
         // Outputs: rows → (file, offset, len); patch directly into the target files.
         let mut out_map: Vec<(usize, u64, u64)> = Vec::with_capacity(rows.len());
-        let mut targets: HashMap<usize, File> = HashMap::new();
+        let mut targets: HashMap<usize, RepairOutputFile<'_>> = HashMap::new();
         for &g in &rows {
             let fi = self
                 .inner
@@ -3468,22 +3587,29 @@ impl StreamingParSession {
                 .expect("slice belongs to a file");
             let f = &self.inner.files[fi];
             if let std::collections::hash_map::Entry::Vacant(slot) = targets.entry(fi) {
-                if let Some(p) = f.target_path.parent() {
-                    std::fs::create_dir_all(p)
-                        .map_err(io_ctx(format!("creating {}", p.display())))?;
-                }
-                let fh = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&f.target_path)
-                    .map_err(io_ctx(format!("opening {}", f.target_path.display())))?;
+                let target = if let Some(files) = &admitted {
+                    RepairOutputFile::Admitted(files[&fi])
+                } else {
+                    if let Some(p) = f.target_path.parent() {
+                        std::fs::create_dir_all(p)
+                            .map_err(io_ctx(format!("creating {}", p.display())))?;
+                    }
+                    RepairOutputFile::Opened(
+                        OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(&f.target_path)
+                            .map_err(io_ctx(format!("opening {}", f.target_path.display())))?,
+                    )
+                };
+                let fh = target.file();
                 if fh.metadata().map(|m| m.len()).unwrap_or(0) < f.length {
                     fh.set_len(f.length)
                         .map_err(io_ctx(format!("sizing {}", f.target_path.display())))?;
                 }
-                slot.insert(fh);
+                slot.insert(target);
             }
             let off = (g - f.first_slice) as u64 * ss as u64;
             out_map.push((fi, off, (f.length - off).min(ss as u64)));
@@ -3499,11 +3625,13 @@ impl StreamingParSession {
             if offset < block_len {
                 let n = ((block_len - offset) as usize).min(data.len());
                 let _write = self.inner.control.phase(RepairPhase::Write);
-                write_all_at(&targets[&fi], block_off + offset, &data[..n])?;
+                write_all_at(targets[&fi].file(), block_off + offset, &data[..n])?;
                 self.inner
                     .control
                     .repair_written
                     .fetch_add(n as u64, Ordering::Relaxed);
+                #[cfg(test)]
+                live_tests::control_tests::pause_target_io(false);
             }
             Ok(())
         };
@@ -3543,7 +3671,7 @@ impl StreamingParSession {
         {
             let _sync = self.inner.control.phase(RepairPhase::Sync);
             for fh in targets.values() {
-                fh.sync_data().ok();
+                fh.file().sync_data().ok();
             }
         }
         self.inner.control.ensure_running()?;
@@ -3574,7 +3702,7 @@ impl StreamingParSession {
         }
         drop(refold);
         for id in target_file_ids {
-            let (st, ok) = self.check_target_timed(id, hashes)?;
+            let (st, ok) = self.check_target_timed(id, admitted.as_ref(), hashes)?;
             report.files.push((*id, st, ok));
         }
         Ok(report)
@@ -3583,16 +3711,18 @@ impl StreamingParSession {
     fn check_target_timed(
         &self,
         id: &FileId,
+        target_files: Option<&HashMap<usize, &File>>,
         hashes: &mut Option<Vec<(FileId, crate::hasher::FileHashes)>>,
     ) -> Result<(VolumeStatus, bool), RepairError> {
         let _verify = self.inner.control.phase(RepairPhase::Verify);
-        self.check_target(id, hashes)
+        self.check_target(id, target_files, hashes)
     }
 
     /// Volume status plus whole-file MD5 check (only performed when all slices are verified).
     fn check_target(
         &self,
         id: &FileId,
+        target_files: Option<&HashMap<usize, &File>>,
         hashes: &mut Option<Vec<(FileId, crate::hasher::FileHashes)>>,
     ) -> Result<(VolumeStatus, bool), RepairError> {
         let fi = self.inner.file_index[id];
@@ -3602,8 +3732,19 @@ impl StreamingParSession {
             Self::volume_status_locked(&t, f)
         };
         let ok = if st == VolumeStatus::CompleteAndVerified {
-            let result = CountedFile::open(&f.target_path, &self.inner.control, IoClass::Target)
-                .and_then(|source| crate::hasher::hash_reader(&source));
+            let source = match target_files {
+                Some(files) => files[&fi].try_clone().and_then(|mut file| {
+                    // Clones share the caller's cursor; whole-file hashes start at zero.
+                    file.seek(SeekFrom::Start(0))?;
+                    CountedFile::from_file(file, &self.inner.control, IoClass::Target)
+                }),
+                None => CountedFile::open(&f.target_path, &self.inner.control, IoClass::Target),
+            };
+            let result = source.and_then(|source| {
+                #[cfg(test)]
+                let source = live_tests::control_tests::PausedTargetRead(source);
+                crate::hasher::hash_reader(&source)
+            });
             self.inner.control.ensure_running()?;
             result
                 .map(|h| {
@@ -3629,7 +3770,7 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod live_tests {
-    mod control_tests;
+    pub(super) mod control_tests;
     use super::*;
     use crate::crc::crc32;
     use crate::create::{CreateOptions, SourceFile, VolumeScheme, create};
