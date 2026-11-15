@@ -1411,6 +1411,47 @@ fn live_target_files_symlink_replacement_and_oversize_are_preserved() {
     std::fs::remove_dir_all(fx.dir).unwrap();
 }
 
+// A typed, one-shot test rendezvous, scoped to the repair caller thread. It
+// cannot call host code, and is entirely absent from non-test builds.
+struct TargetIoPause {
+    verify: bool,
+    reached: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+thread_local! {
+    static TARGET_IO_PAUSE: std::cell::RefCell<Option<TargetIoPause>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(in crate::streaming) fn pause_target_io(verify: bool) {
+    let pause = TARGET_IO_PAUSE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|pause| pause.verify == verify) {
+            slot.take()
+        } else {
+            None
+        }
+    });
+    if let Some(pause) = pause {
+        pause.reached.send(()).unwrap();
+        pause.resume.recv().unwrap();
+    }
+}
+
+pub(in crate::streaming) struct PausedTargetRead<'a>(pub(in crate::streaming) CountedFile<'a>);
+
+impl io::Read for &PausedTargetRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = io::Read::read(&mut &self.0, buf)?;
+        if n > 0 {
+            pause_target_io(true);
+        }
+        Ok(n)
+    }
+}
+
 fn target_files_cancel_during_io(verify: bool) {
     let tag = if verify {
         "target-fds-cancel-verify"
@@ -1453,18 +1494,34 @@ fn target_files_cancel_during_io(verify: bool) {
         .map(|s| s.lock().unwrap().data.clone())
         .collect();
     std::thread::scope(|scope| {
-        let op = scope
-            .spawn(|| session.repair_available_targets_with_files_and_hashes_now(&[id], &targets));
-        let reached = wait_until(|| {
-            if verify {
-                session.io_stats().target_verification_bytes_read > 0
-            } else {
-                session.repair_phase_stats().target_bytes_written > 0
-            }
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let op = scope.spawn(|| {
+            TARGET_IO_PAUSE.with(|slot| {
+                *slot.borrow_mut() = Some(TargetIoPause {
+                    verify,
+                    reached: reached_tx,
+                    resume: resume_rx,
+                });
+            });
+            session.repair_available_targets_with_files_and_hashes_now(&[id], &targets)
         });
+        reached_rx
+            .recv()
+            .expect("operation ended before the I/O rendezvous");
+        let bytes = if verify {
+            session.io_stats().target_verification_bytes_read
+        } else {
+            session.repair_phase_stats().target_bytes_written
+        };
+        assert!(
+            bytes > 0 && bytes < len as u64,
+            "must pause after real partial I/O"
+        );
+        assert!(!op.is_finished());
         session.cancel();
+        resume_tx.send(()).unwrap();
         let result = op.join().unwrap();
-        assert!(reached, "operation never reached the requested I/O phase");
         assert!(matches!(result, Err(RepairError::Cancelled)));
     });
     assert_eq!(session.repair_phase_stats().completed, 0);

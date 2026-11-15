@@ -3630,6 +3630,8 @@ impl StreamingParSession {
                     .control
                     .repair_written
                     .fetch_add(n as u64, Ordering::Relaxed);
+                #[cfg(test)]
+                live_tests::control_tests::pause_target_io(false);
             }
             Ok(())
         };
@@ -3738,7 +3740,11 @@ impl StreamingParSession {
                 }),
                 None => CountedFile::open(&f.target_path, &self.inner.control, IoClass::Target),
             };
-            let result = source.and_then(|source| crate::hasher::hash_reader(&source));
+            let result = source.and_then(|source| {
+                #[cfg(test)]
+                let source = live_tests::control_tests::PausedTargetRead(source);
+                crate::hasher::hash_reader(&source)
+            });
             self.inner.control.ensure_running()?;
             result
                 .map(|h| {
@@ -3764,7 +3770,7 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod live_tests {
-    mod control_tests;
+    pub(super) mod control_tests;
     use super::*;
     use crate::crc::crc32;
     use crate::create::{CreateOptions, SourceFile, VolumeScheme, create};
