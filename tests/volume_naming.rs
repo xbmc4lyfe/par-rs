@@ -107,6 +107,7 @@ fn options(total: u32, first: u32, scheme: par_rs::VolumeScheme) -> (CreateOptio
             mem_limit_bytes: 16 << 20,
             ..Default::default()
         },
+        file_threads: 0,
         kernel: par_rs::Kernel::scalar(),
     };
     let memory = SetOptions {

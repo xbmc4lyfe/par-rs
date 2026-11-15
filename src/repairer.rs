@@ -72,6 +72,10 @@ pub enum BackupPolicy {
 pub struct RepairOptions {
     /// Worker threads for the Reed-Solomon engine (0 = all cores).
     pub num_threads: usize,
+    /// Threads that read and hash whole files during verification (par2cmdline `-T`):
+    /// scanning, slice checksums and whole-file hashes. 0 = use `num_threads`. Results do not
+    /// depend on it, and the verification memory budget still bounds the buffers.
+    pub file_threads: usize,
     /// Buffer budget per verification or repair phase (minimum 16 MiB).
     /// Recovery-matrix planning has a separate cap of the same size. Metadata,
     /// retained inverse matrices, thread stacks, and allocator overhead are additional.
@@ -166,6 +170,7 @@ impl Default for RepairOptions {
     fn default() -> Self {
         Self {
             num_threads: 0,
+            file_threads: 0,
             mem_limit_bytes: 256 << 20,
             backup: BackupPolicy::RenameNumbered,
             verify_repaired: true,
@@ -983,7 +988,7 @@ impl Par2Repairer {
         let digests = hash_ranges_parallel_with_budget(
             &paths,
             &ranges,
-            self.options.num_threads,
+            self.hash_threads(),
             self.verification_memory(),
             Some(&self.cancel),
             &mut |_| {},
@@ -1227,7 +1232,7 @@ impl Par2Repairer {
             let results = hash_ranges_parallel_with_budget(
                 &paths,
                 &ranges,
-                self.options.num_threads,
+                self.hash_threads(),
                 self.verification_memory(),
                 Some(&self.cancel),
                 &mut |done| {
@@ -1331,15 +1336,23 @@ impl Par2Repairer {
             .min(crate::parhash::WORKING_MEMORY_BYTES)
     }
 
+    /// Requested file-level thread count (`file_threads`, or `num_threads` when 0).
+    fn hash_threads(&self) -> usize {
+        match self.options.file_threads {
+            0 => self.options.num_threads,
+            n => n,
+        }
+    }
+
     fn file_hash_threads(&self) -> usize {
-        let threads = crate::parhash::thread_count(self.options.num_threads);
+        let threads = crate::parhash::thread_count(self.hash_threads());
         (threads as u64).min(self.verification_memory() / crate::hasher::READ_CHUNK as u64) as usize
     }
 
     fn scan_resources(&self, files: usize) -> (usize, usize) {
         // Allow for incoming, outgoing, and candidate buffers in every scanner.
         let budget = self.verification_memory();
-        let threads = crate::parhash::thread_count(self.options.num_threads).clamp(1, files.max(1));
+        let threads = crate::parhash::thread_count(self.hash_threads()).clamp(1, files.max(1));
         let threads =
             (threads as u64).min(budget / (3 * crate::scanner::MIN_BUFFER) as u64) as usize;
         let buffer = (budget / threads as u64 / 3)
@@ -1351,7 +1364,7 @@ impl Par2Repairer {
         (threads, buffer)
     }
 
-    /// Scan several files (sliding window) on up to `num_threads` threads; `known` is the
+    /// Scan several files (sliding window) on up to `file_threads` threads; `known` is the
     /// slice-level verdict of an earlier aligned pass. Reports come back in input order.
     fn scan_many(
         &self,
@@ -2133,7 +2146,7 @@ impl Par2Repairer {
             let results = hash_ranges_parallel_with_budget(
                 &paths,
                 &ranges,
-                self.options.num_threads,
+                self.hash_threads(),
                 self.verification_memory(),
                 Some(&self.cancel),
                 &mut |done| {
@@ -3054,5 +3067,27 @@ mod tests {
         ));
         check_all(&fx);
         std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn file_threads_selects_hashing_threads() {
+        let make = |num_threads, file_threads| {
+            Par2Repairer::new(
+                "/nonexistent",
+                RepairOptions {
+                    num_threads,
+                    file_threads,
+                    ..RepairOptions::default()
+                },
+            )
+        };
+        assert_eq!(make(5, 0).hash_threads(), 5);
+        assert_eq!(make(5, 2).hash_threads(), 2);
+        assert_eq!(make(0, 0).hash_threads(), 0);
+        // Scanning is capped by the file count and never below one thread.
+        assert_eq!(make(8, 3).scan_resources(10).0, 3);
+        assert_eq!(make(8, 3).scan_resources(2).0, 2);
+        assert_eq!(make(1, 6).scan_resources(10).0, 6);
+        assert!(make(8, 0).file_hash_threads() >= 1);
     }
 }
