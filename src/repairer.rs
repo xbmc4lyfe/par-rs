@@ -44,6 +44,8 @@ use std::sync::{Arc, Mutex};
 mod donor;
 mod donor_budget;
 pub use donor_budget::{DonorReadBudget, DonorReadError, DonorReadScope};
+mod purge;
+pub use purge::{PurgeEntry, PurgeKept, PurgeReport};
 mod rename;
 
 /// How an explicitly admitted extra file supplies source blocks.
@@ -560,6 +562,8 @@ pub struct Par2Repairer {
     pub(crate) quick_verified_files: usize,
     /// Streaming (incremental syndrome) state, see [`crate::streaming`].
     pub(crate) streaming: Option<crate::streaming::SyndromeState>,
+    /// Whether [`purge`](Self::purge) may remove files, and the leftovers it would remove.
+    pub(crate) purge_state: purge::PurgeState,
 }
 
 impl Par2Repairer {
@@ -585,6 +589,7 @@ impl Par2Repairer {
             cancel: Arc::new(AtomicBool::new(false)),
             quick_verified_files: 0,
             streaming: None,
+            purge_state: purge::PurgeState::default(),
         }
     }
 
@@ -844,6 +849,7 @@ impl Par2Repairer {
         self.finalized = true;
         self.verified = false;
         self.streaming = None;
+        self.purge_state = purge::PurgeState::default();
         Ok(())
     }
 
@@ -1326,6 +1332,7 @@ impl Par2Repairer {
         }
         observer.progress(1000, "Verification finished");
         self.verified = true;
+        self.purge_state.safe = self.files.iter().all(|f| f.status == FileStatus::Complete);
         Ok(self.verify_result())
     }
 
@@ -1782,6 +1789,8 @@ impl Par2Repairer {
         }
         // Reject before backups, renames, or target creation change the filesystem.
         check_recovery_matrix_memory(missing_total, self.options.mem_limit_bytes)?;
+        // From here the targets change; only a re-verified success makes purging safe again.
+        self.purge_state.safe = false;
         let (mut copies, mut backups) =
             rename::Copies::prepare(self, incomplete.len(), self.verification_memory())?;
         observer.stage(Stage::Repairing);
@@ -2218,6 +2227,13 @@ impl Par2Repairer {
                 }
             }
         }
+        self.purge_state.leftovers = leftovers
+            .iter()
+            .filter(|p| p.symlink_metadata().is_ok())
+            .cloned()
+            .collect();
+        self.purge_state.safe = self.options.verify_repaired
+            && self.files.iter().all(|f| f.status == FileStatus::Complete);
         observer.progress(1000, "Repair complete");
         Ok(RepairResult::Repaired {
             files: repaired_names,
