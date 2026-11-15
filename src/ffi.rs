@@ -235,10 +235,10 @@ impl QuickVerifier for QuickCb {
             (self.f)(
                 self.ctx,
                 name.as_ptr(),
-                &mut status,
-                &mut crc,
-                &mut segs,
-                &mut count,
+                &raw mut status,
+                &raw mut crc,
+                &raw mut segs,
+                &raw mut count,
             );
         };
         match status {
@@ -808,7 +808,7 @@ pub unsafe extern "C" fn nzbpar_rename_dir(
 #[unsafe(no_mangle)]
 pub extern "C" fn nzbpar_version() -> *const c_char {
     static V: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
-    V.as_ptr() as *const c_char
+    V.as_ptr().cast::<c_char>()
 }
 
 #[cfg(test)]

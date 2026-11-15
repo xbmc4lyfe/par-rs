@@ -510,19 +510,16 @@ impl<'a, S: PacketSource + ?Sized> PacketIter<'a, S> {
             self.done = true;
             return Ok(false);
         }
-        match self.find_magic(from)? {
-            Some(next) => {
-                self.stats.resyncs += 1;
-                self.stats.skipped_bytes += next - self.pos;
-                self.pos = next;
-                Ok(true)
-            }
-            None => {
-                self.stats.skipped_bytes += self.len - self.pos;
-                self.pos = self.len;
-                self.done = true;
-                Ok(false)
-            }
+        if let Some(next) = self.find_magic(from)? {
+            self.stats.resyncs += 1;
+            self.stats.skipped_bytes += next - self.pos;
+            self.pos = next;
+            Ok(true)
+        } else {
+            self.stats.skipped_bytes += self.len - self.pos;
+            self.pos = self.len;
+            self.done = true;
+            Ok(false)
         }
     }
 
@@ -571,7 +568,7 @@ impl<'a, S: PacketSource + ?Sized> PacketIter<'a, S> {
     }
 }
 
-impl<'a, S: PacketSource + ?Sized> Iterator for PacketIter<'a, S> {
+impl<S: PacketSource + ?Sized> Iterator for PacketIter<'_, S> {
     type Item = io::Result<RawPacket>;
 
     fn next(&mut self) -> Option<Self::Item> {

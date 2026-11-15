@@ -995,16 +995,15 @@ impl Par2Repairer {
         for r in refs {
             let path = paths[r.source_id];
             let file = File::open(path).map_err(io_ctx(format!("opening {}", path.display())))?;
-            let flen = match lens.get(&r.source_id) {
-                Some(&l) => l,
-                None => {
-                    let l = file
-                        .metadata()
-                        .map(|m| m.len())
-                        .map_err(io_ctx(format!("reading {}", path.display())))?;
-                    lens.insert(r.source_id, l);
-                    l
-                }
+            let flen = if let Some(&l) = lens.get(&r.source_id) {
+                l
+            } else {
+                let l = file
+                    .metadata()
+                    .map(|m| m.len())
+                    .map_err(io_ctx(format!("reading {}", path.display())))?;
+                lens.insert(r.source_id, l);
+                l
             };
             let mut hdr = [0u8; HEADER_LEN];
             let parsed = match read_exact_at(&file, r.packet_offset, &mut hdr) {
@@ -1972,16 +1971,15 @@ impl Par2Repairer {
                     copied += 1;
                     continue;
                 }
-                let src = match sources.get(&loc.file) {
-                    Some(s) => s,
-                    None => {
-                        let p = &self.disk_files[loc.file];
-                        sources.insert(
-                            loc.file,
-                            File::open(p).map_err(io_ctx(format!("opening {}", p.display())))?,
-                        );
-                        &sources[&loc.file]
-                    }
+                let src = if let Some(s) = sources.get(&loc.file) {
+                    s
+                } else {
+                    let p = &self.disk_files[loc.file];
+                    sources.insert(
+                        loc.file,
+                        File::open(p).map_err(io_ctx(format!("opening {}", p.display())))?,
+                    );
+                    &sources[&loc.file]
                 };
                 let dst_off = u64::from(b) * ss;
                 let want = (f.file_length - dst_off).min(ss);

@@ -668,13 +668,13 @@ struct Job {
     next_tile: AtomicUsize,
 }
 
-impl<'a> Engine<'a> {
+impl Engine<'_> {
     /// Bytes per chunk under the memory budget.
     fn chunk_bytes(&self) -> usize {
         let k = self.output_exponents.len().max(1) as u64;
         let b = self.config.input_batch.max(1) as u64;
         let mem = self.config.mem_limit_bytes.max(MIN_MEM_LIMIT);
-        let post = if self.post_transform.is_some() { 1 } else { 0 };
+        let post = u64::from(self.post_transform.is_some());
         // Outputs (+ transformed outputs) + batches in flight: one per reader, the channel
         // (readers + 1) and the one being processed.
         let readers = self.config.reader_threads(self.config.threads()) as u64;

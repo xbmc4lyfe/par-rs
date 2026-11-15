@@ -663,7 +663,7 @@ pub fn create_with_volume_naming(
         for (vi, &(first, count)) in layout.iter().enumerate() {
             let name = creation_volume_name(base, opts.first_exponent + first, count, widths);
             let path = out_dir.join(&name);
-            let copies = 1 + (31 - count.max(1).leading_zeros()); // 1 + floor(log2(count))
+            let copies = 1 + count.max(1).ilog2(); // 1 + floor(log2(count))
             for i in 0..count {
                 sink.locations[(first + i) as usize] = (vi, u64::from(i) * packet_len);
             }
@@ -1166,7 +1166,7 @@ pub fn build_set_with_volume_naming(
                 ));
                 vol.extend_from_slice(data);
             }
-            let copies = 1 + (31 - count.max(1).leading_zeros());
+            let copies = 1 + count.max(1).ilog2();
             for _ in 0..copies {
                 vol.extend_from_slice(&critical);
             }

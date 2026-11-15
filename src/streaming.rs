@@ -2807,31 +2807,28 @@ impl StreamingParSession {
             if t.states[g] == SliceState::VerifiedGood {
                 continue;
             }
-            match verdict {
-                Some(data) => {
-                    self.inner.control.ensure_running()?;
-                    self.inner
-                        .control
-                        .ram
-                        .fetch_add(ram_bytes as u64, Ordering::Relaxed);
-                    Self::set_state(&mut t, g, SliceState::VerifiedGood);
-                    drop(t);
-                    self.fold(g, data)?;
-                    out.events.push(SliceEvent {
-                        file_id: *file_id,
-                        slice_idx: b,
-                        state: SliceState::VerifiedGood,
-                    });
-                }
-                None => {
-                    Self::set_state(&mut t, g, SliceState::Damaged);
-                    damaged_any = true;
-                    out.events.push(SliceEvent {
-                        file_id: *file_id,
-                        slice_idx: b,
-                        state: SliceState::Damaged,
-                    });
-                }
+            if let Some(data) = verdict {
+                self.inner.control.ensure_running()?;
+                self.inner
+                    .control
+                    .ram
+                    .fetch_add(ram_bytes as u64, Ordering::Relaxed);
+                Self::set_state(&mut t, g, SliceState::VerifiedGood);
+                drop(t);
+                self.fold(g, data)?;
+                out.events.push(SliceEvent {
+                    file_id: *file_id,
+                    slice_idx: b,
+                    state: SliceState::VerifiedGood,
+                });
+            } else {
+                Self::set_state(&mut t, g, SliceState::Damaged);
+                damaged_any = true;
+                out.events.push(SliceEvent {
+                    file_id: *file_id,
+                    slice_idx: b,
+                    state: SliceState::Damaged,
+                });
             }
         }
         if damaged_any {
@@ -2868,25 +2865,24 @@ impl StreamingParSession {
         {
             return Ok(None);
         }
-        let data = match staged {
-            Some(d) => d,
-            None => {
-                let off = b as u64 * ss;
-                let len = (f.length - off).min(ss) as usize;
-                let fh = CountedFile::open(&f.target_path, &self.inner.control, IoClass::Source)
-                    .map_err(|e| {
-                        self.inner
-                            .control
-                            .io_error(format!("opening {}", f.target_path.display()), e)
-                    })?;
-                let mut buf = vec![0u8; len];
-                fh.read_at(off, &mut buf).map_err(|e| {
+        let data = if let Some(d) = staged {
+            d
+        } else {
+            let off = b as u64 * ss;
+            let len = (f.length - off).min(ss) as usize;
+            let fh = CountedFile::open(&f.target_path, &self.inner.control, IoClass::Source)
+                .map_err(|e| {
                     self.inner
                         .control
-                        .io_error(format!("reading {}", f.target_path.display()), e)
+                        .io_error(format!("opening {}", f.target_path.display()), e)
                 })?;
-                buf
-            }
+            let mut buf = vec![0u8; len];
+            fh.read_at(off, &mut buf).map_err(|e| {
+                self.inner
+                    .control
+                    .io_error(format!("reading {}", f.target_path.display()), e)
+            })?;
+            buf
         };
         let ok = if data.len() == ss as usize {
             let (c, m) = slice_checksums(&data);
@@ -3205,26 +3201,25 @@ impl StreamingParSession {
                     .map_err(io_ctx("resynchronizing recovery packets"))?;
                 continue;
             }
-            let slot = match slot {
-                Some(s) => s,
-                None => {
-                    let mut list = self
-                        .inner
-                        .slots
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    // The exclusive payload gate keeps the admitted slot count stable.
-                    let total = self.inner.logs.len();
-                    let s = Arc::new(Mutex::new(SyndromeSlot {
-                        exponent: *e,
-                        data: vec![0u8; ss],
-                        folded_mask: BitVec::new(total),
-                        recovery_added: false,
-                    }));
-                    list.push(Arc::clone(&s));
-                    self.inner.needs_backfill.store(true, Ordering::Release);
-                    s
-                }
+            let slot = if let Some(s) = slot {
+                s
+            } else {
+                let mut list = self
+                    .inner
+                    .slots
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // The exclusive payload gate keeps the admitted slot count stable.
+                let total = self.inner.logs.len();
+                let s = Arc::new(Mutex::new(SyndromeSlot {
+                    exponent: *e,
+                    data: vec![0u8; ss],
+                    folded_mask: BitVec::new(total),
+                    recovery_added: false,
+                }));
+                list.push(Arc::clone(&s));
+                self.inner.needs_backfill.store(true, Ordering::Release);
+                s
             };
             let mut data = vec![0u8; ss];
             r.read_data(&src, 0, &mut data)

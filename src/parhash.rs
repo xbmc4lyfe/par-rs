@@ -372,7 +372,7 @@ pub fn file_hashes_parallel(
             match res {
                 Ok(h) => {
                     out.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)[i] = Some(h)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)[i] = Some(h);
                 }
                 Err(e) => {
                     let mut g = error
