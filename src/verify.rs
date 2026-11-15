@@ -576,4 +576,48 @@ mod tests {
         assert!(SetVerifier::new(bs as u64, vec![bad]).is_none());
         assert!(v.sliding_search(&[], |_, _| false).is_empty());
     }
+
+    #[test]
+    fn sliding_search_and_slice_matching_edge_cases() {
+        let bs = 256usize;
+        // A file whose only slice is short (zero padded to the block size).
+        let short = data(100, 5);
+        let long = data(bs * 3, 6);
+        let v = SetVerifier::new(bs as u64, vec![spec(1, &short, bs), spec(2, &long, bs)]).unwrap();
+        assert!(v.sliding_search(&[], |_, _| false).is_empty());
+        // A buffer shorter than one block still matches through virtual zero padding.
+        let found = v.sliding_search(&short, |_, _| false);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].file, found[0].slice, found[0].offset), (0, 0, 0));
+        // Shifted data: every slice of the long file, each reported once, at its offset.
+        let mut buf = vec![0xEEu8; 7];
+        buf.extend_from_slice(&long);
+        buf.extend_from_slice(&long[..bs]); // a repeat of slice 0
+        let found = v.sliding_search(&buf, |_, _| false);
+        let mut got: Vec<(usize, usize, u64)> =
+            found.iter().map(|f| (f.file, f.slice, f.offset)).collect();
+        got.sort();
+        assert_eq!(got, vec![(1, 0, 7), (1, 1, 7 + 256), (1, 2, 7 + 512)]);
+        assert!(
+            found
+                .iter()
+                .all(|f| v.global_slice(f.file, f.slice) == Some(f.global))
+        );
+        // `already` skips pairs the caller has.
+        let found = v.sliding_search(&buf, |f, s| f == 1 && s == 1);
+        assert!(found.iter().all(|f| f.slice != 1));
+        assert_eq!(found.len(), 2);
+
+        let exp = v.files()[0].slices[0];
+        assert!(v.slice_matches(&exp, &short));
+        let mut padded = short.clone();
+        padded.resize(bs, 0);
+        assert!(v.slice_matches(&exp, &padded));
+        padded.push(0);
+        assert!(
+            !v.slice_matches(&exp, &padded),
+            "longer than a block never matches"
+        );
+        assert!(!v.slice_matches(&exp, &short[..99]));
+    }
 }
