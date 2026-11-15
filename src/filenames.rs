@@ -165,7 +165,7 @@ pub fn find_main_pars_in_dir(dir: &std::path::Path) -> std::io::Result<Vec<std::
     }
     names.sort();
     let bytes: Vec<Vec<u8>> = names.iter().map(|n| os_str_bytes(n)).collect();
-    let mains = find_main_pars(bytes.iter().map(|b| b.as_slice()));
+    let mains = find_main_pars(bytes.iter().map(std::vec::Vec::as_slice));
     Ok(names
         .iter()
         .zip(&bytes)
@@ -209,7 +209,7 @@ pub fn volume_blocks_bytes(name: &[u8]) -> Option<u32> {
     let seg = &stem[i + 4..];
     let plus = seg.iter().position(|&b| b == b'+')?;
     let digits = &seg[plus + 1..];
-    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
     let mut v: u64 = 0;
@@ -231,7 +231,7 @@ pub fn volume_range(name: &[u8]) -> Option<(u32, u32)> {
     let seg = &stem[i + 4..];
     let plus = seg.iter().position(|&b| b == b'+')?;
     let first = &seg[..plus];
-    if first.is_empty() || !first.iter().all(|b| b.is_ascii_digit()) {
+    if first.is_empty() || !first.iter().all(u8::is_ascii_digit) {
         return None;
     }
     let mut v: u64 = 0;

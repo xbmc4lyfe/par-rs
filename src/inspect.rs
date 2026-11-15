@@ -712,9 +712,8 @@ pub fn inspect_par2_with(data: &[u8], verify: VerifyMode) -> Par2Inspection {
     let mut pos = 0usize;
     let mut expect_contiguous = false;
     while pos < data.len() {
-        let rest = match data.get(pos..) {
-            Some(x) => x,
-            None => break,
+        let Some(rest) = data.get(pos..) else {
+            break;
         };
         // Next PAR2 magic (and any PAR3 headers passed on the way).
         let Some(rel) = finder.find(rest) else {

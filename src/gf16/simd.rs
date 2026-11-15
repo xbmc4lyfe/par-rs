@@ -262,13 +262,13 @@ impl Kernel {
             let mut bufs = init.clone();
             {
                 let mut planes: Vec<PlaneMut> = Vec::with_capacity(count);
-                for b in bufs.iter_mut() {
+                for b in &mut bufs {
                     let (mut lo, mut hi) = (vec![0u8; n], vec![0u8; n]);
                     Kernel::scalar().deinterleave(b, &mut lo, &mut hi);
                     b[..n].copy_from_slice(&lo);
                     b[n..].copy_from_slice(&hi);
                 }
-                for b in bufs.iter_mut() {
+                for b in &mut bufs {
                     planes.push(PlaneMut::from_halves(b));
                 }
                 self.mul_acc_multi_split(&mut planes, Plane { lo: &slo, hi: &shi }, &coeffs);
@@ -283,7 +283,8 @@ impl Kernel {
             // Natural-layout path.
             let mut bufs = init.clone();
             {
-                let mut refs: Vec<&mut [u8]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
+                let mut refs: Vec<&mut [u8]> =
+                    bufs.iter_mut().map(std::vec::Vec::as_mut_slice).collect();
                 self.mul_acc_multi(&mut refs, &src, &coeffs);
             }
             if bufs != expect {

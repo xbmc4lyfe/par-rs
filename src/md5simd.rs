@@ -463,18 +463,13 @@ fn run<L: Lanes, const G: usize>(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
     let mut words = [[0u32; 16]; 4];
     for batch in order.chunks(lanes) {
         let mut st = [[L::splat(0); 4]; G];
-        for group in st.iter_mut() {
+        for group in &mut st {
             for (j, s) in group.iter_mut().enumerate() {
                 *s = L::splat(INIT[j]);
             }
         }
         let nblocks: Vec<usize> = (0..lanes)
-            .map(|l| {
-                batch
-                    .get(l)
-                    .map(|&i| block_count(msgs[i].len()))
-                    .unwrap_or(0)
-            })
+            .map(|l| batch.get(l).map_or(0, |&i| block_count(msgs[i].len())))
             .collect();
         let max_blocks = nblocks.iter().copied().max().unwrap_or(0);
         let mut m = [[L::splat(0); 16]; G];
@@ -583,7 +578,7 @@ pub fn md5_many_into(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        run::<neon::V, GROUPS>(msgs, out)
+        run::<neon::V, GROUPS>(msgs, out);
     }
     #[cfg(target_arch = "x86_64")]
     {

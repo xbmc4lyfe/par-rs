@@ -740,12 +740,10 @@ impl Par2Repairer {
         let dir = main_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let main_name = main_path
             .file_name()
-            .map(crate::filenames::os_str_bytes)
-            .unwrap_or_default();
+            .map_or_default(crate::filenames::os_str_bytes);
         let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map_err(io_ctx(format!("reading {}", dir.display())))?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -755,10 +753,7 @@ impl Par2Repairer {
             if p.file_name() == main_path.file_name() || p.is_dir() {
                 continue;
             }
-            let name = p
-                .file_name()
-                .map(crate::filenames::os_str_bytes)
-                .unwrap_or_default();
+            let name = p.file_name().map_or_default(crate::filenames::os_str_bytes);
             if crate::filenames::same_par_collection(&name, &main_name, true) {
                 match self.load_par2_file(&p) {
                     Ok(_) => loaded.push(p),
@@ -970,7 +965,11 @@ impl Par2Repairer {
         refs: &[RecoverySliceRef],
     ) -> Result<Vec<bool>, RepairError> {
         use crate::packet::{HEADER_LEN, PacketHeader};
-        let paths: Vec<&Path> = self.par_files.iter().map(|p| p.as_path()).collect();
+        let paths: Vec<&Path> = self
+            .par_files
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect();
         let mut ranges: Vec<HashRange> = Vec::new();
         let mut expected: Vec<Option<[u8; 16]>> = Vec::with_capacity(refs.len());
         let mut lens: HashMap<usize, u64> = HashMap::new();
@@ -1103,13 +1102,12 @@ impl Par2Repairer {
                 observer.file_verified(&self.files[fi]);
                 continue;
             }
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let size = std::fs::metadata(&path).map_or(0, |m| m.len());
             // Empty expected file.
             if self.files[fi].block_count == 0 {
                 let ok = size == 0
                     || crate::hasher::hash_file(&path)
-                        .map(|h| h.md5_full == self.files[fi].hash_full)
-                        .unwrap_or(false);
+                        .is_ok_and(|h| h.md5_full == self.files[fi].hash_full);
                 self.files[fi].status = if ok {
                     FileStatus::Complete
                 } else {
@@ -1256,7 +1254,7 @@ impl Par2Repairer {
             let mut ranges: Vec<HashRange> = Vec::new();
             let mut sizes: Vec<u64> = Vec::with_capacity(with_cs.len());
             for (k, &fi) in with_cs.iter().enumerate() {
-                let size = std::fs::metadata(paths[k]).map(|m| m.len()).unwrap_or(0);
+                let size = std::fs::metadata(paths[k]).map_or(0, |m| m.len());
                 sizes.push(size);
                 ranges.extend(slice_ranges(k, size, ss, self.files[fi].block_count as u64));
             }
@@ -1330,8 +1328,7 @@ impl Par2Repairer {
                 let path = self.files[fi].target_path.clone();
                 let label = path
                     .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                    .map_or_default(|n| n.to_string_lossy().into_owned());
                 self.apply_scan(&path, &label, Some(fi), &report, observer);
                 if self.files[fi].status == FileStatus::Unknown {
                     self.files[fi].status = FileStatus::Damaged;
@@ -1430,7 +1427,7 @@ impl Par2Repairer {
                 skip_leeway: self.options.skip_leeway,
                 ..ScanConfig::default()
             };
-            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0).max(1);
+            let size = std::fs::metadata(path).map_or(0, |m| m.len()).max(1);
             let label = &self.files[*fi].target_filename;
             let r = scan_file(
                 path,
@@ -1440,7 +1437,9 @@ impl Par2Repairer {
                 Some(cancel),
                 &mut |done| progress(done, size, label),
             );
-            results.lock().unwrap_or_else(|p| p.into_inner())[i] = Some(r);
+            results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[i] = Some(r);
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
@@ -1453,10 +1452,12 @@ impl Par2Repairer {
                 observer.progress(
                     ((done.min(size) * 1000) / size) as u32,
                     &format!("Scanning {label}"),
-                )
+                );
             });
         });
-        let results = results.into_inner().unwrap_or_else(|p| p.into_inner());
+        let results = results
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut out = Vec::with_capacity(items.len());
         for ((fi, _), r) in items.iter().zip(results) {
             let path = &self.files[*fi].target_path;
@@ -1516,11 +1517,10 @@ impl Par2Repairer {
             ..ScanConfig::default()
         };
         let cancel = self.cancel.clone();
-        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0).max(1);
+        let size = std::fs::metadata(path).map_or(0, |m| m.len()).max(1);
         let label = path
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|n| n.to_string_lossy().into_owned());
         let report = scan_file(path, index, exp_entries, &cfg, Some(&cancel), &mut |done| {
             observer.progress(
                 ((done.min(size) * 1000) / size) as u32,
@@ -1727,10 +1727,7 @@ impl Par2Repairer {
             if p.is_dir() || self.files.iter().any(|f| f.target_path == p) {
                 continue;
             }
-            let name = p
-                .file_name()
-                .map(crate::filenames::os_str_bytes)
-                .unwrap_or_default();
+            let name = p.file_name().map_or_default(crate::filenames::os_str_bytes);
             if targets
                 .iter()
                 .any(|t| crate::renamer::maybe_split_fragment(&name, t))
@@ -1830,7 +1827,7 @@ impl Par2Repairer {
             observer.message(
                 Level::Detail,
                 &format!("{what} done at t+{:.3}s", t_start.elapsed().as_secs_f64()),
-            )
+            );
         };
 
         // ---- 1. rotate damaged targets, rename misnamed complete copies ----
@@ -1858,7 +1855,7 @@ impl Par2Repairer {
                 // (the target is about to be rewritten).
                 let di = self.disk_index.get(&target).copied();
                 if let Some(di) = di {
-                    self.disk_files[di] = backup.clone();
+                    self.disk_files[di].clone_from(&backup);
                     self.disk_index.remove(&target);
                     self.disk_index.insert(backup.clone(), di);
                     copies.remap(&mut self.files, di, &backup);
@@ -1889,7 +1886,7 @@ impl Par2Repairer {
                         target.display()
                     )))?;
                     if let Some(di) = di {
-                        self.disk_files[di] = target.clone();
+                        self.disk_files[di].clone_from(&target);
                         self.disk_index.remove(&copy);
                         self.disk_index.insert(target.clone(), di);
                         copies.remap(&mut self.files, di, &target);
@@ -1963,7 +1960,7 @@ impl Par2Repairer {
                 };
                 let dst_off = b as u64 * ss;
                 let want = (f.file_length - dst_off).min(ss);
-                let src_len = src.metadata().map(|m| m.len()).unwrap_or(0);
+                let src_len = src.metadata().map_or(0, |m| m.len());
                 let avail = src_len.saturating_sub(loc.offset).min(want);
                 let mut done = 0u64;
                 while done < avail {
@@ -1997,7 +1994,11 @@ impl Par2Repairer {
         if !missing_globals.is_empty() {
             let logs =
                 input_constant_logs(self.locations.len()).map_err(|_| RepairError::Singular)?;
-            let present: Vec<bool> = self.locations.iter().map(|l| l.is_some()).collect();
+            let present: Vec<bool> = self
+                .locations
+                .iter()
+                .map(std::option::Option::is_some)
+                .collect();
             let streaming = self.streaming.is_some();
             if streaming {
                 // Fold every located block that has not been accumulated yet (for example, blocks found
@@ -2054,7 +2055,7 @@ impl Par2Repairer {
                         let fidx = reader
                             .file_index(path)
                             .map_err(io_ctx(format!("opening {}", path.display())))?;
-                        let src_len = reader.files[fidx].metadata().map(|m| m.len()).unwrap_or(0);
+                        let src_len = reader.files[fidx].metadata().map_or(0, |m| m.len());
                         let avail = src_len.saturating_sub(loc.offset).min(ss);
                         let sidx = reader.slices.len();
                         reader.slices.push(SliceSrc::File(fidx, loc.offset, avail));
@@ -2186,7 +2187,7 @@ impl Par2Repairer {
             let mut sizes: Vec<u64> = Vec::with_capacity(to_rebuild.len());
             let mut full_idx: Vec<usize> = Vec::new();
             for (k, &fi) in to_rebuild.iter().enumerate() {
-                let size = std::fs::metadata(paths[k]).map(|m| m.len()).unwrap_or(0);
+                let size = std::fs::metadata(paths[k]).map_or(0, |m| m.len());
                 sizes.push(size);
                 if self.checksums[fi].is_some() {
                     ranges.extend(slice_ranges(k, size, ss, self.files[fi].block_count as u64));

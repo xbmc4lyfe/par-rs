@@ -219,7 +219,10 @@ impl PacketSource for CountedFile<'_> {
     }
     fn read_at(&self, offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
         self.control.ensure_reading()?;
-        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         file.seek(SeekFrom::Start(offset))?;
         while !buf.is_empty() {
             match self.read_chunk(&mut file, buf) {
@@ -235,7 +238,10 @@ impl PacketSource for CountedFile<'_> {
 
 impl Read for &CountedFile<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.read_chunk(&mut file, buf)
     }
 }

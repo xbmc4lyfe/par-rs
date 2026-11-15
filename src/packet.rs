@@ -1341,10 +1341,7 @@ impl PacketSet {
 
     /// Creator string, or `""`.
     pub fn creator_string(&self) -> String {
-        self.creator
-            .as_ref()
-            .map(|c| c.client())
-            .unwrap_or_default()
+        self.creator.as_ref().map_or_default(CreatorPacket::client)
     }
 
     /// Add a parsed packet whose header carried `set_id`.
@@ -1492,13 +1489,13 @@ impl PacketSet {
         {
             return Some(*id);
         }
-        let lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+        let lower: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
         self.file_descs
             .iter()
             .find(|(_, fd)| {
                 fd.name
                     .iter()
-                    .map(|b| b.to_ascii_lowercase())
+                    .map(u8::to_ascii_lowercase)
                     .eq(lower.iter().copied())
                     || local(fd).to_ascii_lowercase().as_bytes() == lower.as_slice()
             })
@@ -1688,18 +1685,14 @@ pub fn load_par2_collection(
         .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
     let main_name = main_path
         .file_name()
-        .map(crate::filenames::os_str_bytes)
-        .unwrap_or_default();
+        .map_or_default(crate::filenames::os_str_bytes);
     let mut siblings: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.file_name() != main_path.file_name() && !p.is_dir())
         .collect();
     siblings.sort();
     for p in siblings {
-        let name = p
-            .file_name()
-            .map(crate::filenames::os_str_bytes)
-            .unwrap_or_default();
+        let name = p.file_name().map_or_default(crate::filenames::os_str_bytes);
         if !crate::filenames::same_par_collection(&name, &main_name, true) {
             continue;
         }

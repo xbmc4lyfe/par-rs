@@ -254,8 +254,11 @@ pub fn inventory_from(insp: &Par2Inspection) -> Inventory {
             },
         );
     }
-    inv.files = by_set.into_values().flat_map(|m| m.into_values()).collect();
-    inv.sealed.sort();
+    inv.files = by_set
+        .into_values()
+        .flat_map(std::collections::BTreeMap::into_values)
+        .collect();
+    inv.sealed.sort_unstable();
     inv.complete = match primary {
         Some(p) => {
             let has_main = block_sizes.contains_key(&p);
