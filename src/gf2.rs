@@ -327,6 +327,9 @@ impl fmt::Display for FoldError {
 impl std::error::Error for FoldError {}
 
 /// Fold consecutive yEnc part checksums `(crc32, length)` into the file checksum.
+///
+/// # Errors
+/// [`FoldError::Empty`] when `parts` is empty.
 pub fn fold_yenc_parts(parts: &[(u32, usize)]) -> Result<u32, FoldError> {
     let mut it = parts.iter();
     let Some(&(first, _)) = it.next() else {
@@ -340,6 +343,11 @@ pub fn fold_yenc_parts(parts: &[(u32, usize)]) -> Result<u32, FoldError> {
 
 /// Fold yEnc parts given as `(part index, crc32, length)` in any order; every index in
 /// `0..total` must be present exactly once (duplicates must agree).
+///
+/// # Errors
+/// [`FoldError::Empty`] for no parts or `total == 0`, [`FoldError::LengthMismatch`] for an index
+/// outside `0..total`, [`FoldError::MissingPart`] for a gap, and [`FoldError::CorruptPart`] for
+/// disagreeing duplicates.
 pub fn fold_yenc_indexed_parts(
     total: usize,
     parts: &[(usize, u32, usize)],

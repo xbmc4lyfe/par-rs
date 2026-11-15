@@ -317,6 +317,10 @@ pub struct RecoveryPlan {
 ///   [`crate::gf16::input_constant_logs`]).
 /// * `present[i]` tells whether input slice `i` is available.
 /// * `available_exponents` lists the recovery slices on hand (any order).
+///
+/// # Errors
+/// [`RsError::TooManyInputs`] above 32768 inputs, [`RsError::NotEnoughRecovery`] when fewer
+/// distinct exponents than missing slices, and [`RsError::Singular`] when no subset inverts.
 pub fn plan_recovery(
     input_logbases: &[u16],
     present: &[bool],
@@ -438,12 +442,20 @@ pub struct InputSpec {
 pub trait InputReader: Sync {
     /// Fill `buf` with bytes `[offset, offset + buf.len())` of input slice `source`,
     /// zero-padding past the end of the available data.
+    ///
+    /// # Errors
+    /// Implementations return any I/O error reading the slice; the engine reports it as
+    /// [`RsError::Io`].
     fn read_input(&self, source: usize, offset: u64, buf: &mut [u8]) -> io::Result<()>;
 }
 
 /// Receives output slice data (natural layout), one chunk at a time, in ascending offsets.
 pub trait OutputSink {
     /// Store bytes `[offset, offset + data.len())` of output `output`.
+    ///
+    /// # Errors
+    /// Implementations return any I/O error storing the data; the engine reports it as
+    /// [`RsError::Io`].
     fn write_output(&mut self, output: usize, offset: u64, data: &[u8]) -> io::Result<()>;
 }
 
@@ -689,6 +701,10 @@ impl Engine<'_> {
     }
 
     /// Run the computation.
+    ///
+    /// # Errors
+    /// [`RsError::NoOutputs`] with no output exponents, [`RsError::Cancelled`] when `cancel` is set,
+    /// and [`RsError::Io`] for reader, sink, or worker-thread failures.
     pub fn run(
         &self,
         reader: &dyn InputReader,
@@ -1012,6 +1028,10 @@ impl OutputSink for MemoryOutputs {
 }
 
 /// Compute recovery slices for `exponents` from complete in-memory input slices.
+///
+/// # Errors
+/// [`RsError::TooManyInputs`] above 32768 inputs and [`RsError::NoOutputs`] when `exponents`
+/// is empty.
 pub fn encode_in_memory(
     slice_size: usize,
     inputs: &[&[u8]],
@@ -1071,6 +1091,10 @@ pub fn encode_reference(slice_size: usize, inputs: &[&[u8]], exponents: &[u32]) 
 /// Reconstruct missing in-memory slices. `inputs[i]` is `None` when missing;
 /// `recovery` holds `(exponent, data)` pairs. Returns the recovered slices in the order of
 /// the missing indices.
+///
+/// # Errors
+/// The [`plan_recovery`] errors ([`RsError::TooManyInputs`], [`RsError::NotEnoughRecovery`], or
+/// [`RsError::Singular`]).
 pub fn decode_in_memory(
     slice_size: usize,
     inputs: &[Option<&[u8]>],

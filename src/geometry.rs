@@ -242,6 +242,11 @@ impl SourceGeometry {
     /// concurrent calls belong to the caller's aggregate resource accounting.
     /// Lookup is O(log F), validation O(M), and sorting O(M log M), with O(M)
     /// requested dynamic storage and no allocation for sorting or merging.
+    ///
+    /// # Errors
+    /// [`GeometryError::RangeLimit`], [`GeometryError::UnknownKey`], [`GeometryError::InvalidRange`],
+    /// [`GeometryError::MetadataLimit`], [`GeometryError::AllocationFailed`], or
+    /// [`GeometryError::Overflow`].
     pub fn lost_slice_ranges(
         &self,
         source_key: u64,
@@ -351,6 +356,12 @@ fn aligned_slice(
 /// Creation-scheme rules, first-exponent validation and recovery layouts remain
 /// separate: compose the creator's checked APIs without treating numeric source
 /// geometry as stable-byte, verified-parity, repairability, or publication proof.
+///
+/// # Errors
+/// [`GeometryError::BadLimits`], [`GeometryError::NoSources`], [`GeometryError::TooManyFiles`],
+/// [`GeometryError::BadSliceSize`], [`GeometryError::BadAlignment`], [`GeometryError::NoAlignedSliceSize`],
+/// [`GeometryError::TooManySourceSlices`], [`GeometryError::MetadataLimit`], [`GeometryError::DuplicateKey`],
+/// [`GeometryError::AllocationFailed`], or [`GeometryError::Overflow`] when the request is invalid or out of limits.
 pub fn checked_source_geometry(
     sources: &[SourceSize],
     request: SliceSizeRequest,

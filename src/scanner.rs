@@ -408,6 +408,10 @@ impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
 ///   and the length matches, an aligned fast path checks them first.
 /// * `cancel`: cooperative cancellation flag checked between buffer refills.
 /// * `progress`: called with the number of bytes processed so far.
+///
+/// # Errors
+/// I/O errors from [`PacketSource::read_at`]; cancellation is reported in the
+/// [`ScanReport`], not as an error.
 pub fn scan_source<S: PacketSource + ?Sized>(
     src: &S,
     index: &ChecksumIndex,
@@ -663,6 +667,9 @@ pub fn scan_source<S: PacketSource + ?Sized>(
 }
 
 /// Scan a file on disk.
+///
+/// # Errors
+/// I/O errors opening or reading `path`.
 pub fn scan_file(
     path: &std::path::Path,
     index: &ChecksumIndex,

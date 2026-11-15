@@ -109,6 +109,11 @@ pub struct RepairPlan {
 
 impl RepairPlan {
     /// Plan the repair of the slices absent from `present` (length `total`) with `exponents`.
+    ///
+    /// # Errors
+    /// [`RepairError::BadIndex`] when `present.len() != total`, [`RepairError::TooManyInputs`]
+    /// above 32768 slices, [`RepairError::NotEnoughRecovery`] with too few `exponents`, or
+    /// [`RepairError::Singular`] when no choice of exponents gives an invertible matrix.
     pub fn new(
         total: usize,
         present: &[bool],
@@ -290,6 +295,11 @@ fn presence(
 /// * `recovery`: `(exponent, data)` of the available recovery slices.
 ///
 /// Returns `(global slice index, data)` for every slice in `0..total` that was not present.
+///
+/// # Errors
+/// [`RepairError::ZeroSliceSize`], [`RepairError::SliceSizeMismatch`] for a wrong-length
+/// buffer, [`RepairError::BadIndex`] for an out-of-range or duplicate index, and the
+/// [`RepairPlan::new`] errors (`TooManyInputs`, `NotEnoughRecovery`, `Singular`).
 pub fn repair_slices(
     slice_size: usize,
     total: usize,
@@ -311,6 +321,10 @@ pub fn repair_slices(
 
 /// Reconstruct only `wanted` (a subset of the missing slices). All missing slices still count
 /// towards the recovery slices required, but only the requested rows of `A⁻¹ · S` are formed.
+///
+/// # Errors
+/// As [`repair_slices`], plus [`RepairError::BadIndex`] for a `wanted` index outside
+/// `0..total` and [`RepairError::NotMissing`] for a `wanted` slice that is present.
 pub fn repair_selected_slices(
     slice_size: usize,
     total: usize,
@@ -542,6 +556,11 @@ fn write_all_at(f: &File, offset: u64, data: &[u8]) -> io::Result<()> {
 /// Repair the missing slices of several files on disk: syndromes are accumulated slice by slice
 /// from the present data (memory: `k` slice buffers), solved, and the results written into the
 /// target files at their natural offsets (files are created / sized as needed).
+///
+/// # Errors
+/// [`RepairError::ZeroSliceSize`], the [`RepairPlan::new`] errors, [`RepairError::BadIndex`]
+/// when a missing slice lies in no target file, and [`RepairError::Io`] when opening,
+/// reading, sizing, or writing a file fails.
 pub fn repair_on_disk(
     plan: &DiskRepairPlan,
     kernel: &Kernel,
