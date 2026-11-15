@@ -1628,17 +1628,23 @@ pub struct LiveStatus {
     pub pending_folds: usize,
 }
 
+/// PAR2 recovery exponents are 16-bit, so no set has more distinct syndromes.
+const MAX_SYNDROME_SLOTS: usize = 65535;
+
 /// Session options.
 #[derive(Clone, Debug)]
 pub struct SessionOptions {
     /// Syndrome slots allocated up front (exponents from the loaded set or canonical `0..n`).
     pub preallocated_syndrome_slots: usize,
-    /// Byte cap for resident syndrome payloads and reconstructed output payloads separately.
+    /// Byte cap for resident syndrome payloads and reconstructed output payloads separately,
+    /// at session start. [`StreamingParSession::set_max_syndrome_slots`] may raise the slot
+    /// count past it later; that caller budgets the extra memory.
     pub max_syndrome_bytes: u64,
     /// Byte cap applied separately to staging, folding payloads, and per-call scratch.
     /// Concurrent calls and queued jobs share bounded admission; metadata and engine buffers are additional.
     pub max_working_bytes: u64,
-    /// Hard cap on slots, also limited by `max_syndrome_bytes / slice_size`.
+    /// Starting cap on slots, also limited by `max_syndrome_bytes / slice_size`.
+    /// [`StreamingParSession::set_max_syndrome_slots`] changes it at runtime.
     pub max_syndrome_slots: usize,
     /// Memory for in-RAM slice reassembly before falling back to reading the target file.
     pub max_staging_bytes: u64,
@@ -1910,6 +1916,14 @@ struct SessionInner {
     logs: Vec<u16>,
     tracker: Mutex<Tracker>,
     slots: SlotList,
+    /// Runtime slot cap (starts at `opts.max_syndrome_slots`), see
+    /// [`StreamingParSession::set_max_syndrome_slots`].
+    max_slots: AtomicUsize,
+    /// Highest cap the slice metadata budget (`max_working_bytes`) allows.
+    slot_limit: usize,
+    /// Arrived volumes that had valid recovery packets turned away because the
+    /// slot cap was full. Raising the cap absorbs them again.
+    cap_rejected: Mutex<Vec<(PathBuf, usize)>>,
     needs_backfill: AtomicBool,
     pool: Option<FoldPool>,
     /// Slices folded (counter for statistics).
@@ -2028,15 +2042,6 @@ impl StreamingParSession {
             let mut bytes = (total as usize)
                 .checked_mul(per_slice)?
                 .checked_add(file_metadata?)?;
-            bytes = bytes.checked_add(
-                usize::try_from(
-                    total
-                        .div_ceil(64)
-                        .checked_mul(8)?
-                        .checked_mul(opts.max_syndrome_slots as u64)?,
-                )
-                .ok()?,
-            )?;
             for id in &main.recoverable_file_ids {
                 // Raw name, lossy UTF-8 local name, joined path, and capacity growth.
                 bytes = bytes.checked_add(set.file_descs[id].name.len().checked_mul(16)?)?;
@@ -2050,6 +2055,11 @@ impl StreamingParSession {
             }
             Some(bytes as u64)
         })();
+        // Each syndrome slot also keeps a folded-slice bitmask.
+        let slot_mask_bytes = total.div_ceil(64).saturating_mul(8).max(1);
+        let metadata = metadata.and_then(|bytes| {
+            bytes.checked_add(slot_mask_bytes.checked_mul(opts.max_syndrome_slots as u64)?)
+        });
         if metadata.is_none_or(|bytes| bytes > opts.max_working_bytes) {
             return Err(RepairError::StreamingMemoryLimit {
                 context: "slice metadata",
@@ -2057,6 +2067,14 @@ impl StreamingParSession {
                 limit_bytes: opts.max_working_bytes,
             });
         }
+        let slot_limit = {
+            let without_slots =
+                metadata.unwrap_or(0) - slot_mask_bytes * opts.max_syndrome_slots as u64;
+            usize::try_from((opts.max_working_bytes - without_slots) / slot_mask_bytes)
+                .unwrap_or(usize::MAX)
+                .min(MAX_SYNDROME_SLOTS)
+                .max(opts.max_syndrome_slots)
+        };
         let ss = main.slice_size as usize;
         let mut files = Vec::new();
         let mut file_index = HashMap::new();
@@ -2165,6 +2183,9 @@ impl StreamingParSession {
             file_index,
             logs,
             slots,
+            max_slots: AtomicUsize::new(opts.max_syndrome_slots),
+            slot_limit,
+            cap_rejected: Mutex::new(Vec::new()),
             needs_backfill: AtomicBool::new(false),
             pool,
             folds: AtomicU64::new(0),
@@ -3170,6 +3191,103 @@ impl StreamingParSession {
         result
     }
 
+    /// Recovery slices of arrived volumes that were turned away because the
+    /// slot cap was full (counted when framed, before hashing, so an upper
+    /// bound). Raising the cap with
+    /// [`set_max_syndrome_slots`](Self::set_max_syndrome_slots) absorbs them.
+    #[must_use]
+    pub fn turned_away_recovery_slices(&self) -> usize {
+        self.inner
+            .cap_rejected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    /// Current syndrome slot cap (starts at `SessionOptions::max_syndrome_slots`).
+    #[must_use]
+    pub fn max_syndrome_slots(&self) -> usize {
+        self.inner.max_slots.load(Ordering::Acquire)
+    }
+
+    /// Change the syndrome slot cap of a running session, so a caller can grow
+    /// syndrome memory as damage appears instead of reserving it up front.
+    ///
+    /// Each slot costs one slice of resident syndrome plus one slice of
+    /// reconstructed output during a repair; the caller budgets that memory.
+    /// The cap is clamped to at least the slots already allocated (their
+    /// syndromes are kept) and at most what the slice metadata budget
+    /// (`max_working_bytes`) and the 16-bit exponent space allow.
+    ///
+    /// Whenever the cap leaves room for more slots (a raise, or a retry after an
+    /// error), it absorbs again every arrived recovery volume whose valid
+    /// recovery slices were turned away because the cap was full, and back-fills
+    /// the new syndromes from the verified source slices already on disk (each
+    /// reread is authenticated against IFSC). Lowering it only stops further
+    /// growth. Returns the effective cap.
+    ///
+    /// # Errors
+    /// [`RepairError::Cancelled`] after [`cancel`](Self::cancel), and
+    /// [`RepairError::Io`] when re-reading a turned-away volume or back-filling
+    /// from the source files fails. The new cap stays in effect on error.
+    pub fn set_max_syndrome_slots(&self, slots: usize) -> Result<usize, RepairError> {
+        self.inner.control.ensure_running()?;
+        let (cap, room) = {
+            // The exclusive payload gate keeps the allocated slot count stable.
+            let _payload = self
+                .inner
+                .payload_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let allocated = self
+                .inner
+                .slots
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            let cap = slots.min(self.inner.slot_limit).max(allocated);
+            self.inner.max_slots.store(cap, Ordering::Release);
+            (cap, cap > allocated)
+        };
+        // Retry turned-away volumes whenever there is room, not only on a raise,
+        // so a failed re-absorb can be retried at the same cap. A failing
+        // volume does not block the others; the first error is returned.
+        let mut first_error = None;
+        if room {
+            let rejected = std::mem::take(
+                &mut *self
+                    .inner
+                    .cap_rejected
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            for (path, blocks) in &rejected {
+                if let Err(e) = self.absorb_recovery_volume(path, None) {
+                    let mut list = self
+                        .inner
+                        .cap_rejected
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !list.iter().any(|(p, _)| p == path) {
+                        list.push((path.clone(), *blocks));
+                    }
+                    drop(list);
+                    if matches!(e, RepairError::Cancelled) {
+                        return Err(e);
+                    }
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        self.inner.control.ensure_running()?;
+        Ok(cap)
+    }
+
     fn absorb_recovery_volume(
         &self,
         path: &Path,
@@ -3188,6 +3306,8 @@ impl StreamingParSession {
         })?;
         let ss = self.inner.slice_size;
         let mut absorbed = 0usize;
+        // Recovery slices of new exponents turned away because the cap was full.
+        let mut cap_full = 0usize;
         // Keep every framed candidate until its hash is known. PacketSet would
         // deduplicate exponents before a corrupt candidate can be rejected.
         let mut packets = crate::packet::PacketIter::new(&src, ScanOptions::METADATA);
@@ -3252,8 +3372,9 @@ impl StreamingParSession {
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .len()
-                    >= self.inner.opts.max_syndrome_slots
+                    >= self.inner.max_slots.load(Ordering::Acquire)
             {
+                cap_full += 1;
                 packets
                     .reject_frame(&raw)
                     .map_err(io_ctx("resynchronizing recovery packets"))?;
@@ -3320,12 +3441,30 @@ impl StreamingParSession {
                 .tracker
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            t.par_files.push(path.to_path_buf());
+            if !t.par_files.iter().any(|p| p == path) {
+                t.par_files.push(path.to_path_buf());
+            }
             if let Some(id) = queued_id {
                 t.unpaused_in_flight.remove(&id);
                 if let Some(v) = t.queued_volumes.iter_mut().find(|v| v.id == id) {
                     v.paused = false;
                 }
+            }
+        }
+        {
+            let mut rejected = self
+                .inner
+                .cap_rejected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let known = rejected.iter().position(|(p, _)| p == path);
+            match (cap_full, known) {
+                (0, Some(i)) => {
+                    rejected.swap_remove(i);
+                }
+                (0, None) => {}
+                (n, Some(i)) => rejected[i].1 = n,
+                (n, None) => rejected.push((path.to_path_buf(), n)),
             }
         }
         // A failed read/authentication leaves missing rows and must be retried
@@ -5014,6 +5153,96 @@ mod live_tests {
             std::fs::read(fx.dir.join("part00.rar")).unwrap(),
             fx.files[0].1
         );
+        std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn raising_syndrome_cap_absorbs_turned_away_volume_and_backfills() {
+        // Start with a cap of 2 for 4 damaged slices: the volume's other valid
+        // recovery slices are turned away. Raising the cap at runtime absorbs
+        // them from the same arrived volume and back-fills from disk.
+        let fx = fixture("growcap", &[15_000, 9_000], 1000, 6, VolumeScheme::Single);
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                preallocated_syndrome_slots: 1,
+                max_syndrome_slots: 2,
+                max_staging_bytes: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.max_syndrome_slots(), 2);
+        for (name, data) in &fx.files {
+            let id = fid(&fx, name);
+            let path = fx.dir.join(name);
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(data.len() as u64)
+                .unwrap();
+            for (si, chunk) in data.chunks(1000).enumerate() {
+                if name == "part00.rar" && matches!(si, 1 | 6 | 11 | 14) {
+                    s.on_article_failed_permanently(&id, (si * 1000) as u64, 1000)
+                        .unwrap();
+                    continue;
+                }
+                write_at(&path, (si * 1000) as u64, chunk);
+                s.on_article_finished(
+                    &id,
+                    (si * 1000) as u64,
+                    chunk.len() as u64,
+                    crc32(chunk),
+                    Some(chunk),
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(), 2);
+        assert_eq!(s.status().ready_recovery, 2);
+        assert_eq!(s.turned_away_recovery_slices(), 4);
+        let f0 = fid(&fx, "part00.rar");
+        assert!(matches!(
+            s.repair_available_targets_now(&[f0]),
+            Err(RepairError::NotEnoughRecovery { .. })
+        ));
+        // Lowering below the allocated slots keeps them.
+        assert_eq!(s.set_max_syndrome_slots(0).unwrap(), 2);
+        // A turned-away volume that cannot be read keeps the raised cap and is
+        // retried by the next call at the same cap.
+        let moved = fx.dir.join("moved.par2");
+        std::fs::rename(&fx.vols[0], &moved).unwrap();
+        assert!(matches!(
+            s.set_max_syndrome_slots(5),
+            Err(RepairError::Io { .. })
+        ));
+        assert_eq!(s.max_syndrome_slots(), 5);
+        std::fs::rename(&moved, &fx.vols[0]).unwrap();
+        // 3 more slices come from the already arrived volume.
+        assert_eq!(s.set_max_syndrome_slots(5).unwrap(), 5);
+        assert_eq!(s.turned_away_recovery_slices(), 1);
+        let st = s.status();
+        assert_eq!(st.syndrome_slots, 5);
+        assert_eq!(st.ready_recovery, 5);
+        assert!(st.early_cutover_possible);
+        // Raising again re-reads the volume once more for the sixth slice only.
+        assert_eq!(
+            s.set_max_syndrome_slots(1 << 20).unwrap(),
+            s.inner.slot_limit
+        );
+        assert_eq!(s.status().ready_recovery, 6);
+        assert_eq!(s.turned_away_recovery_slices(), 0);
+        let rep = s.repair_available_targets_now(&[f0]).unwrap();
+        assert_eq!(rep.repaired_slices.len(), 4);
+        assert_eq!(
+            std::fs::read(fx.dir.join("part00.rar")).unwrap(),
+            fx.files[0].1
+        );
+        s.cancel();
+        assert!(matches!(
+            s.set_max_syndrome_slots(8),
+            Err(RepairError::Cancelled)
+        ));
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
 
