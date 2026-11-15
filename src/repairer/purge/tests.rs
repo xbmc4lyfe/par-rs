@@ -431,6 +431,10 @@ fn caller_registered_originals_are_checked_then_purged() {
             [&index[..], &foreign_unknown[..]].concat(),
         ),
         ("late_start.par2", [&b"junk"[..], &index[..]].concat()),
+        (
+            "mostly_data.par2",
+            [&index[..], &vec![0x41; 3 * index.len()][..]].concat(),
+        ),
     ];
     let mut rejected_paths = vec![foreign.clone()];
     for (name, bytes) in &cases {
