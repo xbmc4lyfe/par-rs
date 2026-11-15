@@ -123,6 +123,7 @@ fn literal_options() -> RepairOptions {
     RepairOptions {
         num_threads: 1,
         file_threads: 0,
+        skip_leeway: None,
         mem_limit_bytes: 16 << 20,
         backup: par_rs::BackupPolicy::RenameNumbered,
         verify_repaired: true,

@@ -361,6 +361,7 @@ impl Par2Repairer {
             ExtraFileScanPolicy::Full => {
                 let config = ScanConfig {
                     buffer_size: self.scan_resources(1).1,
+                    skip_leeway: self.options.skip_leeway,
                     ..ScanConfig::default()
                 };
                 let total = source.source_len().max(1);

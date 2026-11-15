@@ -193,6 +193,8 @@ pub struct ScanReport {
     pub sliding_hits: u64,
     /// Bytes examined by the sliding window.
     pub slid_bytes: u64,
+    /// Bytes jumped over by data skipping ([`ScanConfig::skip_leeway`]).
+    pub skipped_bytes: u64,
     /// Fused hashes of the whole file. Absent if cancellation leaves bytes unread.
     pub file_hashes: Option<FileHashes>,
     /// Whether the scan was cancelled.
@@ -224,6 +226,14 @@ pub struct ScanConfig<'a> {
     /// offset `b * slice_size`). When present (and as long as `expected`) the scanner skips its
     /// own aligned pass and does not re-hash those slices during the sliding scan.
     pub known_aligned: Option<&'a [bool]>,
+    /// Data skipping (par2cmdline `-N` with `-S<n>`): `Some(leeway)` probes only offsets
+    /// within `leeway` bytes of an expected slice position instead of sliding over every
+    /// byte. Expected positions are whole slices after the start of the last match (the file
+    /// start before any match), so data shifted by an insertion or deletion is picked up
+    /// again after the next match. Slices displaced further than `leeway` from that grid are
+    /// missed. `None` (the default) is the full sliding scan; a `leeway` of half a slice or
+    /// more is equivalent to it.
+    pub skip_leeway: Option<u64>,
 }
 
 impl Default for ScanConfig<'_> {
@@ -233,6 +243,7 @@ impl Default for ScanConfig<'_> {
             buffer_size: 8 << 20,
             hash_file: true,
             known_aligned: None,
+            skip_leeway: None,
         }
     }
 }
@@ -504,6 +515,13 @@ pub fn scan_source<S: PacketSource + ?Sized>(
 
     // ---- General scan ---------------------------------------------------------------------
     let wt = (!config.aligned_only).then(|| WindowTable::new(ss));
+    // Data skipping: start of the last match; probes stay within `leeway` of its slice grid.
+    let skip = config.skip_leeway.filter(|&l| l.saturating_mul(2) < ss);
+    let mut anchor = 0u64;
+    let in_leeway = |p: u64, anchor: u64, l: u64| {
+        let r = p.saturating_sub(anchor) % ss;
+        r <= l || r >= ss - l
+    };
     while pos < file_len {
         if is_cancelled() {
             report.cancelled = true;
@@ -519,6 +537,7 @@ pub fn scan_source<S: PacketSource + ?Sized>(
                 block: e.block,
             });
             report.aligned_hits += 1;
+            anchor = pos;
             pos += ss;
             progress(pos.min(file_len));
             continue;
@@ -534,6 +553,7 @@ pub fn scan_source<S: PacketSource + ?Sized>(
         if index.might_contain(final_crc)
             && confirm(pos, final_crc, digest, &mut report, aligned_here)
         {
+            anchor = pos;
             pos += ss;
             progress(pos.min(file_len));
             continue;
@@ -544,10 +564,21 @@ pub fn scan_source<S: PacketSource + ?Sized>(
             progress(pos.min(file_len));
             continue;
         };
-        // Slide byte by byte until the next confirmed match or EOF.
+        // Slide byte by byte until the next confirmed match or EOF (with data skipping, only
+        // while inside the leeway around the expected slice position).
         let mut matched = false;
+        let mut jump_to = None;
         while pos + 1 < file_len {
             let new_pos = pos + 1;
+            if let Some(l) = skip
+                && !in_leeway(new_pos, anchor, l)
+            {
+                // Next expected position minus the leeway; always ahead of `new_pos` and
+                // within the bytes already read, so the fused file hash stays contiguous.
+                let q = (new_pos - anchor) / ss;
+                jump_to = Some(anchor + (q + 1) * ss - l);
+                break;
+            }
             let new_end = new_pos.saturating_add(ss);
             if new_end <= file_len
                 && (new_end > win.base + win.len as u64 || new_end - 1 < win.base)
@@ -599,7 +630,15 @@ pub fn scan_source<S: PacketSource + ?Sized>(
             break;
         }
         if matched {
+            anchor = pos;
             pos += ss;
+        } else if let Some(next) = jump_to {
+            report.skipped_bytes += next.min(file_len) - pos;
+            if !win.hash_until(next.min(file_len), cancel)? {
+                report.cancelled = true;
+                break;
+            }
+            pos = next;
         } else {
             pos = file_len;
         }
@@ -1243,5 +1282,140 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn scan_with(data: &[u8], index: &ChecksumIndex, skip: Option<u64>) -> ScanReport {
+        let cfg = ScanConfig {
+            buffer_size: 64 << 10,
+            skip_leeway: skip,
+            ..ScanConfig::default()
+        };
+        scan_source(data, index, None, &cfg, None, &mut |_| {}).unwrap()
+    }
+
+    fn found_blocks(r: &ScanReport) -> Vec<(u64, u32)> {
+        let mut v: Vec<(u64, u32)> = r
+            .found
+            .iter()
+            .map(|f| (f.offset, f.block.block_index))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn data_skipping_finds_slices_within_leeway_and_skips_the_rest() {
+        let ss = 4096usize;
+        let data = rnd(ss * 12, 41);
+        let index = ChecksumIndex::new(ss as u64, entries(0, &data, ss));
+        // 3 junk bytes at the start: every slice sits 3 bytes after its grid position.
+        let mut shifted = vec![0xA5u8; 3];
+        shifted.extend_from_slice(&data);
+        let full = scan_with(&shifted, &index, None);
+        let skip = scan_with(&shifted, &index, Some(8));
+        assert_eq!(found_blocks(&skip), found_blocks(&full));
+        assert_eq!(skip.found.len(), 12);
+        assert_eq!(skip.skipped_bytes, 0, "the first match re-anchors the grid");
+        // Same fused file hashes whether or not data is skipped.
+        assert_eq!(skip.file_hashes, full.file_hashes);
+        assert!(skip.file_hashes.is_some());
+
+        // Leeway 2 < shift 3: the first slice is missed until the grid is passed; nothing
+        // after it is found either (the grid never re-anchors), and most bytes are skipped.
+        let tight = scan_with(&shifted, &index, Some(2));
+        assert!(tight.found.is_empty(), "{:?}", found_blocks(&tight));
+        assert!(tight.skipped_bytes > (ss * 10) as u64);
+        assert!(tight.slid_bytes < (ss * 12) as u64 / 100);
+        assert_eq!(tight.file_hashes, full.file_hashes);
+    }
+
+    #[test]
+    fn data_skipping_re_anchors_after_each_match() {
+        let ss = 4096usize;
+        let data = rnd(ss * 10, 42);
+        let index = ChecksumIndex::new(ss as u64, entries(0, &data, ss));
+        // Slices 0..4 in place, then 5 inserted bytes, then slices 4..10 (shifted by 5).
+        let mut file = data[..ss * 4].to_vec();
+        file.extend_from_slice(&[1, 2, 3, 4, 5]);
+        file.extend_from_slice(&data[ss * 4..]);
+        let full = scan_with(&file, &index, None);
+        assert_eq!(full.found.len(), 10);
+        // Leeway 5 reaches the first shifted slice; later ones follow the new anchor.
+        let skip = scan_with(&file, &index, Some(5));
+        assert_eq!(found_blocks(&skip), found_blocks(&full));
+        // Leeway 4 misses everything after the insertion.
+        let tight = scan_with(&file, &index, Some(4));
+        assert_eq!(
+            found_blocks(&tight),
+            (0..4)
+                .map(|b| (b * ss as u64, b as u32))
+                .collect::<Vec<_>>()
+        );
+        assert!(tight.skipped_bytes > 0);
+        assert_eq!(tight.file_hashes, full.file_hashes);
+    }
+
+    #[test]
+    fn data_skipping_with_half_slice_leeway_is_the_full_scan() {
+        let ss = 1024usize;
+        let data = rnd(ss * 16, 43);
+        let index = ChecksumIndex::new(ss as u64, entries(0, &data, ss));
+        // Slices scattered at odd offsets between junk.
+        let mut file = Vec::new();
+        for (i, c) in data.chunks(ss).enumerate() {
+            file.extend(std::iter::repeat_n(0x5Au8, (i * 37) % 300));
+            file.extend_from_slice(c);
+        }
+        let full = scan_with(&file, &index, None);
+        for leeway in [ss as u64 / 2, ss as u64, u64::MAX] {
+            let r = scan_with(&file, &index, Some(leeway));
+            assert_eq!(found_blocks(&r), found_blocks(&full), "leeway {leeway}");
+            assert_eq!(r.skipped_bytes, 0);
+        }
+        // A small leeway still finds every slice displaced by at most that much from the
+        // previous match's grid, and reads no more than the full scan.
+        let r = scan_with(&file, &index, Some(40));
+        assert!(r.found.len() <= full.found.len());
+        assert!(r.slid_bytes <= full.slid_bytes);
+        assert_eq!(r.file_hashes, full.file_hashes);
+    }
+
+    #[test]
+    fn data_skipping_anchor_follows_reused_aligned_matches() {
+        let ss = 4096usize;
+        let data = rnd(ss * 8, 44);
+        let es = entries(0, &data, ss);
+        let index = ChecksumIndex::new(ss as u64, es.clone());
+        // 8 junk bytes + S0, S1 minus its first 8 bytes, S2 (now aligned at 2ss), S3 minus its
+        // first 8 bytes, then S4.. at 4ss - 8 (-8 from the grid of the S2 match).
+        let s = |i: usize| &data[i * ss..(i + 1) * ss];
+        let mut file = vec![0x33u8; 8];
+        file.extend_from_slice(s(0));
+        file.extend_from_slice(&s(1)[8..]);
+        file.extend_from_slice(s(2));
+        file.extend_from_slice(&s(3)[8..]);
+        for i in 4..8 {
+            file.extend_from_slice(s(i));
+        }
+        let run = |expected: Option<&[ChecksumEntry]>| {
+            let cfg = ScanConfig {
+                buffer_size: 64 << 10,
+                skip_leeway: Some(8),
+                ..ScanConfig::default()
+            };
+            scan_source(&file[..], &index, expected, &cfg, None, &mut |_| {}).unwrap()
+        };
+        let without = run(None);
+        let with = run(Some(&es));
+        let blocks = |r: &ScanReport| {
+            let mut v: Vec<u32> = r.found.iter().map(|f| f.block.block_index).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert_eq!(blocks(&without), [0, 2, 4, 5, 6, 7]);
+        assert_eq!(blocks(&with), blocks(&without));
+        assert_eq!(with.file_hashes, without.file_hashes);
+        assert!(with.skipped_bytes <= file.len() as u64);
     }
 }
