@@ -1923,7 +1923,7 @@ struct SessionInner {
     slot_limit: usize,
     /// Arrived volumes that had valid recovery packets turned away because the
     /// slot cap was full. Raising the cap absorbs them again.
-    cap_rejected: Mutex<Vec<PathBuf>>,
+    cap_rejected: Mutex<Vec<(PathBuf, usize)>>,
     needs_backfill: AtomicBool,
     pool: Option<FoldPool>,
     /// Slices folded (counter for statistics).
@@ -3191,6 +3191,21 @@ impl StreamingParSession {
         result
     }
 
+    /// Recovery slices of arrived volumes that were turned away because the
+    /// slot cap was full (counted when framed, before hashing, so an upper
+    /// bound). Raising the cap with
+    /// [`set_max_syndrome_slots`](Self::set_max_syndrome_slots) absorbs them.
+    #[must_use]
+    pub fn turned_away_recovery_slices(&self) -> usize {
+        self.inner
+            .cap_rejected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(_, n)| n)
+            .sum()
+    }
+
     /// Current syndrome slot cap (starts at `SessionOptions::max_syndrome_slots`).
     #[must_use]
     pub fn max_syndrome_slots(&self) -> usize {
@@ -3248,15 +3263,15 @@ impl StreamingParSession {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
-            for path in &rejected {
+            for (path, blocks) in &rejected {
                 if let Err(e) = self.absorb_recovery_volume(path, None) {
                     let mut list = self
                         .inner
                         .cap_rejected
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !list.contains(path) {
-                        list.push(path.clone());
+                    if !list.iter().any(|(p, _)| p == path) {
+                        list.push((path.clone(), *blocks));
                     }
                     drop(list);
                     if matches!(e, RepairError::Cancelled) {
@@ -3291,7 +3306,8 @@ impl StreamingParSession {
         })?;
         let ss = self.inner.slice_size;
         let mut absorbed = 0usize;
-        let mut cap_full = false;
+        // Recovery slices of new exponents turned away because the cap was full.
+        let mut cap_full = 0usize;
         // Keep every framed candidate until its hash is known. PacketSet would
         // deduplicate exponents before a corrupt candidate can be rejected.
         let mut packets = crate::packet::PacketIter::new(&src, ScanOptions::METADATA);
@@ -3358,7 +3374,7 @@ impl StreamingParSession {
                     .len()
                     >= self.inner.max_slots.load(Ordering::Acquire)
             {
-                cap_full = true;
+                cap_full += 1;
                 packets
                     .reject_frame(&raw)
                     .map_err(io_ctx("resynchronizing recovery packets"))?;
@@ -3441,13 +3457,14 @@ impl StreamingParSession {
                 .cap_rejected
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let known = rejected.iter().position(|p| p == path);
+            let known = rejected.iter().position(|(p, _)| p == path);
             match (cap_full, known) {
-                (true, None) => rejected.push(path.to_path_buf()),
-                (false, Some(i)) => {
+                (0, Some(i)) => {
                     rejected.swap_remove(i);
                 }
-                _ => {}
+                (0, None) => {}
+                (n, Some(i)) => rejected[i].1 = n,
+                (n, None) => rejected.push((path.to_path_buf(), n)),
             }
         }
         // A failed read/authentication leaves missing rows and must be retried
@@ -5183,6 +5200,7 @@ mod live_tests {
         }
         assert_eq!(s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(), 2);
         assert_eq!(s.status().ready_recovery, 2);
+        assert_eq!(s.turned_away_recovery_slices(), 4);
         let f0 = fid(&fx, "part00.rar");
         assert!(matches!(
             s.repair_available_targets_now(&[f0]),
@@ -5202,6 +5220,7 @@ mod live_tests {
         std::fs::rename(&moved, &fx.vols[0]).unwrap();
         // 3 more slices come from the already arrived volume.
         assert_eq!(s.set_max_syndrome_slots(5).unwrap(), 5);
+        assert_eq!(s.turned_away_recovery_slices(), 1);
         let st = s.status();
         assert_eq!(st.syndrome_slots, 5);
         assert_eq!(st.ready_recovery, 5);
@@ -5212,6 +5231,7 @@ mod live_tests {
             s.inner.slot_limit
         );
         assert_eq!(s.status().ready_recovery, 6);
+        assert_eq!(s.turned_away_recovery_slices(), 0);
         let rep = s.repair_available_targets_now(&[f0]).unwrap();
         assert_eq!(rep.repaired_slices.len(), 4);
         assert_eq!(
