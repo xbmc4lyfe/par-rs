@@ -303,7 +303,16 @@ pub fn slice_ranges(file: usize, file_len: u64, slice_size: u64, slices: u64) ->
         .collect()
 }
 
-/// Whole-file digests (CRC-32, MD5, 16k MD5) of several files, one file per thread.
+/// Threads for [`file_hashes_parallel`]: the requested count (0 = all cores), at most one
+/// per file and at most `WORKING_MEMORY_BYTES / READ_CHUNK` buffers.
+fn file_hash_thread_cap(threads: usize, files: usize) -> usize {
+    let budget = (WORKING_MEMORY_BYTES / READ_CHUNK as u64).max(1) as usize;
+    thread_count(threads).min(budget).clamp(1, files.max(1))
+}
+
+/// Whole-file digests (CRC-32, MD5, 16k MD5) of several files, one file per thread. Each
+/// thread holds one `READ_CHUNK` buffer, so the thread count is capped to keep the buffers
+/// within the working-memory budget whatever `threads` asks for.
 pub fn file_hashes_parallel(
     paths: &[&Path],
     threads: usize,
@@ -312,7 +321,7 @@ pub fn file_hashes_parallel(
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    let threads = thread_count(threads).clamp(1, paths.len());
+    let threads = file_hash_thread_cap(threads, paths.len());
     let next = AtomicUsize::new(0);
     let out: Mutex<Vec<Option<FileHashes>>> = Mutex::new(vec![None; paths.len()]);
     let error: Mutex<Option<io::Error>> = Mutex::new(None);
@@ -549,5 +558,15 @@ mod tests {
         assert!(file_hashes_parallel(&mp, 1, None).is_err());
         assert!(file_hashes_parallel(&paths, 1, Some(&c)).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_hash_threads_stay_within_memory_budget() {
+        let budget = (WORKING_MEMORY_BYTES / READ_CHUNK as u64) as usize;
+        assert_eq!(file_hash_thread_cap(1000, 5000), budget);
+        assert_eq!(file_hash_thread_cap(3, 5000), 3.min(budget));
+        assert_eq!(file_hash_thread_cap(1000, 2), 2);
+        assert_eq!(file_hash_thread_cap(1, 0), 1);
+        assert!(file_hash_thread_cap(0, 5000) <= budget);
     }
 }
