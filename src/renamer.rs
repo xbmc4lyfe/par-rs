@@ -473,15 +473,13 @@ impl ParRenamer {
     fn load_par_file(&mut self, path: &Path, events: &mut dyn FnMut(RenamerEvent)) {
         let disk = self.disk_path(path);
         let mut set = PacketSet::new();
-        let loaded = match set.load_file(&disk, 0, ScanOptions::METADATA) {
-            Ok(_) => {
-                set.main.is_some()
-                    && std::fs::metadata(&disk)
-                        .map(|m| m.len() > 0)
-                        .unwrap_or(false)
-            }
-            Err(_) => false,
-        };
+        // Like libpar2's LoadPacketsFromFile, a file counts as loaded when it yielded any
+        // usable packet: a Main or at least one FileDesc. Packets read before an error count.
+        let _ = set.load_file(&disk, 0, ScanOptions::METADATA);
+        let loaded = (set.main.is_some() || !set.file_descs.is_empty())
+            && std::fs::metadata(&disk)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
         if !loaded {
             events(RenamerEvent::Warning(format!(
                 "Could not load par2-file {}",
@@ -496,19 +494,15 @@ impl ParRenamer {
             "Loaded par2-file {} for par-rename",
             base_name(path)
         )));
+        // Without a Main packet the file is damaged (extra par2 files get loaded), but its
+        // FileDescs still name files: `file_ids_in_main_order` falls back to their ids.
+        if set.main.is_none() {
+            self.mark_damaged(path, events);
+        }
         let ids = set.file_ids_in_main_order();
         for id in ids {
             let Some(fd) = set.file_descs.get(&id) else {
-                // One warning and one bad-list entry per par2 file, however many
-                // descriptions it lacks (otherwise it would be renamed to .bad twice).
-                if !self.bad_pars.iter().any(|p| p == path) {
-                    events(RenamerEvent::Warning(format!(
-                        "Damaged par2-file detected: {}",
-                        base_name(path)
-                    )));
-                    self.bad_pars.push(path.to_path_buf());
-                }
-                self.report.has_damaged_par_files = true;
+                self.mark_damaged(path, events);
                 continue;
             };
             let filename = fd.local_name();
@@ -526,6 +520,19 @@ impl ParRenamer {
                 });
             }
         }
+    }
+
+    /// Flag `path` as a damaged par2 file: one warning and one bad-list entry per file, however
+    /// often it is found damaged (otherwise it would be renamed to `.bad` twice).
+    fn mark_damaged(&mut self, path: &Path, events: &mut dyn FnMut(RenamerEvent)) {
+        if !self.bad_pars.iter().any(|p| p == path) {
+            events(RenamerEvent::Warning(format!(
+                "Damaged par2-file detected: {}",
+                base_name(path)
+            )));
+            self.bad_pars.push(path.to_path_buf());
+        }
+        self.report.has_damaged_par_files = true;
     }
 
     fn check_regular_file(
@@ -1440,6 +1447,103 @@ mod tests {
             matches!(warnings[0], RenamerEvent::Warning(m) if m.contains(&locked.display().to_string()))
         );
         assert!(!events.iter().any(|e| matches!(e, RenamerEvent::Error(_))));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn index_without_main_still_names_files_and_reports_damage() {
+        let dir = tmpdir("nomain");
+        let a = rnd(9_000, 91);
+        let b = rnd(4_000, 92);
+        let (bytes, _) = create_in_memory(
+            &[(b"first.bin", &a), (b"second.bin", &b)],
+            1024,
+            &[0],
+            Kernel::detect(),
+        )
+        .unwrap();
+        // Index with every critical packet, its Main corrupted (packet hash no longer matches).
+        let mut index = Vec::new();
+        for r in crate::packet::PacketIter::new(&bytes, ScanOptions::UNVERIFIED).map(|r| r.unwrap())
+        {
+            let s = r.offset as usize;
+            let e = s + r.header.length as usize;
+            match r.header.kind() {
+                crate::packet::PacketType::RecoverySlice => {}
+                crate::packet::PacketType::Main => {
+                    let mut p = bytes[s..e].to_vec();
+                    let last = p.len() - 1;
+                    p[last] ^= 0xFF;
+                    index.extend_from_slice(&p);
+                }
+                _ => index.extend_from_slice(&bytes[s..e]),
+            }
+        }
+        std::fs::write(dir.join("set.par2"), &index).unwrap();
+        std::fs::write(dir.join("obf1"), &a).unwrap();
+        std::fs::write(dir.join("obf2"), &b).unwrap();
+        let mut events = Vec::new();
+        let rep = ParRenamer::new(&dir, RenamerOptions::default())
+            .run(None, &mut |e| events.push(e))
+            .unwrap();
+        assert!(dir.join("first.bin").exists() && dir.join("second.bin").exists());
+        assert!(rep.has_damaged_par_files);
+        assert_eq!(rep.loaded_par_files, vec![dir.join("set.par2")]);
+        assert_eq!(rep.bad_par_files, vec![dir.join("set.par2")]);
+        // Renames happened, so the Main-less index is marked bad, once.
+        assert!(dir.join("set.par2.bad").exists());
+        let damaged = events
+            .iter()
+            .filter(|e| matches!(e, RenamerEvent::Warning(m) if m.contains("Damaged par2-file detected")))
+            .count();
+        assert_eq!(damaged, 1, "{events:?}");
+        let mut described: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                RenamerEvent::Described { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        described.sort();
+        assert_eq!(described, ["first.bin", "second.bin"]);
+        assert!(!events.iter().any(|e| matches!(e, RenamerEvent::Error(_))));
+        assert!(!events.iter().any(
+            |e| matches!(e, RenamerEvent::Warning(m) if m.contains("Could not load par2-file"))
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn par_file_without_main_or_descs_is_not_loaded() {
+        let dir = tmpdir("nodescs");
+        let a = rnd(3_000, 93);
+        let (bytes, _) = create_in_memory(&[(b"x.bin", &a)], 1024, &[0], Kernel::detect()).unwrap();
+        // Only recovery and IFSC/creator packets: nothing to learn names from.
+        let mut only = Vec::new();
+        for r in crate::packet::PacketIter::new(&bytes, ScanOptions::UNVERIFIED).map(|r| r.unwrap())
+        {
+            let s = r.offset as usize;
+            let e = s + r.header.length as usize;
+            if !matches!(
+                r.header.kind(),
+                crate::packet::PacketType::Main | crate::packet::PacketType::FileDesc
+            ) {
+                only.extend_from_slice(&bytes[s..e]);
+            }
+        }
+        std::fs::write(dir.join("set.par2"), &only).unwrap();
+        std::fs::write(dir.join("obf"), &a).unwrap();
+        let mut events = Vec::new();
+        let rep = ParRenamer::new(&dir, RenamerOptions::default())
+            .run(None, &mut |e| events.push(e))
+            .unwrap();
+        assert_eq!(rep.renamed_count(), 0);
+        assert!(rep.has_damaged_par_files);
+        assert!(rep.loaded_par_files.is_empty());
+        assert_eq!(rep.bad_par_files, vec![dir.join("set.par2")]);
+        assert!(events.iter().any(
+            |e| matches!(e, RenamerEvent::Warning(m) if m.contains("Could not load par2-file"))
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
