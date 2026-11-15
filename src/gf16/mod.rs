@@ -177,6 +177,9 @@ pub const fn is_valid_logbase(logbase: u32) -> bool {
 }
 
 /// The logarithms (base `alpha`) of the first `count` input-slice constants.
+///
+/// # Errors
+/// [`TooManyInputSlices`] when `count` exceeds 32768.
 pub fn input_constant_logs(count: usize) -> Result<Vec<u16>, TooManyInputSlices> {
     if count > 32768 {
         return Err(TooManyInputSlices);
@@ -198,6 +201,9 @@ pub fn input_constant_logs(count: usize) -> Result<Vec<u16>, TooManyInputSlices>
 
 /// The constants assigned to the first `count` input slices of a PAR2 recovery set
 /// (`2, 4, 16, 128, 256, 2048, 8192, 16384, ...`).
+///
+/// # Errors
+/// [`TooManyInputSlices`] when `count` exceeds 32768.
 pub fn input_constants(count: usize) -> Result<Vec<u16>, TooManyInputSlices> {
     let logs = input_constant_logs(count)?;
     let t = tables();

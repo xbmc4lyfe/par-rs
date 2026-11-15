@@ -210,6 +210,10 @@ impl Segment {
 /// Reads raw bytes to compute CRCs where in-memory article CRCs do not line up with slices.
 pub trait RangeReader {
     /// CRC-32 of `len` bytes starting at `start`.
+    ///
+    /// # Errors
+    /// Implementations return the read error, `UnexpectedEof` for a range past the data, or
+    /// `Unsupported` when reads are disabled (as in [`NoDiskAccess`]).
     fn range_crc(&mut self, start: u64, len: u64) -> io::Result<u32>;
 }
 
@@ -260,6 +264,9 @@ impl RangeReader for NoDiskAccess {
 /// gaps, and failed segments).
 ///
 /// `segments` must be sorted by offset and non-overlapping.
+///
+/// # Errors
+/// Propagates any error from `reader` while reading the uncovered parts.
 pub fn smart_calc_range_crc(
     segments: &[Segment],
     start: i64,
@@ -386,6 +393,9 @@ pub fn presumed_valid_blocks(
 /// vector when every run of presumed-valid blocks checks out, or `None` when a CRC mismatch
 /// (or an unreadable range) means the file needs a full scan. Port of
 /// `ParChecker::VerifyPartialDataFile`.
+///
+/// # Errors
+/// Propagates read errors from `reader`, except `Unsupported`, which yields `Ok(None)`.
 pub fn verify_partial_file(
     segments: &[Segment],
     file_size: i64,
@@ -462,6 +472,10 @@ pub enum DownloadStatus<'a> {
 
 /// Quick verification entry point combining [`verify_success_file_crc`] and
 /// [`verify_partial_file`]. `file_size` is the size of the file on disk.
+///
+/// # Errors
+/// For [`DownloadStatus::Partial`], propagates read errors from `reader` (except
+/// `Unsupported`, which yields [`QuickVerdict::NeedsFullScan`]).
 pub fn quick_verify(
     status: &DownloadStatus<'_>,
     file_size: u64,

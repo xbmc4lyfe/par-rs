@@ -119,6 +119,9 @@ pub fn slice_checksums(slice: &[u8]) -> (u32, [u8; 16]) {
 }
 
 /// Hash everything readable from `reader`.
+///
+/// # Errors
+/// Propagates any non-`Interrupted` read error from `reader`.
 pub fn hash_reader<R: Read>(mut reader: R) -> io::Result<FileHashes> {
     let mut buf = vec![0u8; READ_CHUNK];
     let mut h = FileHasher::new();
@@ -135,11 +138,17 @@ pub fn hash_reader<R: Read>(mut reader: R) -> io::Result<FileHashes> {
 }
 
 /// Hash a file on disk.
+///
+/// # Errors
+/// Propagates I/O errors opening or reading `path`.
 pub fn hash_file(path: &std::path::Path) -> io::Result<FileHashes> {
     hash_reader(std::fs::File::open(path)?)
 }
 
 /// MD5 of the first 16 KiB of a file on disk (reads at most 16384 bytes).
+///
+/// # Errors
+/// Propagates I/O errors opening or reading `path`.
 pub fn file_md5_16k(path: &std::path::Path) -> io::Result<[u8; 16]> {
     let mut f = std::fs::File::open(path)?;
     let mut buf = vec![0u8; HASH_16K_LEN as usize];

@@ -43,6 +43,10 @@ pub struct SyndromeBank {
 
 impl SyndromeBank {
     /// Bank for `total_slices` input slices and the given recovery exponents.
+    ///
+    /// # Errors
+    /// [`RepairError::ZeroSliceSize`] when `slice_size` is 0, or [`RepairError::TooManyInputs`]
+    /// when `total_slices` exceeds 32768.
     pub fn new(
         slice_size: usize,
         total_slices: usize,
@@ -129,6 +133,10 @@ impl SyndromeBank {
     }
 
     /// Fold a verified input slice (exactly `slice_size` bytes, zero padded) into every buffer.
+    ///
+    /// # Errors
+    /// [`RepairError::SliceSizeMismatch`] when `data` is not `slice_size` bytes, or
+    /// [`RepairError::BadIndex`] when `global` is out of range.
     pub fn fold_verified(&mut self, global: usize, data: &[u8]) -> Result<(), RepairError> {
         if data.len() != self.slice_size {
             return Err(RepairError::SliceSizeMismatch {
@@ -158,6 +166,9 @@ impl SyndromeBank {
 
     /// XOR a recovery slice into its buffer. Returns `Ok(true)` when it was folded; unknown
     /// exponents and duplicate deliveries are ignored (`Ok(false)`).
+    ///
+    /// # Errors
+    /// [`RepairError::SliceSizeMismatch`] when `data` is not `slice_size` bytes.
     pub fn xor_recovery(&mut self, exponent: u32, data: &[u8]) -> Result<bool, RepairError> {
         if data.len() != self.slice_size {
             return Err(RepairError::SliceSizeMismatch {
@@ -182,6 +193,9 @@ impl SyndromeBank {
     }
 
     /// Solve for every unknown slice: `(global index, data)`.
+    ///
+    /// # Errors
+    /// As [`solve_selected`](Self::solve_selected).
     pub fn solve_now(&self) -> Result<Vec<(usize, Vec<u8>)>, RepairError> {
         let unknown = self.unknown_slices();
         self.solve_selected(&unknown)
@@ -189,6 +203,11 @@ impl SyndromeBank {
 
     /// Solve only for `wanted` (each must be unknown); every unknown slice still counts toward
     /// the syndromes required.
+    ///
+    /// # Errors
+    /// [`RepairError::BadIndex`] or [`RepairError::NotMissing`] for a bad `wanted` entry;
+    /// [`RepairError::NotEnoughRecovery`] or [`RepairError::Singular`] when the ready
+    /// syndromes cannot solve the unknown slices.
     pub fn solve_selected(&self, wanted: &[usize]) -> Result<Vec<(usize, Vec<u8>)>, RepairError> {
         let mut rows: Vec<usize> = wanted.to_vec();
         rows.sort_unstable();
@@ -345,6 +364,10 @@ pub struct StreamingSliceAssembler {
 impl StreamingSliceAssembler {
     /// Assembler over `files` (any order; sorted into `libpar2` file-id order here) tracking `exponents`.
     /// `max_staging_bytes` bounds the partially filled slice buffers (0 = unbounded).
+    ///
+    /// # Errors
+    /// [`RepairError::ZeroSliceSize`], [`RepairError::BadIndex`] when a file's checksum count
+    /// does not match its size, or [`RepairError::TooManyInputs`] above 32768 slices.
     pub fn new(
         slice_size: usize,
         mut files: Vec<FileLayout>,
@@ -505,6 +528,10 @@ impl StreamingSliceAssembler {
 
     /// Deliver decoded bytes of file `file_id` starting at `byte_offset`. Bytes beyond the file
     /// size are ignored. Returns the events this chunk produced.
+    ///
+    /// # Errors
+    /// [`RepairError::BadIndex`] for an unknown `file_id`, or [`RepairError::Io`] (kind
+    /// `OutOfMemory`) when a new staging buffer would exceed `max_staging_bytes`.
     pub fn push_chunk(
         &mut self,
         file_id: &[u8; 16],
@@ -641,6 +668,9 @@ impl StreamingSliceAssembler {
     }
 
     /// A recovery slice arrived (any time). Untracked exponents are ignored.
+    ///
+    /// # Errors
+    /// [`RepairError::SliceSizeMismatch`] when `data` is not `slice_size` bytes.
     pub fn push_recovery(
         &mut self,
         exponent: u32,
@@ -655,11 +685,17 @@ impl StreamingSliceAssembler {
     }
 
     /// Solve every damaged and pending slice from the bank: `(global, data)`.
+    ///
+    /// # Errors
+    /// As [`SyndromeBank::solve_selected`].
     pub fn solve_now(&self) -> Result<Vec<(usize, Vec<u8>)>, RepairError> {
         self.bank.solve_now()
     }
 
     /// Solve only the given unknown slices (for example, an archive's header and tail).
+    ///
+    /// # Errors
+    /// As [`SyndromeBank::solve_selected`].
     pub fn solve_selected_slices(
         &self,
         wanted: &[usize],

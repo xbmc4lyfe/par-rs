@@ -238,6 +238,11 @@ impl SyndromeState {
 impl Par2Repairer {
     /// Turn on streaming mode (after [`finalize`](Self::finalize)). Allocates one
     /// `slice_size` buffer per tracked exponent.
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`] before [`finalize`](Self::finalize), [`RepairError::Singular`]
+    /// when the set has more than 32768 source slices, and [`RepairError::Io`] when re-reading an
+    /// already located block fails.
     pub fn enable_streaming(
         &mut self,
         opts: &StreamingOptions,
@@ -351,6 +356,10 @@ impl Par2Repairer {
     /// Track additional recovery exponents (for example, when more volumes are queued). Already
     /// verified blocks are re-read from disk and folded into the new syndromes. Returns the
     /// number of exponents now tracked.
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`] when streaming is not enabled, and [`RepairError::Io`] when
+    /// re-reading an already folded block fails.
     pub fn streaming_track_exponents(&mut self, more: &[u32]) -> Result<usize, RepairError> {
         let ss = self.block_size() as usize;
         let Some(st) = self.streaming.as_mut() else {
@@ -393,6 +402,10 @@ impl Par2Repairer {
     /// Report an article written to the target file of `file_index` at `offset`
     /// (`success == false` for a failed article). Blocks that became complete are read from
     /// the target file, verified, and folded. Returns the blocks whose state changed.
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`] when streaming is not enabled, and [`RepairError::Io`] when
+    /// opening, reading, or hashing the target file fails.
     pub fn streaming_segment_written(
         &mut self,
         file_index: usize,
@@ -406,6 +419,10 @@ impl Par2Repairer {
     /// Report a decoded article held in memory (also assumed to be written to the target file
     /// at the same offset). Blocks completed purely from staged data undergo verification
     /// without touching the disk.
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`] when streaming is not enabled, and [`RepairError::Io`] when
+    /// reading a block not fully staged in memory, or hashing the target file, fails.
     pub fn streaming_segment_data(
         &mut self,
         file_index: usize,
@@ -416,6 +433,9 @@ impl Par2Repairer {
     }
 
     /// Report that a failed article's byte range cannot arrive.
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`] when streaming is not enabled.
     pub fn streaming_segment_failed(
         &mut self,
         file_index: usize,
@@ -622,6 +642,10 @@ impl Par2Repairer {
 
     /// Declare a file fully written. Needed for files without IFSC packets (verified by whole
     /// file MD5 only); harmless otherwise. Returns the blocks whose state changed.
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`] when streaming is not enabled, and [`RepairError::Io`] when
+    /// hashing or reading the target file fails.
     pub fn streaming_file_complete(
         &mut self,
         file_index: usize,
@@ -1938,6 +1962,12 @@ impl StreamingParSession {
     /// Create a session from the metadata packets of a set (Main + `FileDesc` + IFSC; recovery
     /// packets, if any are loaded already, seed the syndrome exponents). Target files live in
     /// `base_dir`.
+    ///
+    /// # Errors
+    /// [`RepairError::NoMainPacket`] without a Main packet, [`RepairError::IncompleteMetadata`]
+    /// when file descriptions are missing, [`RepairError::StreamingMemoryLimit`] when `opts` caps
+    /// cannot hold the slice or metadata state, and [`RepairError::Io`] for an invalid slice size,
+    /// duplicate IDs, or over 32768 slices.
     pub fn new(
         set: &PacketSet,
         base_dir: &Path,
@@ -2258,6 +2288,10 @@ impl StreamingParSession {
     }
 
     /// [`on_article_finished`](Self::on_article_finished) keyed by filename.
+    ///
+    /// # Errors
+    /// [`RepairError::UnknownFile`] (with an all-zero ID) when `name` matches no file; otherwise as
+    /// [`on_article_finished`](Self::on_article_finished).
     pub fn on_article_finished_by_name(
         &self,
         name: &[u8],
@@ -2273,6 +2307,10 @@ impl StreamingParSession {
     }
 
     /// [`on_article_failed_permanently`](Self::on_article_failed_permanently) keyed by filename.
+    ///
+    /// # Errors
+    /// [`RepairError::UnknownFile`] (with an all-zero ID) when `name` matches no file; otherwise as
+    /// [`on_article_failed_permanently`](Self::on_article_failed_permanently).
     pub fn on_article_failed_permanently_by_name(
         &self,
         name: &[u8],
@@ -2301,6 +2339,10 @@ impl StreamingParSession {
     }
 
     /// Current state of a slice.
+    ///
+    /// # Errors
+    /// [`RepairError::UnknownFile`] when `file_id` is not in the set or `slice_idx` is out of
+    /// range.
     pub fn slice_state(
         &self,
         file_id: &FileId,
@@ -2320,6 +2362,9 @@ impl StreamingParSession {
     }
 
     /// Completion status of one volume (source file).
+    ///
+    /// # Errors
+    /// [`RepairError::UnknownFile`] when `file_id` is not in the set.
     pub fn volume_status(&self, file_id: &FileId) -> Result<VolumeStatus, RepairError> {
         let fi = self.file(file_id)?;
         let t = self
@@ -2427,6 +2472,10 @@ impl StreamingParSession {
 
     /// An article failed on every server and fallback round: its slices are damaged now.
     /// Returns an unpause instruction when more recovery blocks must be fetched.
+    ///
+    /// # Errors
+    /// [`RepairError::Cancelled`] after [`cancel`](Self::cancel), [`RepairError::UnknownFile`] for
+    /// an unknown `file_id`, and [`RepairError::Io`] when `offset + size` overflows.
     pub fn on_article_failed_permanently(
         &self,
         file_id: &FileId,
@@ -2481,6 +2530,12 @@ impl StreamingParSession {
     /// `crc32` is the decoded article CRC (yEnc); `bytes` the decoded data when still in RAM
     /// (`ArticleCache`). Completed slices are verified on the calling thread without holding
     /// any lock and folded into the syndromes.
+    ///
+    /// # Errors
+    /// [`RepairError::Cancelled`] after [`cancel`](Self::cancel), [`RepairError::UnknownFile`] for
+    /// an unknown `file_id`, [`RepairError::StreamingMemoryLimit`] when article metadata exceeds
+    /// the working cap, and [`RepairError::Io`] for an overflowing or short article range or a
+    /// failed target-file read.
     pub fn on_article_finished(
         &self,
         file_id: &FileId,
@@ -2508,6 +2563,11 @@ impl StreamingParSession {
     /// the article before changing coverage. The caller can replay it after a
     /// flush barrier or when staging becomes available. Whole slices supplied
     /// by this call do not require partial staging.
+    ///
+    /// # Errors
+    /// As [`on_article_finished`](Self::on_article_finished), plus
+    /// [`RepairError::StreamingMemoryLimit`] when partial-slice staging cannot retain `bytes`; the
+    /// article is then refused unchanged.
     pub fn on_article_finished_memory_only(
         &self,
         file_id: &FileId,
@@ -3094,6 +3154,11 @@ impl StreamingParSession {
     /// recovery slice into the syndrome of its exponent (allocating a slot and back-filling it
     /// from disk when the exponent was not pre-allocated). `queued_id` clears the in-flight
     /// accounting of the scheduler. Returns the number of recovery slices absorbed.
+    ///
+    /// # Errors
+    /// [`RepairError::Cancelled`] after [`cancel`](Self::cancel), and [`RepairError::Io`] when
+    /// opening, scanning, or verifying `path` fails, or when back-filling a slot from the source
+    /// files fails.
     pub fn on_recovery_volume_arrived(
         &self,
         path: &Path,
@@ -3279,6 +3344,11 @@ impl StreamingParSession {
     /// (from a duplicate posting or twin set); they are combined in RAM with the on-disk bytes
     /// of every touched slice and verified against IFSC. Matching slices are written to
     /// `disk_file`, marked verified, and folded. Returns the healed slice indices.
+    ///
+    /// # Errors
+    /// [`RepairError::Cancelled`] after [`cancel`](Self::cancel), [`RepairError::UnknownFile`] for
+    /// an unknown `file_id`, and [`RepairError::Io`] for an overflowing `hole_range` or when
+    /// opening, reading, or writing `disk_file` fails.
     pub fn try_splice_live_slice(
         &self,
         file_id: &FileId,
@@ -3408,6 +3478,12 @@ impl StreamingParSession {
     /// as an erasure, invert the `K×K` recovery matrix and compute **only** the rows for the
     /// non-verified slices of `target_file_ids`, patching them into the target files on disk.
     /// Each target's whole-file MD5 is checked afterwards.
+    ///
+    /// # Errors
+    /// [`RepairError::Cancelled`], [`RepairError::UnknownFile`], [`RepairError::NotEnoughRecovery`]
+    /// when erasures outnumber ready recovery slices, [`RepairError::RecoveryMemoryLimit`],
+    /// [`RepairError::Singular`], and [`RepairError::Io`] when back-filling, reading, or writing
+    /// target files fails.
     pub fn repair_available_targets_now(
         &self,
         target_file_ids: &[FileId],
@@ -3421,6 +3497,9 @@ impl StreamingParSession {
     /// PAR2 description. This adds no target read. These are results of this call,
     /// not a guarantee against later writes: callers must retain target ownership
     /// while publishing or reusing them. An error returns no hash entries.
+    ///
+    /// # Errors
+    /// As [`repair_available_targets_now`](Self::repair_available_targets_now).
     pub fn repair_available_targets_with_hashes_now(
         &self,
         target_file_ids: &[FileId],
@@ -3450,6 +3529,11 @@ impl StreamingParSession {
     /// failure yields `ok = false`. Cancellation or other errors return no hashes
     /// and can leave partial writes. This is not transactional or a filesystem
     /// snapshot, and it does not exclude external writers.
+    ///
+    /// # Errors
+    /// As [`repair_available_targets_now`](Self::repair_available_targets_now), plus
+    /// [`RepairError::Io`] when `target_files` does not bind exactly one regular file per distinct
+    /// requested ID.
     pub fn repair_available_targets_with_files_and_hashes_now(
         &self,
         target_file_ids: &[FileId],

@@ -318,6 +318,12 @@ impl Par2Repairer {
     /// becomes EOF or a smaller source length. Required-read errors/cancellation leave
     /// donor admission state unchanged; spent allowance and earlier calls remain.
     /// This adds no source-binding, memory, rollback, or blocking-I/O time guarantee.
+    ///
+    /// # Errors
+    /// [`DonorReadError::Limit`] when a read request exceeds `budget` or `per_call_limit_bytes`,
+    /// [`DonorReadError::CounterOverflow`] on unrepresentable ranges, and
+    /// [`DonorReadError::Repair`] for [`RepairError::NotFinalized`], [`RepairError::Cancelled`],
+    /// or I/O errors on `path`.
     pub fn add_extra_file_with_read_budget(
         &mut self,
         path: &Path,

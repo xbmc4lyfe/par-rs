@@ -205,6 +205,10 @@ impl Pool<'_> {
 /// `progress` receives the cumulative number of file bytes hashed; it is only called from the
 /// calling thread. Ranges past the end of a file must be clamped by the caller (`len` may be 0
 /// for an all-zero message).
+///
+/// # Errors
+/// `InvalidInput` for a range with a bad file index, `len > pad_to`, or an oversized size;
+/// `Interrupted` when `cancel` is set; otherwise the first I/O error opening or reading a file.
 pub fn hash_ranges_parallel(
     paths: &[&Path],
     ranges: &[HashRange],
@@ -329,6 +333,9 @@ fn file_hash_thread_cap(threads: usize, files: usize) -> usize {
 /// Whole-file digests (CRC-32, MD5, 16k MD5) of several files, one file per thread. Each
 /// thread holds one `READ_CHUNK` buffer, so the thread count is capped to keep the buffers
 /// within the working-memory budget whatever `threads` asks for.
+///
+/// # Errors
+/// The first I/O error opening or reading a file, or `Interrupted` when `cancel` is set.
 pub fn file_hashes_parallel(
     paths: &[&Path],
     threads: usize,

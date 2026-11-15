@@ -248,6 +248,11 @@ impl Par2Repairer {
     /// and eligible checksum-absent fallback require full and 16 KiB MD5 hashes.
     /// Reads/errors and cancellation finish before staged locations are committed.
     /// No scan moves, removes, or overwrites a donor or target path.
+    ///
+    /// # Errors
+    /// As [`Self::add_extra_file`] for `Full`. Otherwise [`RepairError::NotFinalized`] before
+    /// [`finalize`](Self::finalize), [`RepairError::Cancelled`], or [`RepairError::Io`] when
+    /// opening or reading `path` fails.
     pub fn add_extra_file_with_policy(
         &mut self,
         path: &Path,

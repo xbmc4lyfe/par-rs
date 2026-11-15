@@ -238,6 +238,10 @@ pub trait PacketSource {
     /// Total length in bytes.
     fn source_len(&self) -> u64;
     /// Fill `buf` from `offset`. Must fail if the range is out of bounds.
+    ///
+    /// # Errors
+    /// Implementations return an I/O error (typically [`io::ErrorKind::UnexpectedEof`]) when
+    /// `offset..offset + buf.len()` is out of bounds, or when the underlying read fails.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
     /// Whether the source is empty.
     fn source_is_empty(&self) -> bool {
@@ -288,11 +292,17 @@ pub struct FileSource {
 
 impl FileSource {
     /// Open `path`.
+    ///
+    /// # Errors
+    /// I/O errors opening `path` or reading its metadata.
     pub fn open(path: &Path) -> io::Result<Self> {
         Self::from_file(File::open(path)?)
     }
 
     /// Wrap an open file.
+    ///
+    /// # Errors
+    /// I/O errors reading the file's metadata.
     pub fn from_file(file: File) -> io::Result<Self> {
         let len = file.metadata()?.len();
         Ok(Self {
@@ -331,6 +341,10 @@ impl PacketSource for FileSource {
 }
 
 /// Positional read helper for plain `File`s used outside of packet scanning.
+///
+/// # Errors
+/// I/O errors from the read, including [`io::ErrorKind::UnexpectedEof`] when the file ends
+/// before `buf` is filled.
 pub fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -584,6 +598,9 @@ impl<S: PacketSource + ?Sized> Iterator for PacketIter<'_, S> {
 }
 
 /// Verify the MD5 of a packet located at `offset` (hashes bytes `32..length`, streaming).
+///
+/// # Errors
+/// I/O errors from [`PacketSource::read_at`]; an MD5 mismatch returns `Ok(false)`.
 pub fn verify_packet_md5<S: PacketSource + ?Sized>(
     src: &S,
     offset: u64,
@@ -674,6 +691,10 @@ pub struct MainPacket {
 
 impl MainPacket {
     /// Parse a body.
+    ///
+    /// # Errors
+    /// [`PacketError::Truncated`], [`PacketError::BadMainLayout`], [`PacketError::BadSliceSize`], or
+    /// [`PacketError::BadRecoverableCount`] when the body is malformed.
     pub fn parse(set_id: SetId, body: &[u8]) -> Result<Self, PacketError> {
         if body.len() < 12 {
             return Err(PacketError::Truncated);
@@ -755,6 +776,10 @@ pub struct FileDescPacket {
 
 impl FileDescPacket {
     /// Parse a body.
+    ///
+    /// # Errors
+    /// [`PacketError::Truncated`] for a short body, [`PacketError::BadFileName`] for an empty or
+    /// oversized name, and [`PacketError::InconsistentHashes`] for a small file whose hashes differ.
     pub fn parse(body: &[u8]) -> Result<Self, PacketError> {
         if body.len() < 56 {
             return Err(PacketError::Truncated);
@@ -843,6 +868,9 @@ pub struct IfscPacket {
 
 impl IfscPacket {
     /// Parse a body.
+    ///
+    /// # Errors
+    /// [`PacketError::Truncated`] or [`PacketError::BadIfscLayout`] when the body is malformed.
     pub fn parse(body: &[u8]) -> Result<Self, PacketError> {
         if body.len() < 16 {
             return Err(PacketError::Truncated);
@@ -923,6 +951,10 @@ pub struct RecoverySliceRef {
 
 impl RecoverySliceRef {
     /// Build from a framed recovery packet; reads only the 4-byte exponent.
+    ///
+    /// # Errors
+    /// The outer `io::Result` carries I/O errors reading the exponent; the inner result is
+    /// [`PacketError::Truncated`] or [`PacketError::EmptyRecoverySlice`] for a malformed body.
     pub fn from_raw<S: PacketSource + ?Sized>(
         src: &S,
         raw: &RawPacket,
@@ -955,6 +987,9 @@ impl RecoverySliceRef {
     }
 
     /// Verify the packet MD5 by streaming the payload from `src`.
+    ///
+    /// # Errors
+    /// I/O errors reading from `src`; a bad header or MD5 mismatch returns `Ok(false)`.
     pub fn verify<S: PacketSource + ?Sized>(&self, src: &S) -> io::Result<bool> {
         let mut hdr = [0u8; HEADER_LEN];
         src.read_at(self.packet_offset, &mut hdr)?;
@@ -968,6 +1003,10 @@ impl RecoverySliceRef {
     }
 
     /// Read the payload (or a sub-range `[start, start + buf.len())` of it).
+    ///
+    /// # Errors
+    /// [`io::ErrorKind::UnexpectedEof`] when the range extends past the slice payload, or I/O
+    /// errors reading from `src`.
     pub fn read_data<S: PacketSource + ?Sized>(
         &self,
         src: &S,
@@ -1013,6 +1052,10 @@ impl Packet {
 }
 
 /// Parse a framed packet. Recovery slices read only their exponent.
+///
+/// # Errors
+/// The outer `io::Result` carries I/O errors reading the body; the inner result is a
+/// [`PacketError`] from the per-type parser ([`PacketError::BadMainLayout`] for bodies over 64 MiB).
 pub fn parse_packet<S: PacketSource + ?Sized>(
     src: &S,
     raw: &RawPacket,
@@ -1464,6 +1507,9 @@ impl PacketSet {
 
     /// Scan `src` and add every packet of this set. `source_id` is recorded in recovery
     /// slice references. Returns the statistics of this source only.
+    ///
+    /// # Errors
+    /// I/O errors reading `src`; malformed packets are counted in the returned stats, not returned.
     pub fn load_source<S: PacketSource + ?Sized>(
         &mut self,
         src: &S,
@@ -1507,6 +1553,9 @@ impl PacketSet {
     }
 
     /// Load a `.par2` file from disk.
+    ///
+    /// # Errors
+    /// I/O errors opening or reading `path`.
     pub fn load_file(
         &mut self,
         path: &Path,
@@ -1645,6 +1694,9 @@ impl Par2Collection {
     }
 
     /// Scan `src` and distribute packets into their sets.
+    ///
+    /// # Errors
+    /// I/O errors reading `src`; malformed packets are counted in the returned stats, not returned.
     pub fn load_source<S: PacketSource + ?Sized>(
         &mut self,
         src: &S,
@@ -1679,6 +1731,9 @@ impl Par2Collection {
     }
 
     /// Load a file from disk.
+    ///
+    /// # Errors
+    /// I/O errors opening or reading `path`.
     pub fn load_file(
         &mut self,
         path: &Path,
@@ -1701,6 +1756,9 @@ impl Par2Collection {
 }
 
 /// Convenience: load one `.par2` file into a fresh set.
+///
+/// # Errors
+/// I/O errors opening or reading `path`.
 pub fn load_par2_file(path: &Path, opts: ScanOptions) -> io::Result<PacketSet> {
     let mut set = PacketSet::new();
     set.load_file(path, 0, opts)?;
@@ -1708,6 +1766,9 @@ pub fn load_par2_file(path: &Path, opts: ScanOptions) -> io::Result<PacketSet> {
 }
 
 /// Convenience: parse in-memory PAR2 data into a fresh set (first Main packet binds the set).
+///
+/// # Errors
+/// None in practice: reads from an in-memory slice never fail, so this always returns `Ok`.
 pub fn load_par2_bytes(data: &[u8], opts: ScanOptions) -> io::Result<PacketSet> {
     let mut set = PacketSet::new();
     set.load_source(data, 0, opts)?;
@@ -1719,6 +1780,9 @@ pub fn load_par2_bytes(data: &[u8], opts: ScanOptions) -> io::Result<PacketSet> 
 /// Files of another set are skipped. Returns the set and the files that contributed packets,
 /// `main_path` first; the recovery slice references carry each file's index in that list as
 /// their `source_id`.
+///
+/// # Errors
+/// I/O errors opening or reading `main_path` or a sibling, or listing its directory.
 pub fn load_par2_collection(
     main_path: &Path,
     opts: ScanOptions,

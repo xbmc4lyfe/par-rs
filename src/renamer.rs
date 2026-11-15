@@ -170,6 +170,9 @@ impl ParRenamer {
 
     /// Run the renamer, cancelled through an optional flag. Port of `ParRenamer::Execute`;
     /// see [`run_with_stop`](Self::run_with_stop).
+    ///
+    /// # Errors
+    /// None in practice; see [`run_with_stop`](Self::run_with_stop).
     pub fn run(
         self,
         cancel: Option<&AtomicBool>,
@@ -192,6 +195,9 @@ impl ParRenamer {
     /// removed mid-run) produces one `Warning("Could not read directory …")` and is treated
     /// as empty, so the run carries on and returns `Ok`; the `io::Result` is kept for API
     /// compatibility.
+    ///
+    /// # Errors
+    /// None in practice: unreadable directories become warnings, so this always returns `Ok`.
     pub fn run_with_stop(
         mut self,
         stopped: &mut dyn FnMut() -> bool,
@@ -767,6 +773,9 @@ pub fn set_id_name(set_id: &SetId) -> String {
 }
 
 /// Collect the distinct set ids of par2 files in a directory (by content).
+///
+/// # Errors
+/// I/O errors listing `dir`; files that cannot be opened or read are skipped.
 pub fn par2_set_ids_in_dir(dir: &Path) -> io::Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     for p in sorted_entries(dir)? {

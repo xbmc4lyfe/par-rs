@@ -711,6 +711,10 @@ impl Par2Repairer {
 
     /// Load one par2 file (index or volume). Metadata is verified; recovery payloads are only
     /// indexed. Returns the number of recovery slices added.
+    ///
+    /// # Errors
+    /// [`RepairError::Io`] when reading `path` fails, or [`RepairError::WrongSet`] when every
+    /// packet in it belongs to a different recovery set.
     pub fn load_par2_file(&mut self, path: &Path) -> Result<usize, RepairError> {
         self.load_par2_path(path, true)
     }
@@ -753,6 +757,10 @@ impl Par2Repairer {
 
     /// Load `main_path` and every other file of the same collection in its directory
     /// (`name.par2`, `name.volXX+YY.par2`). Returns the files loaded.
+    ///
+    /// # Errors
+    /// As [`load_par2_file`](Self::load_par2_file) for `main_path`; [`RepairError::Io`] when
+    /// listing its directory or reading a sibling volume fails (foreign-set siblings are skipped).
     pub fn load_par2_set(&mut self, main_path: &Path) -> Result<Vec<PathBuf>, RepairError> {
         let mut loaded = vec![main_path.to_path_buf()];
         self.load_par2_file(main_path)?;
@@ -785,6 +793,10 @@ impl Par2Repairer {
     }
 
     /// Load in-memory par2 data (for example, a volume kept in RAM). `label` names the source.
+    ///
+    /// # Errors
+    /// [`RepairError::Io`] when writing or reading the temporary copy fails, or
+    /// [`RepairError::WrongSet`] when the data belongs to a different recovery set.
     pub fn load_par2_bytes(&mut self, data: Vec<u8>, label: &str) -> Result<usize, RepairError> {
         // Materialise to a temporary file so recovery payloads can be streamed later.
         let tmp = std::env::temp_dir().join(format!(
@@ -798,6 +810,10 @@ impl Par2Repairer {
     }
 
     /// Build the file and block tables. Must be called after loading and before verifying.
+    ///
+    /// # Errors
+    /// [`RepairError::NoMainPacket`] when no Main packet is loaded, or
+    /// [`RepairError::IncompleteMetadata`] when a recoverable file has no description packet.
     pub fn finalize(&mut self) -> Result<(), RepairError> {
         let main = self.packets.main.clone().ok_or(RepairError::NoMainPacket)?;
         let missing: Vec<FileId> = main
@@ -1074,6 +1090,11 @@ impl Par2Repairer {
     /// verifier), then one slice-level pass over every remaining file on all cores (multi-lane
     /// MD5 + hardware CRC), then the sliding scan of the files that pass is not enough for,
     /// in parallel across files, reusing the slices the second phase already verified.
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`] before [`finalize`](Self::finalize),
+    /// [`RepairError::Cancelled`] when cancelled, and [`RepairError::Io`] when opening, reading,
+    /// or hashing a file fails.
     pub fn verify(
         &mut self,
         mut quick: Option<&mut dyn QuickVerifier>,
@@ -1656,6 +1677,11 @@ impl Par2Repairer {
 
     /// Scan an additional file (renamed download, duplicate, fragment). Returns the number of
     /// previously missing blocks it supplied.
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`] before [`finalize`](Self::finalize),
+    /// [`RepairError::Cancelled`] when cancelled, or [`RepairError::Io`] when scanning `path`
+    /// fails.
     pub fn add_extra_file(
         &mut self,
         path: &Path,
@@ -1689,6 +1715,11 @@ impl Par2Repairer {
 
     /// Scan every regular file in `dir` that is neither a target, a par2 file of this set, nor
     /// already scanned, for missing blocks. Stops early once nothing is missing.
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`] before [`finalize`](Self::finalize), [`RepairError::Io`] when
+    /// listing `dir` fails, [`RepairError::Cancelled`], and any
+    /// [`add_extra_file`](Self::add_extra_file) error.
     pub fn add_extra_files_from_dir(
         &mut self,
         dir: &Path,
@@ -1728,6 +1759,10 @@ impl Par2Repairer {
 
     /// Scan files in `dir` whose names look like split fragments of a target
     /// such as `target.001` or `target.bin.002`. Returns blocks gained.
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`] before [`finalize`](Self::finalize), [`RepairError::Io`] when
+    /// listing `dir` fails, and any [`add_extra_file`](Self::add_extra_file) error for a fragment.
     pub fn add_split_fragments(
         &mut self,
         dir: &Path,
@@ -1813,6 +1848,12 @@ impl Par2Repairer {
     }
 
     /// Repair all incomplete files. Call after [`verify`](Self::verify).
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`], [`RepairError::NotEnoughRecovery`],
+    /// [`RepairError::RecoveryMemoryLimit`], [`RepairError::Singular`], [`RepairError::Cancelled`],
+    /// [`RepairError::Io`] on file I/O, [`RepairError::VerificationFailed`] when a repaired file
+    /// does not verify, and any [`verify`](Self::verify) error.
     pub fn repair(
         &mut self,
         observer: &mut dyn RepairObserver,

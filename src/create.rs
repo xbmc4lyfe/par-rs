@@ -308,6 +308,11 @@ impl InputReader for SourceReader {
 /// allow zero recovery slices. Other schemes retain their existing behavior.
 ///
 /// Use this function for fallible planning and before reading source files.
+///
+/// # Errors
+/// [`CreateError::TooManyRecoveryBlocks`] above 65535, [`CreateError::BadVolumeLimit`] for a zero
+/// cap, [`CreateError::BadVolumeCount`] for a bad balanced count, and [`CreateError::Io`] on
+/// allocation failure.
 pub fn checked_volume_layout(
     scheme: VolumeScheme,
     total: u32,
@@ -505,6 +510,9 @@ fn write_all_at(file: &File, offset: u64, data: &[u8]) -> io::Result<()> {
 }
 
 /// Create a recovery set for `sources`, writing `<out_dir>/<base>.par2` and volumes.
+///
+/// # Errors
+/// The same errors as [`create_with_volume_naming`].
 pub fn create(
     sources: &[SourceFile],
     out_dir: &Path,
@@ -529,6 +537,11 @@ pub fn create(
 /// This has the same validation, I/O, progress, and cancellation behavior as
 /// [`create`]. The policy only changes exponential volume names; it does not
 /// change packet bytes, volume allocation, or publication behavior.
+///
+/// # Errors
+/// Validation errors ([`CreateError::BadSliceSize`], [`CreateError::NoSources`], [`CreateError::BadSourceName`],
+/// [`CreateError::DuplicateSource`], [`CreateError::TooManyInputSlices`], [`CreateError::NoSourceData`], or the
+/// [`checked_volume_layout`] errors), [`CreateError::Cancelled`], [`CreateError::Rs`], or [`CreateError::Io`].
 pub fn create_with_volume_naming(
     sources: &[SourceFile],
     out_dir: &Path,
@@ -839,6 +852,10 @@ pub fn create_with_volume_naming(
 
 /// Build a complete single-buffer PAR2 set in memory (critical packets followed by recovery
 /// packets with real recovery data). `files` are `(par2 name, contents)`.
+///
+/// # Errors
+/// [`CreateError::BadSliceSize`] for a zero or unaligned `slice_size`, and [`CreateError::Rs`]
+/// with [`RsError::TooManyInputs`] above 32768 input slices.
 pub fn create_in_memory(
     files: &[(&[u8], &[u8])],
     slice_size: usize,
@@ -978,6 +995,9 @@ pub struct Par2Set {
 
 impl Par2Set {
     /// Write the index and volumes into `dir`.
+    ///
+    /// # Errors
+    /// Propagates I/O errors creating `dir` or writing any file.
     pub fn write_to(&self, dir: &Path, base: &str) -> io::Result<Vec<PathBuf>> {
         std::fs::create_dir_all(dir)?;
         let mut out = Vec::with_capacity(self.volumes.len() + 1);
@@ -1014,6 +1034,9 @@ pub fn encode_unicode_name_body(file_id: &FileId, name: &str) -> Vec<u8> {
 /// for in-memory `(name, contents)` sources, laid out like `par2cmdline` (`base` is used for
 /// the volume file names). Replaces the single-buffer [`create_in_memory`] where an index and
 /// separate volumes are wanted.
+///
+/// # Errors
+/// The same errors as [`build_set_with_volume_naming`].
 pub fn build_set(
     base: &str,
     sources: &[(&str, &[u8])],
@@ -1026,6 +1049,11 @@ pub fn build_set(
 ///
 /// Like [`build_set`], with filename spelling selected independently of packet
 /// bytes and allocation. Only exponential volume names can differ from Native.
+///
+/// # Errors
+/// [`CreateError::BadSliceSize`], [`CreateError::NoSources`], [`CreateError::TooManyRecoveryBlocks`],
+/// [`CreateError::BadSourceName`], [`CreateError::DuplicateSource`], [`CreateError::TooManyInputSlices`],
+/// [`CreateError::NoSourceData`], or the [`checked_volume_layout`] errors.
 pub fn build_set_with_volume_naming(
     base: &str,
     sources: &[(&str, &[u8])],

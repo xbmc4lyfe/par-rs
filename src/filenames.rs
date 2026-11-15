@@ -162,6 +162,9 @@ where
 }
 
 /// Directory-walking convenience for [`find_main_pars`]: returns file names (not paths).
+///
+/// # Errors
+/// I/O errors listing `dir` or reading one of its entries.
 pub fn find_main_pars_in_dir(dir: &std::path::Path) -> std::io::Result<Vec<std::ffi::OsString>> {
     let mut names: Vec<std::ffi::OsString> = Vec::new();
     for entry in std::fs::read_dir(dir)? {

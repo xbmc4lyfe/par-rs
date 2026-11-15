@@ -32,6 +32,9 @@ impl FileSliceHasher {
     ///
     /// Invalid geometry returns `InvalidInput`. No additional input-size ceiling is
     /// imposed; large geometry remains caller-chosen work, with bounded polling.
+    ///
+    /// # Errors
+    /// `InvalidInput` when `slice_size` is zero or not a multiple of four.
     pub fn new(slice_size: u64) -> io::Result<Self> {
         if slice_size == 0 || !slice_size.is_multiple_of(4) {
             return Err(io::Error::new(
@@ -58,6 +61,10 @@ impl FileSliceHasher {
     /// unchanged, ahead of cancellation that it also sets. Any terminal failure
     /// poisons reuse: later update/finish returns Other before digest work/callbacks.
     /// Already emitted records are provisional caller state and are not rolled back.
+    ///
+    /// # Errors
+    /// `Interrupted` on cancellation, `InvalidData` on counter overflow, `Other` after an
+    /// earlier failure, or the callback's own error unchanged.
     pub fn update(
         &mut self,
         bytes: &[u8],
@@ -77,6 +84,10 @@ impl FileSliceHasher {
     /// Padding uses fixed 4 KiB windows with cancellation checks. Cancellation set
     /// by the last callback is checked before success. This consumes the object;
     /// failure returns no `FileHashes` and does not revoke earlier emitted records.
+    ///
+    /// # Errors
+    /// `Interrupted` on cancellation, `InvalidData` on counter overflow, `Other` after an
+    /// earlier failure, or the callback's own error unchanged.
     pub fn finish(
         self,
         cancel: Option<&AtomicBool>,
