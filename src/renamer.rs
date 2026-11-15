@@ -76,7 +76,8 @@ pub enum RenamerEvent {
         to: PathBuf,
     },
     /// Progress: `(checks done, checks total)`. Every file is checked twice (a par2 pass and a
-    /// rename pass), so the total is twice the file count and `checks done` stays below it.
+    /// rename pass), so the total is twice the file count; it grows when a rename moves a file
+    /// into a sub-directory still to be scanned. `checks done` always stays below the total.
     /// Emitted right after [`Checking`](Self::Checking) for the same file.
     Progress(usize, usize),
     /// The file about to be checked (emitted just before [`Progress`](Self::Progress)).
@@ -142,6 +143,8 @@ pub struct ParRenamer {
     report: RenamerReport,
     cur_file: usize,
     file_count: usize,
+    /// Directories still to be processed after the current one (scanned later).
+    pending_dirs: Vec<PathBuf>,
 }
 
 impl ParRenamer {
@@ -157,6 +160,7 @@ impl ParRenamer {
             report: RenamerReport::default(),
             cur_file: 0,
             file_count: 0,
+            pending_dirs: Vec::new(),
         }
     }
 
@@ -185,10 +189,12 @@ impl ParRenamer {
         events: &mut dyn FnMut(RenamerEvent),
     ) -> io::Result<RenamerReport> {
         let dirs = self.build_dir_list(stopped)?;
-        for dir in dirs {
+        for (i, dir) in dirs.iter().enumerate() {
             if stopped() {
                 break;
             }
+            let dir = dir.clone();
+            self.pending_dirs = dirs[i + 1..].to_vec();
             self.file_hashes.clear();
             self.par_infos.clear();
             self.bad_pars.clear();
@@ -261,6 +267,9 @@ impl ParRenamer {
             events(RenamerEvent::Checking {
                 path: self.current_path(&path),
             });
+            // Safety net for files that appeared after counting (for example created by
+            // another process): never report more checks done than the total.
+            self.file_count = self.file_count.max(self.cur_file + 1);
             events(RenamerEvent::Progress(self.cur_file, self.file_count));
             self.cur_file += 1;
             if check_pars {
@@ -583,6 +592,15 @@ impl ParRenamer {
                 )));
                 return;
             }
+        }
+        // A FileDesc name with a '/' can move a file into a sub-directory that is scanned
+        // later; it is then checked twice more, so count it into the progress total.
+        if !self.options.dry_run
+            && to
+                .parent()
+                .is_some_and(|parent| self.pending_dirs.iter().any(|d| d == parent))
+        {
+            self.file_count += 2;
         }
         self.report
             .renamed
@@ -1311,6 +1329,36 @@ mod tests {
         assert_eq!(rep.renamed, vec![(dir.join("idx.dat"), planned.clone())]);
         assert_eq!(checking, vec![dir.join("idx.dat"), planned]);
         assert!(dir.join("idx.dat").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn progress_stays_within_total_when_renaming_into_pending_subdir() {
+        let dir = tmpdir("subprog");
+        let a = rnd(8_000, 71);
+        let (bytes, _) =
+            create_in_memory(&[(b"sub/a.bin", &a)], 1024, &[], Kernel::detect()).unwrap();
+        std::fs::write(dir.join("set.par2"), &bytes).unwrap();
+        std::fs::write(dir.join("obf"), &a).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("keep.txt"), b"k").unwrap();
+        let mut progress = Vec::new();
+        let rep = ParRenamer::new(&dir, RenamerOptions::default())
+            .run(None, &mut |e| {
+                if let RenamerEvent::Progress(cur, total) = e {
+                    progress.push((cur, total));
+                }
+            })
+            .unwrap();
+        assert_eq!(rep.renamed, vec![(dir.join("obf"), dir.join("sub/a.bin"))]);
+        // 3 files counted up front (6 checks); the moved file is checked twice more in sub/.
+        assert_eq!(progress.len(), 8, "{progress:?}");
+        assert!(
+            progress.iter().all(|&(cur, total)| cur < total),
+            "{progress:?}"
+        );
+        // The total is raised when the file moves, not clamped up one check at a time.
+        assert_eq!(&progress[6..], &[(6, 8), (7, 8)]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
