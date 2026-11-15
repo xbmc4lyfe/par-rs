@@ -239,7 +239,7 @@ impl QuickVerifier for QuickCb {
                 &mut crc,
                 &mut segs,
                 &mut count,
-            )
+            );
         };
         match status {
             1 => Some(QuickInfo::Success { crc }),
@@ -628,9 +628,7 @@ pub unsafe extern "C" fn nzbpar_repairer_stats(
 /// `r` valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nzbpar_repairer_file_count(r: *const NzbParRepairer) -> usize {
-    unsafe { r.as_ref() }
-        .map(|h| h.inner.source_files().len())
-        .unwrap_or(0)
+    unsafe { r.as_ref() }.map_or(0, |h| h.inner.source_files().len())
 }
 
 /// Snapshot of file `index`; `out_name` receives a pointer to a NUL-terminated name owned by

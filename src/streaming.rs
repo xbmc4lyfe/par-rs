@@ -206,9 +206,7 @@ impl SyndromeState {
         let exps = &exps[range];
         let k = syn.len();
         let threads = if self.threads == 0 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
         } else {
             self.threads
         };
@@ -757,7 +755,7 @@ impl Par2Repairer {
         let Ok(fh) = File::open(&target) else {
             return Ok(());
         };
-        let disk_len = fh.metadata().map(|m| m.len()).unwrap_or(0);
+        let disk_len = fh.metadata().map_or(0, |m| m.len());
         for b in 0..count {
             let g = first + b as usize;
             if self.locations[g].is_some() {
@@ -786,7 +784,7 @@ impl Par2Repairer {
         let loc = self.locations[g].clone().expect("located block");
         let path = &self.disk_files[loc.file];
         let f = File::open(path).map_err(io_ctx(format!("opening {}", path.display())))?;
-        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let len = f.metadata().map_or(0, |m| m.len());
         let avail = len.saturating_sub(loc.offset).min(ss as u64) as usize;
         let mut buf = vec![0u8; ss];
         if avail > 0 {
@@ -805,8 +803,7 @@ impl Par2Repairer {
     /// blocks count as missing), or the plain estimate otherwise.
     pub fn blocks_needed_now(&self) -> u64 {
         self.streaming_status()
-            .map(|s| s.blocks_needed_now)
-            .unwrap_or_else(|| self.blocks_needed())
+            .map_or_else(|| self.blocks_needed(), |s| s.blocks_needed_now)
     }
 }
 
@@ -1794,7 +1791,7 @@ impl Drop for StagingCharges<'_> {
     fn drop(&mut self) {
         self.tracker
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .staging_bytes -= self.bytes;
     }
 }
@@ -1807,7 +1804,9 @@ struct TakenSyndromes {
 impl Drop for TakenSyndromes {
     fn drop(&mut self) {
         for (slot, data) in self.slots.iter().zip(self.data.drain(..)) {
-            slot.lock().unwrap_or_else(|e| e.into_inner()).data = data;
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .data = data;
         }
     }
 }
@@ -1827,7 +1826,9 @@ struct FoldPool {
 
 /// Fold `job` into every slot whose index satisfies `index % stride == lane`.
 fn fold_lane(kernel: &Kernel, slots: &SlotList, job: &FoldJob, lane: usize, stride: usize) {
-    let list = slots.read().unwrap_or_else(|e| e.into_inner());
+    let list = slots
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let src = Plane::from_halves(&job.split);
     for (i, slot) in list.iter().enumerate() {
         if job.control.cancelled.load(Ordering::Acquire) {
@@ -1836,7 +1837,9 @@ fn fold_lane(kernel: &Kernel, slots: &SlotList, job: &FoldJob, lane: usize, stri
         if i % stride != lane {
             continue;
         }
-        let mut s = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !s.folded_mask.set(job.slice) {
             continue;
         }
@@ -1890,7 +1893,7 @@ impl Drop for PayloadPermit<'_> {
             .0
             .active_payloads
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *active -= 1;
         self.0.payload_available.notify_one();
     }
@@ -1903,13 +1906,13 @@ impl SessionInner {
         let mut active = self
             .active_payloads
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while *active as u64 >= cap {
             self.control.ensure_running()?;
             active = self
                 .payload_available
                 .wait(active)
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         self.control.ensure_running()?;
         *active += 1;
@@ -2091,7 +2094,7 @@ impl StreamingParSession {
                         while let Ok(job) = rx.recv() {
                             fold_lane(&kernel, &slots, &job, lane, stride);
                             let (m, cv) = &*pending;
-                            let mut p = m.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut p = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             *p -= 1;
                             cv.notify_all();
                         }
@@ -2143,7 +2146,7 @@ impl StreamingParSession {
             .inner
             .active_payloads
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.inner.control.cancelled.store(true, Ordering::Release);
         self.inner.payload_available.notify_all();
         if let Some(pool) = &self.inner.pool {
@@ -2217,13 +2220,13 @@ impl StreamingParSession {
         {
             return Some(f.file_id);
         }
-        let lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+        let lower: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
         files
             .iter()
             .find(|f| {
                 f.raw_name
                     .iter()
-                    .map(|b| b.to_ascii_lowercase())
+                    .map(u8::to_ascii_lowercase)
                     .eq(lower.iter().copied())
                     || f.local_name.to_ascii_lowercase().as_bytes() == lower.as_slice()
             })
@@ -2271,7 +2274,11 @@ impl StreamingParSession {
     /// Register a `.volXX+YY.par2` file in the download queue (call for every recovery volume
     /// of the NZB, paused or not).
     pub fn register_queued_volume(&self, volume: QueuedVolume) {
-        let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = self
+            .inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(v) = t.queued_volumes.iter_mut().find(|v| v.id == volume.id) {
             *v = volume;
         } else {
@@ -2290,14 +2297,22 @@ impl StreamingParSession {
         if slice_idx >= f.slice_count {
             return Err(RepairError::UnknownFile(*file_id));
         }
-        let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let t = self
+            .inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(t.states[f.first_slice + slice_idx].clone())
     }
 
     /// Completion status of one volume (source file).
     pub fn volume_status(&self, file_id: &FileId) -> Result<VolumeStatus, RepairError> {
         let fi = self.file(file_id)?;
-        let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let t = self
+            .inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(Self::volume_status_locked(&t, &self.inner.files[fi]))
     }
 
@@ -2323,7 +2338,11 @@ impl StreamingParSession {
 
     /// Live counters.
     pub fn status(&self) -> LiveStatus {
-        let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let t = self
+            .inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ready = t.ready_exponents.len();
         let in_flight: i64 = t.unpaused_in_flight.values().map(|&b| b as i64).sum();
         let damaged = t.counts[3] as i64;
@@ -2332,14 +2351,14 @@ impl StreamingParSession {
             .inner
             .slots
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len();
-        let pending = self
-            .inner
-            .pool
-            .as_ref()
-            .map(|p| *p.pending.0.lock().unwrap_or_else(|e| e.into_inner()))
-            .unwrap_or(0);
+        let pending = self.inner.pool.as_ref().map_or(0, |p| {
+            *p.pending
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         LiveStatus {
             unarrived: t.counts[0],
             partially_arrived: t.counts[1],
@@ -2417,7 +2436,11 @@ impl StreamingParSession {
             })?
             .min(f.length);
         let (b0, b1) = ((offset / ss) as usize, ((end - 1) / ss) as usize);
-        let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = self
+            .inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for b in b0..=b1.min(f.slice_count - 1) {
             let g = f.first_slice + b;
             if t.states[g] == SliceState::VerifiedGood {
@@ -2502,7 +2525,7 @@ impl StreamingParSession {
             .inner
             .payload_gate
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _permit = self.inner.admit_payload()?;
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
@@ -2534,7 +2557,11 @@ impl StreamingParSession {
         };
         let mut completed: Vec<(usize, Option<Vec<u8>>, Option<u32>)> = Vec::new();
         {
-            let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let mut t = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if payload.memory_only {
                 let mut required = t.staging_bytes;
                 for b in b0..=b1.min(f.slice_count - 1) {
@@ -2633,7 +2660,7 @@ impl StreamingParSession {
                 t.covered[g].push(ByteRange::new((s - sstart) as i64, (e - s) as i64));
                 let covered = normalize_ranges(&t.covered[g]);
                 t.metadata_entries = t.metadata_entries - previous + covered.len();
-                t.covered[g] = covered.clone();
+                t.covered[g].clone_from(&covered);
                 // Keep both retained coverage representations current even if
                 // the later disk read or verification fails.
                 if t.states[g] != SliceState::Damaged {
@@ -2755,9 +2782,13 @@ impl StreamingParSession {
                     limit_bytes: 0,
                 });
             }
-            let ram_bytes = staged.as_ref().map_or(0, |data| data.len());
+            let ram_bytes = staged.as_ref().map_or(0, std::vec::Vec::len);
             let verdict = self.verify_slice_bytes(fi, b, staged, quick)?;
-            let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let mut t = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if t.states[g] == SliceState::VerifiedGood {
                 continue;
             }
@@ -2789,7 +2820,11 @@ impl StreamingParSession {
             }
         }
         if damaged_any {
-            let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let mut t = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             out.unpause = Self::schedule_unpause(&mut t);
         }
         self.inner.control.ensure_running()?;
@@ -2883,7 +2918,11 @@ impl StreamingParSession {
             Some(pool) => {
                 let n = pool.txs.len();
                 {
-                    let mut p = pool.pending.0.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut p = pool
+                        .pending
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     *p += n;
                 }
                 for (lane, tx) in pool.txs.iter().enumerate() {
@@ -2892,7 +2931,7 @@ impl StreamingParSession {
                         fold_lane(&self.inner.opts.kernel, &self.inner.slots, &job, lane, n);
                         self.inner.inline_folds.fetch_add(1, Ordering::Relaxed);
                         let (m, cv) = &*pool.pending;
-                        let mut p = m.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut p = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         *p -= 1;
                         cv.notify_all();
                     }
@@ -2906,9 +2945,11 @@ impl StreamingParSession {
     pub fn flush(&self) {
         if let Some(pool) = &self.inner.pool {
             let (m, cv) = &*pool.pending;
-            let mut p = m.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             while *p > 0 {
-                p = cv.wait(p).unwrap_or_else(|e| e.into_inner());
+                p = cv
+                    .wait(p)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         }
     }
@@ -2933,7 +2974,11 @@ impl StreamingParSession {
         self.flush();
         self.inner.control.ensure_running()?;
         let verified: Vec<usize> = {
-            let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let t = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             (0..t.states.len())
                 .filter(|&g| t.states[g] == SliceState::VerifiedGood)
                 .collect()
@@ -2942,7 +2987,7 @@ impl StreamingParSession {
             .inner
             .slots
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let ss = self.inner.slice_size;
         for g in verified {
@@ -2950,7 +2995,7 @@ impl StreamingParSession {
                 .iter()
                 .filter(|s| {
                     !s.lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .folded_mask
                         .get(g)
                 })
@@ -3057,7 +3102,7 @@ impl StreamingParSession {
             .inner
             .payload_gate
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.inner.control.ensure_running()?;
         let src = CountedFile::open(path, &self.inner.control, IoClass::Recovery).map_err(|e| {
             self.inner
@@ -3099,7 +3144,7 @@ impl StreamingParSession {
                 .inner
                 .tracker
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .ready_exponents
                 .contains(e);
             if ready {
@@ -3109,9 +3154,18 @@ impl StreamingParSession {
                 continue;
             }
             let slot = {
-                let list = self.inner.slots.read().unwrap_or_else(|e| e.into_inner());
+                let list = self
+                    .inner
+                    .slots
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 list.iter()
-                    .find(|s| s.lock().unwrap_or_else(|e| e.into_inner()).exponent == *e)
+                    .find(|s| {
+                        s.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .exponent
+                            == *e
+                    })
                     .cloned()
             };
             if slot.is_none()
@@ -3119,7 +3173,7 @@ impl StreamingParSession {
                     .inner
                     .slots
                     .read()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .len()
                     >= self.inner.opts.max_syndrome_slots
             {
@@ -3138,7 +3192,11 @@ impl StreamingParSession {
             let slot = match slot {
                 Some(s) => s,
                 None => {
-                    let mut list = self.inner.slots.write().unwrap_or_else(|e| e.into_inner());
+                    let mut list = self
+                        .inner
+                        .slots
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     // The exclusive payload gate keeps the admitted slot count stable.
                     let total = self.inner.logs.len();
                     let s = Arc::new(Mutex::new(SyndromeSlot {
@@ -3162,7 +3220,9 @@ impl StreamingParSession {
                 self.inner.opts.kernel.deinterleave(&data, lo, hi);
             }
             {
-                let mut s = slot.lock().unwrap_or_else(|e| e.into_inner());
+                let mut s = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !s.recovery_added {
                     for (d, x) in s.data.iter_mut().zip(&split) {
                         *d ^= x;
@@ -3170,12 +3230,20 @@ impl StreamingParSession {
                     s.recovery_added = true;
                 }
             }
-            let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let mut t = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             t.ready_exponents.insert(*e);
             absorbed += 1;
         }
         {
-            let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let mut t = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             t.par_files.push(path.to_path_buf());
             if let Some(id) = queued_id {
                 t.unpaused_in_flight.remove(&id);
@@ -3211,7 +3279,7 @@ impl StreamingParSession {
             .inner
             .payload_gate
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _permit = self.inner.admit_payload()?;
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
@@ -3259,7 +3327,11 @@ impl StreamingParSession {
             self.inner.control.ensure_running()?;
             let g = f.first_slice + b;
             {
-                let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+                let t = self
+                    .inner
+                    .tracker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if t.states[g] == SliceState::VerifiedGood {
                     continue;
                 }
@@ -3287,7 +3359,11 @@ impl StreamingParSession {
             };
             write_all_at(&fh, sstart, &data)
                 .map_err(io_ctx(format!("writing {}", disk_file.display())))?;
-            let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let mut t = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if t.states[g] == SliceState::VerifiedGood {
                 continue;
             }
@@ -3448,7 +3524,7 @@ impl StreamingParSession {
             .inner
             .payload_gate
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         drop(wait);
         self.inner.control.ensure_running()?;
         let admitted = target_files
@@ -3463,7 +3539,11 @@ impl StreamingParSession {
         }
         let ss = self.inner.slice_size;
         let (missing, present, ready_exps): (Vec<usize>, Vec<bool>, Vec<u32>) = {
-            let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let t = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let present: Vec<bool> = t
                 .states
                 .iter()
@@ -3546,7 +3626,7 @@ impl StreamingParSession {
             .inner
             .slots
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let mut taken = TakenSyndromes {
             slots: Vec::with_capacity(k),
@@ -3555,10 +3635,20 @@ impl StreamingParSession {
         for &e in &plan.used_exponents {
             let slot = slots
                 .iter()
-                .find(|s| s.lock().unwrap_or_else(|e| e.into_inner()).exponent == e)
+                .find(|s| {
+                    s.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .exponent
+                        == e
+                })
                 .expect("ready exponent has a slot")
                 .clone();
-            let data = std::mem::take(&mut slot.lock().unwrap_or_else(|e| e.into_inner()).data);
+            let data = std::mem::take(
+                &mut slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .data,
+            );
             taken.slots.push(slot);
             taken.data.push(data);
         }
@@ -3605,7 +3695,7 @@ impl StreamingParSession {
                     )
                 };
                 let fh = target.file();
-                if fh.metadata().map(|m| m.len()).unwrap_or(0) < f.length {
+                if fh.metadata().map_or(0, |m| m.len()) < f.length {
                     fh.set_len(f.length)
                         .map_err(io_ctx(format!("sizing {}", f.target_path.display())))?;
                 }
@@ -3690,7 +3780,11 @@ impl StreamingParSession {
             let mut data = std::mem::take(&mut recon[ri]);
             data.truncate(block_len as usize);
             {
-                let mut t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+                let mut t = self
+                    .inner
+                    .tracker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(st) = t.staging.remove(&g) {
                     t.metadata_entries -= st.ranges.len();
                     t.staging_bytes -= st.buf.len() as u64;
@@ -3728,7 +3822,11 @@ impl StreamingParSession {
         let fi = self.inner.file_index[id];
         let f = &self.inner.files[fi];
         let st = {
-            let t = self.inner.tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let t = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::volume_status_locked(&t, f)
         };
         let ok = if st == VolumeStatus::CompleteAndVerified {
@@ -3746,15 +3844,13 @@ impl StreamingParSession {
                 crate::hasher::hash_reader(&source)
             });
             self.inner.control.ensure_running()?;
-            result
-                .map(|h| {
-                    let valid = h.md5_full == f.hash_full && h.len == f.length;
-                    if valid && let Some(hashes) = hashes {
-                        hashes.push((*id, h));
-                    }
-                    valid
-                })
-                .unwrap_or(false)
+            result.is_ok_and(|h| {
+                let valid = h.md5_full == f.hash_full && h.len == f.length;
+                if valid && let Some(hashes) = hashes {
+                    hashes.push((*id, h));
+                }
+                valid
+            })
         } else {
             false
         };

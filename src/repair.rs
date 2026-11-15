@@ -175,14 +175,14 @@ pub fn xor_into(dst: &mut [u8], src: &[u8]) {
 }
 
 fn check_len(index: usize, expected: usize, data: &[u8]) -> Result<(), RepairError> {
-    if data.len() != expected {
+    if data.len() == expected {
+        Ok(())
+    } else {
         Err(RepairError::SliceSizeMismatch {
             index,
             expected,
             got: data.len(),
         })
-    } else {
-        Ok(())
     }
 }
 
@@ -452,7 +452,7 @@ impl Source {
         let f = File::open(path).map_err(io_err(format!("opening {}", path.display())))?;
         #[cfg(feature = "mmap")]
         {
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            let len = f.metadata().map_or(0, |m| m.len());
             if len > 0
                 // SAFETY: the mapping is private and read-only; the files are inputs the caller
                 // supplies for reading. A concurrent writer could corrupt the data that subsequent
@@ -625,7 +625,7 @@ pub fn repair_on_disk(
                 .truncate(false)
                 .open(&file.path)
                 .map_err(io_err(format!("opening {}", file.path.display())))?;
-            if f.metadata().map(|md| md.len()).unwrap_or(0) < file.size {
+            if f.metadata().map_or(0, |md| md.len()) < file.size {
                 f.set_len(file.size)
                     .map_err(io_err(format!("sizing {}", file.path.display())))?;
             }

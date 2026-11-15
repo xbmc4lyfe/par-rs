@@ -480,9 +480,7 @@ impl Default for EngineConfig {
 impl EngineConfig {
     fn threads(&self) -> usize {
         if self.num_threads == 0 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
         } else {
             self.num_threads
         }
@@ -560,7 +558,7 @@ impl OutView {
     fn new(bufs: &mut [Vec<u8>], words: usize) -> Self {
         debug_assert!(bufs.iter().all(|b| b.len() >= 2 * words));
         Self {
-            ptrs: bufs.iter_mut().map(|b| b.as_mut_ptr()).collect(),
+            ptrs: bufs.iter_mut().map(std::vec::Vec::as_mut_ptr).collect(),
             words,
         }
     }
@@ -737,7 +735,7 @@ impl<'a> Engine<'a> {
             let len = (slice_size - off).min(chunk) as usize;
             debug_assert!(len.is_multiple_of(2));
             let words = len / 2;
-            for o in outputs.iter_mut() {
+            for o in &mut outputs {
                 o[..len].fill(0);
             }
             let tile = self.config.tile_words.max(64);
@@ -773,7 +771,7 @@ impl<'a> Engine<'a> {
                                 let end = (start + batch_size).min(inputs.len());
                                 let mut batch = spare
                                     .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .pop()
                                     .unwrap_or(Batch {
                                         items: Vec::with_capacity(batch_size),
@@ -870,7 +868,7 @@ impl<'a> Engine<'a> {
                         if let Ok(job) = Arc::try_unwrap(job) {
                             spare
                                 .lock()
-                                .unwrap_or_else(|p| p.into_inner())
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push(job.batch);
                         }
                         processed += count;
@@ -891,7 +889,7 @@ impl<'a> Engine<'a> {
 
             // ---- optional second phase: outputs = M · syndromes (tile-parallel) ----
             let final_bufs: &Vec<Vec<u8>> = if let Some(m) = self.post_transform {
-                for t in transformed.iter_mut() {
+                for t in &mut transformed {
                     t[..len].fill(0);
                 }
                 let tview = OutView::new(&mut transformed[..], words);
@@ -1070,7 +1068,7 @@ pub fn decode_in_memory(
     kernel: Kernel,
 ) -> Result<(Vec<usize>, Vec<Vec<u8>>), RsError> {
     let logs = gf16::input_constant_logs(inputs.len()).map_err(|_| RsError::TooManyInputs)?;
-    let present: Vec<bool> = inputs.iter().map(|i| i.is_some()).collect();
+    let present: Vec<bool> = inputs.iter().map(std::option::Option::is_some).collect();
     let exps: Vec<u32> = recovery.iter().map(|(e, _)| *e).collect();
     let plan = plan_recovery(&logs, &present, &exps, &kernel)?;
     if plan.missing.is_empty() {

@@ -37,9 +37,7 @@ const HASH_CHUNK: usize = 64 << 10;
 /// Resolve the worker count.
 pub(crate) fn thread_count(requested: usize) -> usize {
     if requested == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
     } else {
         requested
     }
@@ -87,7 +85,10 @@ impl Pool<'_> {
     }
 
     fn fail(&self, e: io::Error) {
-        let mut g = self.error.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self
+            .error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if g.is_none() {
             *g = Some(e);
         }
@@ -181,8 +182,11 @@ impl Pool<'_> {
                     .collect())
             })();
             match result {
-                Ok(digests) => self.out.lock().unwrap_or_else(|p| p.into_inner())[job.clone()]
-                    .copy_from_slice(&digests),
+                Ok(digests) => self
+                    .out
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)[job.clone()]
+                .copy_from_slice(&digests),
                 Err(e) => {
                     self.fail(e);
                     return;
@@ -250,7 +254,11 @@ pub(crate) fn hash_ranges_parallel_with_budget(
     }
     let memory_bytes = memory_bytes.clamp(READ_CHUNK as u64, WORKING_MEMORY_BYTES);
     let jobs = plan_jobs(ranges);
-    let lanes = jobs.iter().map(|j| j.len()).max().unwrap_or(1);
+    let lanes = jobs
+        .iter()
+        .map(std::iter::ExactSizeIterator::len)
+        .max()
+        .unwrap_or(1);
     let threads = thread_count(threads).clamp(1, jobs.len());
     let threads = (threads as u64).min(memory_bytes / (lanes * 64) as u64) as usize;
     let per_lane = (memory_bytes / threads as u64 / lanes as u64).min(HASH_CHUNK as u64);
@@ -276,14 +284,21 @@ pub(crate) fn hash_ranges_parallel_with_budget(
         }
         pool.work(progress);
     });
-    if let Some(e) = pool.error.into_inner().unwrap_or_else(|p| p.into_inner()) {
+    if let Some(e) = pool
+        .error
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
         return Err(e);
     }
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
     }
     progress(pool.bytes_done.load(Ordering::Relaxed));
-    Ok(pool.out.into_inner().unwrap_or_else(|p| p.into_inner()))
+    Ok(pool
+        .out
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 /// Ranges for every `slice_size` slice of a file: `slices` messages at `b * slice_size`, each
@@ -354,9 +369,14 @@ pub fn file_hashes_parallel(
                 Ok(h.finish())
             })();
             match res {
-                Ok(h) => out.lock().unwrap_or_else(|p| p.into_inner())[i] = Some(h),
+                Ok(h) => {
+                    out.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)[i] = Some(h)
+                }
                 Err(e) => {
-                    let mut g = error.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut g = error
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if g.is_none() {
                         *g = Some(e);
                     }
@@ -372,10 +392,15 @@ pub fn file_hashes_parallel(
         }
         work();
     });
-    if let Some(e) = error.into_inner().unwrap_or_else(|p| p.into_inner()) {
+    if let Some(e) = error
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
         return Err(e);
     }
-    let out = out.into_inner().unwrap_or_else(|p| p.into_inner());
+    let out = out
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     out.into_iter()
         .map(|h| h.ok_or_else(|| io::Error::new(io::ErrorKind::Interrupted, "cancelled")))
         .collect()

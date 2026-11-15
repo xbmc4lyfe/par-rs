@@ -383,13 +383,13 @@ impl<'a, S: PacketSource + ?Sized> Window<'a, S> {
                 pos += n as u64;
             }
         }
-        self.hasher.map(|h| h.finish())
+        self.hasher.map(super::hasher::FileHasher::finish)
     }
 
     /// Finish only a complete fused hash, without reading any trailing bytes.
     pub(crate) fn complete_hash(self) -> Option<FileHashes> {
         (self.hashed_to == self.file_len)
-            .then(|| self.hasher.map(|hasher| hasher.finish()))
+            .then(|| self.hasher.map(super::hasher::FileHasher::finish))
             .flatten()
     }
 }

@@ -354,17 +354,14 @@ impl ParRenamer {
             if !ext_ok {
                 return true;
             }
-            let base_a = parse_par_filename(&name_a, true, ascii_lower)
-                .map(|p| p.base_len)
-                .unwrap_or(0);
+            let base_a = parse_par_filename(&name_a, true, ascii_lower).map_or(0, |p| p.base_len);
             for b in &self.par_infos[i + 1..] {
                 if a.set_id != b.set_id {
                     continue;
                 }
                 let name_b = file_name_bytes(&b.path);
-                let base_b = parse_par_filename(&name_b, true, ascii_lower)
-                    .map(|p| p.base_len)
-                    .unwrap_or(0);
+                let base_b =
+                    parse_par_filename(&name_b, true, ascii_lower).map_or(0, |p| p.base_len);
                 if base_a != base_b
                     || !name_a[..base_a.min(name_a.len())]
                         .eq_ignore_ascii_case(&name_b[..base_b.min(name_b.len())])
@@ -409,9 +406,9 @@ impl ParRenamer {
             .filter(|p| !p.is_dir())
             .map(|p| self.current_name(p))
             .collect();
-        let mains: Vec<Vec<u8>> = find_main_pars(names.iter().map(|n| n.as_slice()))
+        let mains: Vec<Vec<u8>> = find_main_pars(names.iter().map(std::vec::Vec::as_slice))
             .into_iter()
-            .map(|n| n.to_vec())
+            .map(<[u8]>::to_vec)
             .collect();
         for name in mains {
             if stopped() {
@@ -477,9 +474,7 @@ impl ParRenamer {
         // usable packet: a Main or at least one FileDesc. A read error leaves the set empty.
         let _ = set.load_file(&disk, 0, ScanOptions::METADATA);
         let loaded = (set.main.is_some() || !set.file_descs.is_empty())
-            && std::fs::metadata(&disk)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false);
+            && std::fs::metadata(&disk).is_ok_and(|m| m.len() > 0);
         if !loaded {
             events(RenamerEvent::Warning(format!(
                 "Could not load par2-file {}",
@@ -542,15 +537,12 @@ impl ParRenamer {
         events: &mut dyn FnMut(RenamerEvent),
     ) {
         let disk = self.disk_path(path);
-        let hash = match file_md5_16k(&disk) {
-            Ok(h) => h,
-            Err(_) => {
-                events(RenamerEvent::Error(format!(
-                    "Could not read file {}",
-                    path.display()
-                )));
-                return;
-            }
+        let Ok(hash) = file_md5_16k(&disk) else {
+            events(RenamerEvent::Error(format!(
+                "Could not read file {}",
+                path.display()
+            )));
+            return;
         };
         let Some(pos) = self.file_hashes.iter().position(|h| h.hash16k == hash) else {
             return;
@@ -651,7 +643,7 @@ impl ParRenamer {
 /// `<set_id>.volNNN+01.PAR2` (`NNN` from `001`) is used. `exists` answers whether a candidate
 /// name is already taken.
 pub fn direct_par_name(set_id_hex: &str, old_name: &[u8], exists: &dyn Fn(&str) -> bool) -> String {
-    let lower: Vec<u8> = old_name.iter().map(|b| b.to_ascii_lowercase()).collect();
+    let lower: Vec<u8> = old_name.iter().map(u8::to_ascii_lowercase).collect();
     if lower.ends_with(b".par2")
         && let Some(pos) = memchr::memmem::rfind(&lower, b".vol")
     {
@@ -686,7 +678,7 @@ pub fn is_split_fragment(filename: &[u8], correct_name: &[u8]) -> bool {
         return false;
     }
     let digits = &rest[1..];
-    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return false;
     }
     crate::filenames::atoi(digits) <= 1
@@ -699,7 +691,7 @@ pub fn maybe_split_fragment(filename1: &[u8], filename2: &[u8]) -> bool {
     let len = filename2.len();
     if filename1.len() > len && filename1[..len].eq_ignore_ascii_case(filename2) {
         let rest = &filename1[len..];
-        if rest[0] == b'.' && rest.len() > 1 && rest[1..].iter().all(|b| b.is_ascii_digit()) {
+        if rest[0] == b'.' && rest.len() > 1 && rest[1..].iter().all(u8::is_ascii_digit) {
             return true;
         }
     }
@@ -712,8 +704,8 @@ pub fn maybe_split_fragment(filename1: &[u8], filename2: &[u8]) -> bool {
             && e1 == e2
             && filename1[..e1].eq_ignore_ascii_case(&filename2[..e2])
         {
-            return x1[1..].iter().all(|b| b.is_ascii_digit())
-                && x2[1..].iter().all(|b| b.is_ascii_digit());
+            return x1[1..].iter().all(u8::is_ascii_digit)
+                && x2[1..].iter().all(u8::is_ascii_digit);
         }
     }
     false
@@ -725,7 +717,7 @@ pub fn matches_ignored_extension(filename: &str, exts: &[String]) -> bool {
     let lower = filename.to_ascii_lowercase();
     exts.iter()
         .flat_map(|e| e.split([',', ';']))
-        .map(|e| e.trim())
+        .map(str::trim)
         .filter(|e| !e.is_empty())
         .any(|e| {
             let e = e.to_ascii_lowercase();
@@ -747,13 +739,12 @@ fn sorted_entries(dir: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 fn file_name_bytes(path: &Path) -> Vec<u8> {
-    path.file_name().map(os_str_bytes).unwrap_or_default()
+    path.file_name().map_or_default(os_str_bytes)
 }
 
 fn base_name(path: &Path) -> String {
     path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|n| n.to_string_lossy().into_owned())
 }
 
 fn bytes_to_os_string(b: &[u8]) -> std::ffi::OsString {

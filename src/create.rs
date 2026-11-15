@@ -136,8 +136,7 @@ impl SourceFile {
         let path = path.into();
         let name = path
             .file_name()
-            .map(crate::filenames::os_str_bytes)
-            .unwrap_or_default();
+            .map_or_default(crate::filenames::os_str_bytes);
         Self {
             path,
             par2_name: name,
@@ -323,7 +322,7 @@ pub fn checked_volume_layout(
             return Ok(Vec::new());
         }
         let (prefix, tails, cap) = limited_geometry(cap, total);
-        let prefix_files = u32::BITS - prefix.leading_zeros();
+        let prefix_files = prefix.bit_width();
         let mut layout = Vec::new();
         layout
             .try_reserve_exact((prefix_files + tails) as usize)

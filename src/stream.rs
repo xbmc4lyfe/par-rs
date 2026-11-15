@@ -205,8 +205,7 @@ impl SyndromeBank {
                     .iter()
                     .position(|x| x == e)
                     .and_then(|j| self.bufs.get(j))
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[])
+                    .map_or(&[][..], Vec::as_slice)
             })
             .collect();
         let mut out: Vec<Vec<u8>> = vec![vec![0u8; self.slice_size]; rows.len()];
