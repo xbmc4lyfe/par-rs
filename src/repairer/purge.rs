@@ -118,10 +118,19 @@ impl Par2Repairer {
 
     /// Register `path` as a PAR2 file of this set that [`purge`](Self::purge) may remove,
     /// for files the repairer did not load itself (for example when the caller loaded a
-    /// verified private copy of a damaged set). The file is re-read and accepted only when
-    /// every valid packet in it belongs to this set and it has at least one; damaged packets
-    /// are ignored, as when loading. Returns whether it was accepted. Accepting a path does not
-    /// make purging safe: the verdict and the identity guards of `purge` still apply.
+    /// verified private copy of a damaged set). The file is re-read and accepted only when it
+    /// looks like a PAR2 file of this set and nothing else:
+    ///
+    /// - its name ends in `.par2` (any case), as par2cmdline's `-p` expects;
+    /// - it starts with a packet, and at least half of its bytes are packets (damaged bytes
+    ///   between packets are tolerated, an archive or data file holding a copied packet is not);
+    /// - every framed packet carries this set's id, whatever its type or checksum (so a packet
+    ///   whose set-id field is damaged, which cannot be told from another set's, refuses it);
+    /// - at least one packet of this set is valid.
+    ///
+    /// Returns whether it was accepted. Pass only paths believed to be PAR2 files of this set:
+    /// accepting a path does not make purging safe, and the verdict and identity guards of
+    /// `purge` still apply when it runs.
     ///
     /// # Errors
     /// [`RepairError::NoMainPacket`] when no set is loaded yet, or an I/O error reading `path`.
@@ -129,11 +138,8 @@ impl Par2Repairer {
         let Some(set_id) = self.packets.set_id else {
             return Err(RepairError::NoMainPacket);
         };
-        let mut probe = PacketSet::for_set(set_id);
-        let stats = probe
-            .load_file(path, 0, ScanOptions::METADATA)
+        let accepted = par2_file_of_set(path, set_id)
             .map_err(io_ctx(format!("reading {}", path.display())))?;
-        let accepted = stats.foreign == 0 && stats.added + stats.duplicates > 0;
         if accepted && !self.purge_state.par_files.iter().any(|p| p == path) {
             self.purge_state.par_files.push(path.to_path_buf());
         }
@@ -221,6 +227,40 @@ impl Par2Repairer {
         self.purge_state.reset_verdict();
         report
     }
+}
+
+/// Whether `path` is a PAR2 file made of `set_id`'s packets only (see
+/// [`Par2Repairer::add_purge_candidate`]).
+fn par2_file_of_set(path: &Path, set_id: SetId) -> io::Result<bool> {
+    let named_par2 = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("par2"));
+    if !named_par2 {
+        return Ok(false);
+    }
+    use crate::packet::PacketSource;
+    let src = crate::packet::FileSource::open(path)?;
+    let len = src.source_len();
+    // Framing pass without checksums: every frame, valid or not, must be this set's.
+    let mut frames = crate::packet::PacketIter::new(&src, ScanOptions::UNVERIFIED);
+    let mut starts_with_packet = false;
+    for (i, raw) in frames.by_ref().enumerate() {
+        let raw = raw?;
+        if i == 0 {
+            starts_with_packet = raw.offset == 0;
+        }
+        if raw.header.set_id != set_id {
+            return Ok(false);
+        }
+    }
+    let skipped = frames.stats().skipped_bytes;
+    if !starts_with_packet || skipped.saturating_mul(2) > len {
+        return Ok(false);
+    }
+    // Checked pass: at least one valid packet of this set, none of another.
+    let mut probe = PacketSet::for_set(set_id);
+    let stats = probe.load_source(&src, 0, ScanOptions::METADATA)?;
+    Ok(stats.foreign == 0 && stats.added + stats.duplicates > 0)
 }
 
 #[cfg(test)]

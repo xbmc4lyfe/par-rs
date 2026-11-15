@@ -376,14 +376,13 @@ fn caller_registered_originals_are_checked_then_purged() {
     r.load_par2_file(&private.join("copy.par2")).unwrap();
     r.finalize().unwrap();
     let originals = fx.par_files();
-    // A damaged original (one packet's bytes flipped) still holds valid packets of the set.
+    // A damaged original (a byte flipped in its recovery data) still holds the set's packets.
     let vol = originals
         .iter()
         .find(|p| p.to_string_lossy().contains(".vol"))
         .unwrap();
     let mut bytes = std::fs::read(vol).unwrap();
-    let mid = bytes.len() / 2;
-    bytes[mid] ^= 0xFF;
+    bytes[500] ^= 0xFF;
     std::fs::write(vol, &bytes).unwrap();
     for p in &originals {
         assert!(r.add_purge_candidate(p).unwrap(), "{p:?}");
@@ -392,7 +391,10 @@ fn caller_registered_originals_are_checked_then_purged() {
         r.add_purge_candidate(&originals[0]).unwrap(),
         "re-adding is harmless"
     );
-    // Rejected: another set's file, an empty file, garbage; a missing file is an error.
+    // Rejected (all named .par2, in a sub-directory): another set's file, an empty file,
+    // garbage, an archive-like file holding a copy of the set, the set with one valid foreign
+    // packet or one foreign packet of unknown type appended, and a file not starting with a
+    // packet. A correct copy without the .par2 name is refused too; a missing file errors.
     let other = build_set(
         "other",
         &[("z.bin", &[9u8; 3000][..])],
@@ -406,13 +408,52 @@ fn caller_registered_originals_are_checked_then_purged() {
     let odir = fx.dir.join("other");
     std::fs::create_dir(&odir).unwrap();
     let foreign = other.write_to(&odir, "other").unwrap().remove(0);
-    let empty = fx.dir.join("empty.dat");
-    std::fs::write(&empty, b"").unwrap();
-    let garbage = fx.dir.join("garbage.dat");
-    std::fs::write(&garbage, vec![0x5Au8; 4096]).unwrap();
+    let foreign_bytes = std::fs::read(&foreign).unwrap();
+    let index = std::fs::read(&originals[0]).unwrap();
+    let rejects = fx.dir.join("rejects");
+    std::fs::create_dir(&rejects).unwrap();
+    let user = vec![0x41u8; 64 * 1024];
+    let foreign_unknown = crate::packet::encode_packet(
+        &crate::packet::SetId([0xEE; 16]),
+        b"PAR 2.0\0Private\0",
+        &[0u8; 8],
+    );
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("empty.par2", vec![]),
+        ("garbage.par2", vec![0x5A; 4096]),
+        ("archive.par2", [&user[..], &index[..], &user[..]].concat()),
+        (
+            "plus_foreign.par2",
+            [&index[..], &foreign_bytes[..]].concat(),
+        ),
+        (
+            "plus_unknown.par2",
+            [&index[..], &foreign_unknown[..]].concat(),
+        ),
+        ("late_start.par2", [&b"junk"[..], &index[..]].concat()),
+    ];
+    let mut rejected_paths = vec![foreign.clone()];
+    for (name, bytes) in &cases {
+        let p = rejects.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        assert!(
+            !r.add_purge_candidate(&p).unwrap(),
+            "{name} must be refused"
+        );
+        rejected_paths.push(p);
+    }
+    // A packet whose set-id field is damaged cannot be told from another set's: refused.
+    let mut bad_id = index.clone();
+    bad_id[40] ^= 0xFF;
+    let bad_id_path = rejects.join("bad_id.par2");
+    std::fs::write(&bad_id_path, &bad_id).unwrap();
+    assert!(!r.add_purge_candidate(&bad_id_path).unwrap());
+    rejected_paths.push(bad_id_path);
+    let renamed = rejects.join("set.par2.bak");
+    std::fs::write(&renamed, &index).unwrap();
+    assert!(!r.add_purge_candidate(&renamed).unwrap());
+    rejected_paths.push(renamed);
     assert!(!r.add_purge_candidate(&foreign).unwrap());
-    assert!(!r.add_purge_candidate(&empty).unwrap());
-    assert!(!r.add_purge_candidate(&garbage).unwrap());
     assert!(r.add_purge_candidate(&fx.dir.join("nope.par2")).is_err());
     // Registering does not make purging safe on its own.
     assert!(kept_all(
@@ -424,5 +465,5 @@ fn caller_registered_originals_are_checked_then_purged() {
     let report = r.purge(&mut NullObserver);
     assert!(report.all_removed(), "{report:?}");
     assert!(fx.par_files().is_empty());
-    assert!(foreign.exists() && empty.exists() && garbage.exists());
+    assert!(rejected_paths.iter().all(|p| p.exists()));
 }
