@@ -1110,4 +1110,196 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn every_repair_error_maps_to_a_status() {
+        use crate::packet::{FileId, SetId};
+        let cases = [
+            (RepairError::NoMainPacket, NzbParStatus::NoMainPacket),
+            (
+                RepairError::IncompleteMetadata {
+                    missing_descriptions: vec![],
+                },
+                NzbParStatus::IncompleteMetadata,
+            ),
+            (RepairError::NotFinalized, NzbParStatus::NotFinalized),
+            (
+                RepairError::WrongSet {
+                    expected: SetId([1; 16]),
+                    found: SetId([2; 16]),
+                },
+                NzbParStatus::WrongSet,
+            ),
+            (
+                RepairError::NotEnoughRecovery {
+                    needed: 2,
+                    available: 1,
+                },
+                NzbParStatus::NotEnoughRecovery,
+            ),
+            (
+                RepairError::StreamingMemoryLimit {
+                    context: "x",
+                    required_bytes: 2,
+                    limit_bytes: 1,
+                },
+                NzbParStatus::StreamingMemoryLimit,
+            ),
+            (
+                RepairError::RecoveryMemoryLimit {
+                    missing_blocks: 1,
+                    required_bytes: 2,
+                    limit_bytes: 1,
+                },
+                NzbParStatus::RecoveryMemoryLimit,
+            ),
+            (RepairError::Singular, NzbParStatus::Singular),
+            (
+                RepairError::VerificationFailed { files: vec![] },
+                NzbParStatus::VerificationFailed,
+            ),
+            (
+                RepairError::Io {
+                    context: "ctx".into(),
+                    source: std::io::Error::other("e"),
+                },
+                NzbParStatus::Io,
+            ),
+            (RepairError::Cancelled, NzbParStatus::Cancelled),
+            (
+                RepairError::UnknownFile(FileId([0; 16])),
+                NzbParStatus::InvalidArgument,
+            ),
+        ];
+        for (e, status) in &cases {
+            assert_eq!(NzbParStatus::from(e), *status, "{e}");
+        }
+        assert_eq!(guard(|| panic!("boom")), NzbParStatus::Panic);
+    }
+
+    struct QuickReply {
+        status: c_int,
+        segments: Vec<NzbParSegment>,
+        null_segments: bool,
+    }
+
+    unsafe extern "C" fn scripted_quick_cb(
+        ctx: *mut c_void,
+        _filename: *const c_char,
+        out_status: *mut c_int,
+        out_crc: *mut u32,
+        out_segs: *mut *const NzbParSegment,
+        out_count: *mut usize,
+    ) {
+        // SAFETY: ctx is a `*const QuickReply` set up by the test.
+        let r = unsafe { &*(ctx as *const QuickReply) };
+        unsafe {
+            *out_status = r.status;
+            *out_crc = 0xABCD;
+            *out_segs = if r.null_segments {
+                ptr::null()
+            } else {
+                r.segments.as_ptr()
+            };
+            *out_count = r.segments.len();
+        }
+    }
+
+    #[test]
+    fn quick_callback_statuses_and_partial_segments() {
+        let seg = |offset, success| NzbParSegment {
+            offset,
+            size: 100,
+            crc: offset as u32,
+            success,
+        };
+        let ask = |reply: &QuickReply| {
+            let mut q = QuickCb {
+                ctx: reply as *const QuickReply as *mut c_void,
+                f: scripted_quick_cb,
+            };
+            q.quick_info("a.bin")
+        };
+        let reply = |status, segments: Vec<NzbParSegment>, null_segments| QuickReply {
+            status,
+            segments,
+            null_segments,
+        };
+        assert!(matches!(
+            ask(&reply(1, vec![], false)),
+            Some(QuickInfo::Success { crc: 0xABCD })
+        ));
+        // Partial segments come back sorted by offset with their success flags.
+        let Some(QuickInfo::Partial { segments }) =
+            ask(&reply(2, vec![seg(200, 0), seg(0, 1), seg(100, 1)], false))
+        else {
+            panic!("expected a partial verdict");
+        };
+        let got: Vec<(i64, bool)> = segments.iter().map(|s| (s.offset, s.success)).collect();
+        assert_eq!(got, vec![(0, true), (100, true), (200, false)]);
+        // Partial without segments degrades to failure; 3 is failure; anything else unknown.
+        assert!(matches!(
+            ask(&reply(2, vec![], false)),
+            Some(QuickInfo::Failure)
+        ));
+        assert!(matches!(
+            ask(&reply(2, vec![seg(0, 1)], true)),
+            Some(QuickInfo::Failure)
+        ));
+        assert!(matches!(
+            ask(&reply(3, vec![], false)),
+            Some(QuickInfo::Failure)
+        ));
+        assert!(ask(&reply(0, vec![], false)).is_none());
+        assert!(ask(&reply(9, vec![], false)).is_none());
+    }
+
+    unsafe extern "C" fn level_cb(ctx: *mut c_void, level: c_int, _text: *const c_char) {
+        let v = unsafe { &mut *(ctx as *mut Vec<c_int>) };
+        v.push(level);
+    }
+
+    unsafe extern "C" fn stage_cb(
+        ctx: *mut c_void,
+        stage: c_int,
+        _permille: u32,
+        _label: *const c_char,
+    ) {
+        let v = unsafe { &mut *(ctx as *mut Vec<c_int>) };
+        v.push(stage);
+    }
+
+    #[test]
+    fn observer_maps_levels_and_stages() {
+        let mut seen: Vec<c_int> = Vec::new();
+        let mut cb = Callbacks {
+            ctx: &mut seen as *mut Vec<c_int> as *mut c_void,
+            progress: Some(stage_cb),
+            message: Some(level_cb),
+            stage: Stage::Loading,
+        };
+        for level in [Level::Detail, Level::Info, Level::Warning, Level::Error] {
+            cb.message(level, "text with \0 nul");
+        }
+        for stage in [
+            Stage::Loading,
+            Stage::Verifying,
+            Stage::ScanningExtra,
+            Stage::Repairing,
+            Stage::VerifyingRepaired,
+        ] {
+            cb.stage(stage);
+            cb.progress(500, "label");
+        }
+        assert_eq!(seen, vec![0, 1, 2, 3, 0, 1, 2, 3, 4]);
+        // Without callbacks nothing is called.
+        let mut silent = Callbacks {
+            ctx: ptr::null_mut(),
+            progress: None,
+            message: None,
+            stage: Stage::Loading,
+        };
+        silent.message(Level::Error, "x");
+        silent.progress(1, "y");
+    }
 }
