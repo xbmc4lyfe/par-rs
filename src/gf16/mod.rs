@@ -85,7 +85,7 @@ pub fn mul(a: u16, b: u16) -> u16 {
         return 0;
     }
     let t = tables();
-    t.exp(t.log(a) as u32 + t.log(b) as u32)
+    t.exp(u32::from(t.log(a)) + u32::from(t.log(b)))
 }
 
 /// Multiplication by shift-and-add; independent of the tables (used to validate them).
@@ -112,7 +112,7 @@ pub fn inv(a: u16) -> u16 {
         return 0;
     }
     let t = tables();
-    t.exp(ORDER - t.log(a) as u32)
+    t.exp(ORDER - u32::from(t.log(a)))
 }
 
 /// Division `a / b`. Division by zero returns 0.
@@ -122,7 +122,7 @@ pub fn div(a: u16, b: u16) -> u16 {
         return 0;
     }
     let t = tables();
-    t.exp(t.log(a) as u32 + ORDER - t.log(b) as u32)
+    t.exp(u32::from(t.log(a)) + ORDER - u32::from(t.log(b)))
 }
 
 /// Exponentiation `a^e` (with `0^0 == 1`).
@@ -135,7 +135,7 @@ pub fn pow(a: u16, e: u32) -> u16 {
         return 0;
     }
     let t = tables();
-    let l = (t.log(a) as u64 * e as u64) % ORDER as u64;
+    let l = (u64::from(t.log(a)) * u64::from(e)) % u64::from(ORDER);
     t.exp(l as u32)
 }
 
@@ -191,14 +191,14 @@ pub fn input_constant_logs(count: usize) -> Result<Vec<u16>, TooManyInputSlices>
 pub fn input_constants(count: usize) -> Result<Vec<u16>, TooManyInputSlices> {
     let logs = input_constant_logs(count)?;
     let t = tables();
-    Ok(logs.into_iter().map(|l| t.exp(l as u32)).collect())
+    Ok(logs.into_iter().map(|l| t.exp(u32::from(l))).collect())
 }
 
 /// Coefficient of input slice with constant-log `logbase` in the recovery slice with
 /// exponent `exponent`: `(alpha^logbase)^exponent`.
 #[inline]
 pub fn rs_coefficient(logbase: u16, exponent: u32) -> u16 {
-    let l = (logbase as u64 * exponent as u64) % ORDER as u64;
+    let l = (u64::from(logbase) * u64::from(exponent)) % u64::from(ORDER);
     tables().exp(l as u32)
 }
 
@@ -224,10 +224,10 @@ impl MulTables {
         let mut hi = [0u16; 256];
         if coeff != 0 {
             let t = tables();
-            let lc = t.log(coeff) as u32;
+            let lc = u32::from(t.log(coeff));
             for i in 1..256u32 {
-                lo[i as usize] = t.exp(lc + t.log(i as u16) as u32);
-                hi[i as usize] = t.exp(lc + t.log((i << 8) as u16) as u32);
+                lo[i as usize] = t.exp(lc + u32::from(t.log(i as u16)));
+                hi[i as usize] = t.exp(lc + u32::from(t.log((i << 8) as u16)));
             }
         }
         Self { lo, hi, coeff }
@@ -311,11 +311,11 @@ impl ShuffleTables {
         let mut hi = [[0u8; 16]; 4];
         if coeff != 0 {
             let t = tables();
-            let lc = t.log(coeff) as u32;
+            let lc = u32::from(t.log(coeff));
             for k in 0..4 {
                 for v in 1..16u32 {
                     let word = (v << (4 * k)) as u16;
-                    let p = t.exp(lc + t.log(word) as u32);
+                    let p = t.exp(lc + u32::from(t.log(word)));
                     lo[k][v as usize] = p as u8;
                     hi[k][v as usize] = (p >> 8) as u8;
                 }
@@ -344,7 +344,7 @@ impl ShuffleTables {
             lo ^= self.lo[k][nk];
             hi ^= self.hi[k][nk];
         }
-        lo as u16 | (hi as u16) << 8
+        u16::from(lo) | u16::from(hi) << 8
     }
 }
 

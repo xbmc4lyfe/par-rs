@@ -469,9 +469,9 @@ pub unsafe extern "C" fn nzbpar_repairer_verify(
                     // SAFETY: caller-provided out pointer.
                     unsafe {
                         *out = NzbParVerifyResult {
-                            all_complete: v.all_complete as c_int,
-                            repair_needed: v.repair_needed as c_int,
-                            repair_possible: v.repair_possible as c_int,
+                            all_complete: c_int::from(v.all_complete),
+                            repair_needed: c_int::from(v.repair_needed),
+                            repair_possible: c_int::from(v.repair_possible),
                             missing_blocks: v.missing_blocks,
                             recovery_blocks: v.recovery_blocks,
                             quick_verified_files: v.quick_verified_files as u64,
@@ -663,8 +663,8 @@ pub unsafe extern "C" fn nzbpar_repairer_file_info(
                     crate::repairer::FileStatus::Damaged => 3,
                     crate::repairer::FileStatus::Misnamed => 4,
                 },
-                target_exists: f.target_exists as c_int,
-                quick_verified: f.quick_verified as c_int,
+                target_exists: c_int::from(f.target_exists),
+                quick_verified: c_int::from(f.quick_verified),
                 hash_full: f.hash_full,
                 hash_16k: f.hash_16k,
             }

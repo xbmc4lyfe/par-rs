@@ -3,7 +3,7 @@
 //! This module provides:
 //!
 //! * A streaming [`Crc32`] hasher with hardware acceleration (`pclmulqdq` folding on
-//!   x86_64, the `crc32x` instructions on AArch64) and a slice-by-8 table fallback.
+//!   `x86_64`, the `crc32x` instructions on `AArch64`) and a slice-by-8 table fallback.
 //! * GF(2) polynomial arithmetic on CRC registers: [`crc32_combine`], [`crc32_zeros`],
 //!   [`crc32_of_zeros`] and [`crc32_shift_raw`], implemented via `x^n mod P(x)` exponentiation
 //!   in `O(log n)` so that CRCs of concatenations and zero-extensions can be computed
@@ -63,7 +63,7 @@ pub static TABLES: [[u32; 256]; 8] = make_tables();
 /// Process one byte through the raw register.
 #[inline(always)]
 pub fn update_byte_raw(state: u32, byte: u8) -> u32 {
-    (state >> 8) ^ TABLES[0][((state ^ byte as u32) & 0xFF) as usize]
+    (state >> 8) ^ TABLES[0][((state ^ u32::from(byte)) & 0xFF) as usize]
 }
 
 /// Slice-by-8 software update of the raw register.
@@ -453,7 +453,7 @@ mod hw {
 pub enum CrcKernel {
     /// Slice-by-8 table lookup.
     Software,
-    /// `pclmulqdq` folding (x86_64) or `crc32x` instructions (AArch64).
+    /// `pclmulqdq` folding (`x86_64`) or `crc32x` instructions (`AArch64`).
     Hardware,
 }
 

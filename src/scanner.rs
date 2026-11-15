@@ -64,7 +64,7 @@ pub struct ChecksumIndex {
 #[inline(always)]
 fn mix(crc: u32) -> u64 {
     // Cheap avalanche so that adjacent CRCs spread over buckets.
-    (crc as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20
+    u64::from(crc).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20
 }
 
 impl ChecksumIndex {

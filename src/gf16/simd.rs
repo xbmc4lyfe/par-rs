@@ -28,7 +28,7 @@ use crate::gf16::{MulTables, ShuffleTables, mul_acc_scalar, mul_acc_split_scalar
 pub enum Isa {
     /// Portable table-lookup implementation.
     Scalar,
-    /// AArch64 Advanced SIMD (`tbl`).
+    /// `AArch64` Advanced SIMD (`tbl`).
     Neon,
     /// x86 SSSE3 (`pshufb`, 128-bit).
     Ssse3,
@@ -455,7 +455,7 @@ impl Kernel {
             let last = src.len() - 1;
             for (d, &c) in dsts.iter_mut().zip(coeffs) {
                 if c != 0 {
-                    d[last] ^= crate::gf16::mul(c, src[last] as u16) as u8;
+                    d[last] ^= crate::gf16::mul(c, u16::from(src[last])) as u8;
                 }
             }
         }

@@ -64,11 +64,11 @@ pub fn atoi(bytes: &[u8]) -> i32 {
     }
     let mut v: i64 = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
-        v = (v * 10 + (bytes[i] - b'0') as i64).min(i32::MAX as i64 + 1);
+        v = (v * 10 + i64::from(bytes[i] - b'0')).min(i64::from(i32::MAX) + 1);
         i += 1;
     }
     let v = if neg { -v } else { v };
-    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 /// Port of `ParParser::ParseParFilename`.
@@ -214,7 +214,7 @@ pub fn volume_blocks_bytes(name: &[u8]) -> Option<u32> {
     }
     let mut v: u64 = 0;
     for &d in digits {
-        v = (v * 10 + (d - b'0') as u64).min(u32::MAX as u64);
+        v = (v * 10 + u64::from(d - b'0')).min(u64::from(u32::MAX));
     }
     Some(v as u32)
 }
@@ -236,7 +236,7 @@ pub fn volume_range(name: &[u8]) -> Option<(u32, u32)> {
     }
     let mut v: u64 = 0;
     for &d in first {
-        v = (v * 10 + (d - b'0') as u64).min(u32::MAX as u64);
+        v = (v * 10 + u64::from(d - b'0')).min(u64::from(u32::MAX));
     }
     Some((v as u32, count))
 }
@@ -269,7 +269,7 @@ pub fn calc_queued_volume_blocks(parsed_blocks: i32, encoded_size: i64, slice_si
     if per_block <= 0 || encoded_size <= 0 {
         return 0;
     }
-    (encoded_size.saturating_mul(100) / 102 / per_block).clamp(0, i32::MAX as i64) as i32
+    (encoded_size.saturating_mul(100) / 102 / per_block).clamp(0, i64::from(i32::MAX)) as i32
 }
 
 /// Estimated block count of a *completed* (on-disk) volume: when the name carries no block
@@ -282,7 +282,7 @@ pub fn calc_completed_volume_blocks(parsed_blocks: i32, disk_size: i64, slice_si
     if per_block <= 0 || disk_size <= 0 {
         return 0;
     }
-    (disk_size / per_block).clamp(0, i32::MAX as i64) as i32
+    (disk_size / per_block).clamp(0, i64::from(i32::MAX)) as i32
 }
 
 /// Choose which queued volumes to download to obtain `block_needed` recovery blocks.
@@ -311,14 +311,14 @@ pub fn select_more_pars(sorted_block_counts: &[i32], block_needed: i32) -> (Vec<
     }
     let n = sorted_block_counts.len();
     let mut taken = vec![false; n];
-    let mut need = block_needed as i64;
+    let mut need = i64::from(block_needed);
     // Candidates with a positive block count, by ascending index (= ascending count).
     while need > 0 {
         let smallest_sufficient =
-            (0..n).find(|&i| !taken[i] && sorted_block_counts[i] as i64 >= need);
+            (0..n).find(|&i| !taken[i] && i64::from(sorted_block_counts[i]) >= need);
         if let Some(i) = smallest_sufficient {
             taken[i] = true;
-            need -= sorted_block_counts[i] as i64;
+            need -= i64::from(sorted_block_counts[i]);
             break;
         }
         let Some(largest) = (0..n)
@@ -328,19 +328,19 @@ pub fn select_more_pars(sorted_block_counts: &[i32], block_needed: i32) -> (Vec<
             break;
         };
         taken[largest] = true;
-        need -= sorted_block_counts[largest] as i64;
+        need -= i64::from(sorted_block_counts[largest]);
     }
     let mut selected: Vec<usize> = (0..n).filter(|&i| taken[i]).collect();
     if need <= 0 {
         // Prune smallest-first while the remaining selection still covers the need.
         let mut total: i64 = selected
             .iter()
-            .map(|&i| sorted_block_counts[i] as i64)
+            .map(|&i| i64::from(sorted_block_counts[i]))
             .sum();
         let mut i = 0;
         while i < selected.len() {
-            let c = sorted_block_counts[selected[i]] as i64;
-            if total - c >= block_needed as i64 {
+            let c = i64::from(sorted_block_counts[selected[i]]);
+            if total - c >= i64::from(block_needed) {
                 total -= c;
                 selected.remove(i);
             } else {

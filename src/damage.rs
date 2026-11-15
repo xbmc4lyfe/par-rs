@@ -1,4 +1,4 @@
-//! Live-download hole tracking, damage projection and zero-read ("ParQuick") verification.
+//! Live-download hole tracking, damage projection and zero-read ("`ParQuick`") verification.
 //!
 //! nzbget knows, for every downloaded file, which yEnc articles (segments) arrived intact and
 //! what their decoded CRC-32 values are. That information supports these operations:
@@ -96,7 +96,7 @@ pub fn blocks_touched(holes: &[ByteRange], slice_size: u64) -> i32 {
     if let Some((ca, cb)) = cur {
         count += cb - ca + 1;
     }
-    count.min(i32::MAX as i64) as i32
+    count.min(i64::from(i32::MAX)) as i32
 }
 
 /// Whether `[from, to)` is contiguously tiled by `sorted_ranges` (sorted by offset; overlaps
@@ -161,11 +161,11 @@ pub fn project_par_damage(files: &[FileDamage<'_>], slice_size: u64) -> i32 {
     let mut total: i64 = 0;
     for f in files {
         total += match f.missing_file_blocks {
-            Some(b) => b.max(0) as i64,
-            None => blocks_touched(f.holes, slice_size) as i64,
+            Some(b) => i64::from(b.max(0)),
+            None => i64::from(blocks_touched(f.holes, slice_size)),
         };
     }
-    total.min(i32::MAX as i64) as i32
+    total.min(i64::from(i32::MAX)) as i32
 }
 
 /// Whether the projected damage exceeds what the available recovery blocks can repair.

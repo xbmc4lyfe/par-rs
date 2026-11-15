@@ -455,7 +455,7 @@ pub struct EngineConfig {
     pub input_batch: usize,
     /// Words per L1 tile.
     pub tile_words: usize,
-    /// Outputs accumulated per source pass (1..=MAX_MULTI).
+    /// Outputs accumulated per source pass (`1..=MAX_MULTI`).
     pub output_group: usize,
     /// Threads reading input slices (0 = half the workers, 1..=6).
     pub reader_threads: usize,
@@ -536,7 +536,7 @@ impl Shared {
     fn coeff(&self, input: &InputSpec, output: usize) -> u16 {
         match input.kind {
             InputKind::Data { logbase } => rs_coefficient(logbase, self.exponents[output]),
-            InputKind::Recovery { output: o } => (o == output) as u16,
+            InputKind::Recovery { output: o } => u16::from(o == output),
         }
     }
 }
