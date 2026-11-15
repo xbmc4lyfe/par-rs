@@ -25,22 +25,42 @@ use crate::packet::{
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Host predicate deciding whether a missing described file (local name) may be ignored.
+pub type IgnorePredicate = Arc<dyn Fn(&str) -> bool + Send + Sync + std::panic::RefUnwindSafe>;
+
 /// Renamer options.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct RenamerOptions {
     /// Report described files that are missing on disk.
     pub detect_missing: bool,
     /// Extensions (with or without leading dot, case-insensitive) of files whose absence is
-    /// not an error (nzbget `ParIgnoreExt`).
+    /// not an error (nzbget `ParIgnoreExt`). Unused when [`is_ignored`](Self::is_ignored) is set.
     pub ignore_extensions: Vec<String>,
     /// Plan only; do not rename anything.
     pub dry_run: bool,
+    /// Host-supplied ignore rule for missing files. When set it replaces the
+    /// [`ignore_extensions`](Self::ignore_extensions) suffix match, e.g. to apply nzbget's
+    /// `MatchFileExt` wildcard semantics.
+    pub is_ignored: Option<IgnorePredicate>,
+}
+
+impl std::fmt::Debug for RenamerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenamerOptions")
+            .field("detect_missing", &self.detect_missing)
+            .field("ignore_extensions", &self.ignore_extensions)
+            .field("dry_run", &self.dry_run)
+            .field("is_ignored", &self.is_ignored.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
 }
 
 /// Events emitted while renaming.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RenamerEvent {
     /// Informational message.
     Info(String),
@@ -55,8 +75,20 @@ pub enum RenamerEvent {
         /// New path.
         to: PathBuf,
     },
-    /// Progress: `(files checked, files total)`.
+    /// Progress: `(files checked, files total)`. Emitted right after [`Checking`](Self::Checking)
+    /// for the same file.
     Progress(usize, usize),
+    /// The file about to be checked (emitted just before [`Progress`](Self::Progress)).
+    Checking {
+        /// Path of the file being checked (its planned name in dry-run mode).
+        path: PathBuf,
+    },
+    /// A loaded par2 file described a file (local name) not described before in this
+    /// directory; emitted once per distinct 16k hash.
+    Described {
+        /// Local file name from the FileDesc packet.
+        name: String,
+    },
 }
 
 /// Summary of a renamer run.
@@ -127,14 +159,28 @@ impl ParRenamer {
         }
     }
 
-    /// Run the renamer. Port of `ParRenamer::Execute`.
+    /// Run the renamer, cancelled through an optional flag. Port of `ParRenamer::Execute`;
+    /// see [`run_with_stop`](Self::run_with_stop).
     pub fn run(
-        mut self,
+        self,
         cancel: Option<&AtomicBool>,
         events: &mut dyn FnMut(RenamerEvent),
     ) -> io::Result<RenamerReport> {
-        let stopped = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
-        let dirs = self.build_dir_list(&stopped)?;
+        self.run_with_stop(
+            &mut || cancel.is_some_and(|c| c.load(Ordering::Relaxed)),
+            events,
+        )
+    }
+
+    /// Run the renamer, polling `stopped` for cancellation. Once it returns `true` the run
+    /// stops before the next file and performs no further stage (no renames) for the
+    /// directory in progress; the report covers the work done so far.
+    pub fn run_with_stop(
+        mut self,
+        stopped: &mut dyn FnMut() -> bool,
+        events: &mut dyn FnMut(RenamerEvent),
+    ) -> io::Result<RenamerReport> {
+        let dirs = self.build_dir_list(stopped)?;
         for dir in dirs {
             if stopped() {
                 break;
@@ -143,13 +189,22 @@ impl ParRenamer {
             self.par_infos.clear();
             self.bad_pars.clear();
             self.loaded_pars.clear();
-            self.check_files(&dir, true, &stopped, events)?;
-            self.rename_par_files(&dir, events);
-            self.load_main_par_files(&dir, &stopped, events);
-            if self.report.has_damaged_par_files {
-                self.load_extra_par_files(&dir, &stopped, events);
+            self.check_files(&dir, true, stopped, events)?;
+            if stopped() {
+                break;
             }
-            self.check_files(&dir, false, &stopped, events)?;
+            self.rename_par_files(&dir, events);
+            self.load_main_par_files(&dir, stopped, events);
+            if self.report.has_damaged_par_files && !stopped() {
+                self.load_extra_par_files(&dir, stopped, events);
+            }
+            if stopped() {
+                break;
+            }
+            self.check_files(&dir, false, stopped, events)?;
+            if stopped() {
+                break;
+            }
             if self.options.detect_missing {
                 self.check_missing(events);
             }
@@ -163,7 +218,7 @@ impl ParRenamer {
     }
 
     /// Destination directory and all sub-directories (recursively); also counts files.
-    fn build_dir_list(&mut self, stopped: &dyn Fn() -> bool) -> io::Result<Vec<PathBuf>> {
+    fn build_dir_list(&mut self, stopped: &mut dyn FnMut() -> bool) -> io::Result<Vec<PathBuf>> {
         let mut dirs = vec![self.dest_dir.clone()];
         let mut i = 0;
         while i < dirs.len() {
@@ -187,7 +242,7 @@ impl ParRenamer {
         &mut self,
         dir: &Path,
         check_pars: bool,
-        stopped: &dyn Fn() -> bool,
+        stopped: &mut dyn FnMut() -> bool,
         events: &mut dyn FnMut(RenamerEvent),
     ) -> io::Result<()> {
         for path in sorted_entries(dir)? {
@@ -197,6 +252,9 @@ impl ParRenamer {
             if path.is_dir() {
                 continue;
             }
+            events(RenamerEvent::Checking {
+                path: self.current_path(&path),
+            });
             events(RenamerEvent::Progress(self.cur_file, self.file_count));
             self.cur_file += 1;
             if check_pars {
@@ -296,7 +354,7 @@ impl ParRenamer {
     fn load_main_par_files(
         &mut self,
         dir: &Path,
-        stopped: &dyn Fn() -> bool,
+        stopped: &mut dyn FnMut() -> bool,
         events: &mut dyn FnMut(RenamerEvent),
     ) {
         let Ok(entries) = sorted_entries(dir) else {
@@ -324,7 +382,7 @@ impl ParRenamer {
     fn load_extra_par_files(
         &mut self,
         dir: &Path,
-        stopped: &dyn Fn() -> bool,
+        stopped: &mut dyn FnMut() -> bool,
         events: &mut dyn FnMut(RenamerEvent),
     ) {
         let Ok(entries) = sorted_entries(dir) else {
@@ -400,11 +458,15 @@ impl ParRenamer {
         let ids = set.file_ids_in_main_order();
         for id in ids {
             let Some(fd) = set.file_descs.get(&id) else {
-                events(RenamerEvent::Warning(format!(
-                    "Damaged par2-file detected: {}",
-                    base_name(path)
-                )));
-                self.bad_pars.push(path.to_path_buf());
+                // One warning and one bad-list entry per par2 file, however many
+                // descriptions it lacks (otherwise it would be renamed to .bad twice).
+                if !self.bad_pars.iter().any(|p| p == path) {
+                    events(RenamerEvent::Warning(format!(
+                        "Damaged par2-file detected: {}",
+                        base_name(path)
+                    )));
+                    self.bad_pars.push(path.to_path_buf());
+                }
                 self.report.has_damaged_par_files = true;
                 continue;
             };
@@ -413,6 +475,9 @@ impl ParRenamer {
                 continue;
             }
             if !self.file_hashes.iter().any(|h| h.hash16k == fd.hash_16k) {
+                events(RenamerEvent::Described {
+                    name: filename.clone(),
+                });
                 self.file_hashes.push(FileHash {
                     filename,
                     hash16k: fd.hash_16k,
@@ -457,7 +522,11 @@ impl ParRenamer {
             if h.exists {
                 continue;
             }
-            if matches_ignored_extension(&h.filename, &self.options.ignore_extensions) {
+            let ignored = match &self.options.is_ignored {
+                Some(pred) => pred(&h.filename),
+                None => matches_ignored_extension(&h.filename, &self.options.ignore_extensions),
+            };
+            if ignored {
                 events(RenamerEvent::Info(format!(
                     "File {} is missing, ignoring",
                     h.filename
@@ -774,6 +843,7 @@ mod tests {
             detect_missing: true,
             ignore_extensions: vec!["nfo".into()],
             dry_run: false,
+            is_ignored: None,
         };
         let mut events = Vec::new();
         let rep = ParRenamer::new(&dir, opts)
@@ -953,6 +1023,186 @@ mod tests {
                 .run(None, &mut |_| {})
                 .is_err()
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Main par2 file whose Main packet lists file ids without a FileDesc packet.
+    fn index_without_descs(bytes: &[u8], drop: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut dropped = 0;
+        for r in crate::packet::PacketIter::new(bytes, ScanOptions::UNVERIFIED).map(|r| r.unwrap())
+        {
+            let s = r.offset as usize;
+            let e = s + r.header.length as usize;
+            match r.header.kind() {
+                crate::packet::PacketType::RecoverySlice => continue,
+                crate::packet::PacketType::FileDesc if dropped < drop => dropped += 1,
+                _ => out.extend_from_slice(&bytes[s..e]),
+            }
+        }
+        assert_eq!(dropped, drop);
+        out
+    }
+
+    #[test]
+    fn par_missing_several_descs_is_marked_bad_once() {
+        let dir = tmpdir("multidesc");
+        let a = rnd(9_000, 11);
+        let b = rnd(7_000, 12);
+        let c = rnd(5_000, 13);
+        let (bytes, _) = create_in_memory(
+            &[(b"a.bin", &a), (b"b.bin", &b), (b"c.bin", &c)],
+            1024,
+            &[0],
+            Kernel::detect(),
+        )
+        .unwrap();
+        let (_, vols) = split_set(&bytes);
+        std::fs::write(dir.join("set.par2"), index_without_descs(&bytes, 2)).unwrap();
+        std::fs::write(dir.join("set.vol00+01.par2"), &vols[0]).unwrap();
+        std::fs::write(dir.join("o1"), &a).unwrap();
+        std::fs::write(dir.join("o2"), &b).unwrap();
+        std::fs::write(dir.join("o3"), &c).unwrap();
+        let mut events = Vec::new();
+        let rep = ParRenamer::new(&dir, RenamerOptions::default())
+            .run(None, &mut |e| events.push(e))
+            .unwrap();
+        let damaged = events
+            .iter()
+            .filter(|e| matches!(e, RenamerEvent::Warning(m) if m.contains("Damaged par2-file detected")))
+            .count();
+        assert_eq!(damaged, 1, "{events:?}");
+        assert!(
+            !events.iter().any(|e| matches!(e, RenamerEvent::Error(_))),
+            "{events:?}"
+        );
+        let bad_renames = rep
+            .renamed
+            .iter()
+            .filter(|(_, to)| to.to_string_lossy().ends_with(".bad"))
+            .count();
+        assert_eq!(bad_renames, 1);
+        assert!(rep.has_damaged_par_files);
+        assert_eq!(rep.bad_par_files, vec![dir.join("set.par2")]);
+        assert!(dir.join("set.par2.bad").exists());
+        for n in ["a.bin", "b.bin", "c.bin"] {
+            assert!(dir.join(n).exists(), "{n}");
+        }
+        // Main described one file, the extra volume the same file again plus two new ones:
+        // one Described per distinct 16k hash, the repeat suppressed.
+        let mut described: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                RenamerEvent::Described { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(described.len(), 3, "{described:?}");
+        described.sort();
+        assert_eq!(described, ["a.bin", "b.bin", "c.bin"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn described_fires_once_per_distinct_hash16k() {
+        let dir = tmpdir("described");
+        let same = rnd(20_000, 21);
+        let other = rnd(20_000, 22);
+        let (bytes, _) = create_in_memory(
+            &[
+                (b"one.bin", &same),
+                (b"two.bin", &same),
+                (b"three.bin", &other),
+            ],
+            4096,
+            &[],
+            Kernel::detect(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("set.par2"), &bytes).unwrap();
+        let mut described = Vec::new();
+        let mut checking = Vec::new();
+        let mut progress = 0;
+        ParRenamer::new(&dir, RenamerOptions::default())
+            .run(None, &mut |e| match e {
+                RenamerEvent::Described { name } => described.push(name),
+                RenamerEvent::Checking { path } => checking.push(path),
+                RenamerEvent::Progress(..) => progress += 1,
+                _ => {}
+            })
+            .unwrap();
+        assert_eq!(described.len(), 2, "{described:?}");
+        assert!(described.contains(&"three.bin".to_string()));
+        // One Checking event (with the path) per Progress event.
+        assert_eq!(checking.len(), progress);
+        assert!(checking.iter().all(|p| p == &dir.join("set.par2")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stop_callback_stops_after_first_file() {
+        let dir = tmpdir("stopcb");
+        let a = rnd(6_000, 31);
+        let b = rnd(6_000, 32);
+        let (bytes, _) = create_in_memory(
+            &[(b"a.bin", &a), (b"b.bin", &b)],
+            1024,
+            &[],
+            Kernel::detect(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("0set.par2"), &bytes).unwrap();
+        std::fs::write(dir.join("x1"), &a).unwrap();
+        std::fs::write(dir.join("x2"), &b).unwrap();
+        let checked = std::cell::Cell::new(0usize);
+        let mut events = Vec::new();
+        let rep = ParRenamer::new(&dir, RenamerOptions::default())
+            .run_with_stop(&mut || checked.get() >= 1, &mut |e| {
+                if matches!(e, RenamerEvent::Progress(..)) {
+                    checked.set(checked.get() + 1);
+                }
+                events.push(e);
+            })
+            .unwrap();
+        assert_eq!(checked.get(), 1, "{events:?}");
+        assert_eq!(rep.renamed_count(), 0);
+        assert!(dir.join("x1").exists() && dir.join("x2").exists());
+        // Without the stop the same directory is renamed.
+        let rep = ParRenamer::new(&dir, RenamerOptions::default())
+            .run_with_stop(&mut || false, &mut |_| {})
+            .unwrap();
+        assert_eq!(rep.renamed_count(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn host_ignore_predicate_replaces_extension_list() {
+        let dir = tmpdir("ignorepred");
+        let a = rnd(3_000, 41);
+        let b = rnd(3_000, 42);
+        let (bytes, _) = create_in_memory(
+            &[(b"readme.nfo", &a), (b"sample-x.mkv", &b)],
+            1024,
+            &[],
+            Kernel::detect(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("set.par2"), &bytes).unwrap();
+        let opts = RenamerOptions {
+            detect_missing: true,
+            ignore_extensions: vec!["nfo".into()],
+            is_ignored: Some(Arc::new(|n: &str| n.starts_with("sample"))),
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        let rep = ParRenamer::new(&dir, opts)
+            .run(None, &mut |e| events.push(e))
+            .unwrap();
+        assert!(rep.has_missed_files); // readme.nfo no longer ignored
+        assert!(events.contains(&RenamerEvent::Info(
+            "File sample-x.mkv is missing, ignoring".into()
+        )));
+        assert!(events.contains(&RenamerEvent::Info("File readme.nfo is missing".into())));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
