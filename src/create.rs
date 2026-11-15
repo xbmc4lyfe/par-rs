@@ -107,6 +107,7 @@ impl Default for CreateOptions {
 /// - any `../`, even inside a component such as `a../b` (readers rewrite every `../`).
 ///
 /// Any other bytes, including non-UTF-8 ones, are kept as given.
+#[must_use]
 pub fn valid_par2_name(name: &[u8]) -> bool {
     let drive = name.len() >= 2 && name[0].is_ascii_alphabetic() && name[1] == b':';
     !name.is_empty()
@@ -381,6 +382,7 @@ fn limited_geometry(cap: u32, total: u32) -> (u32, u32, u32) {
 /// from zero recovery.
 /// Use [`checked_volume_layout`] when consuming the new variant. Existing
 /// schemes retain their previous behavior, including `Uniform(0)`.
+#[must_use]
 pub fn volume_layout(scheme: VolumeScheme, total: u32) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     if total == 0 {
@@ -995,6 +997,7 @@ impl Par2Set {
 pub const TYPE_UNIFILEN: [u8; 16] = *b"PAR 2.0\0UniFileN";
 
 /// Body of a `UniFileN` packet: file id + UTF-16LE name, NUL padded to a multiple of 4.
+#[must_use]
 pub fn encode_unicode_name_body(file_id: &FileId, name: &str) -> Vec<u8> {
     let mut body = Vec::with_capacity(16 + name.len() * 2 + 4);
     body.extend_from_slice(&file_id.0);

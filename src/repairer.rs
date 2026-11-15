@@ -118,6 +118,7 @@ pub struct RepairOptions {
 /// `*.nfo`, `readme.nfo` and `*` all ignore `release.nfo` or `readme.nfo`, while `clip*` does
 /// not ignore `extras/clip.mkv`. Mirrors nzbget's `Util::MatchFileExt` + `WildMask`, which
 /// see the target filename, directories included.
+#[must_use]
 pub fn ignore_name_matches(local_name: &str, entry: &str) -> bool {
     let name = local_name.as_bytes();
     let pat = entry.as_bytes();
@@ -244,6 +245,7 @@ pub struct SourceFileState {
 
 impl SourceFileState {
     /// Slices still missing.
+    #[must_use]
     pub fn missing_blocks(&self) -> u32 {
         self.block_count - self.available_blocks
     }
@@ -515,6 +517,7 @@ pub struct VerifyResult {
 
 impl VerifyResult {
     /// Recovery blocks still needed (0 if repair is possible).
+    #[must_use]
     pub fn blocks_needed(&self) -> u64 {
         self.missing_blocks.saturating_sub(self.recovery_blocks)
     }
@@ -598,6 +601,7 @@ impl Par2Repairer {
     }
 
     /// Cancellation flag shared with long operations.
+    #[must_use]
     pub fn cancel_token(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancel)
     }
@@ -612,76 +616,91 @@ impl Par2Repairer {
     }
 
     /// Options.
+    #[must_use]
     pub fn options(&self) -> &RepairOptions {
         &self.options
     }
 
     /// Base directory.
+    #[must_use]
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
 
     /// Loaded packets.
+    #[must_use]
     pub fn packets(&self) -> &PacketSet {
         &self.packets
     }
 
     /// Set id, once known.
+    #[must_use]
     pub fn set_id(&self) -> Option<SetId> {
         self.packets.set_id
     }
 
     /// Slice size.
+    #[must_use]
     pub fn block_size(&self) -> u64 {
         self.packets.slice_size().unwrap_or(0)
     }
 
     /// Creator string or `""`.
+    #[must_use]
     pub fn creator(&self) -> String {
         self.packets.creator_string()
     }
 
     /// Source files in Main-packet (`libpar2`) order.
+    #[must_use]
     pub fn source_files(&self) -> &[SourceFileState] {
         &self.files
     }
 
     /// Files blocks may be read from (targets, backups, extra files).
+    #[must_use]
     pub fn disk_files(&self) -> &[PathBuf] {
         &self.disk_files
     }
 
     /// Location of every global input block.
+    #[must_use]
     pub fn block_locations(&self) -> &[Option<BlockLocation>] {
         &self.locations
     }
 
     /// Recovery slices loaded.
+    #[must_use]
     pub fn recovery_blocks(&self) -> u64 {
         self.packets.recovery.len() as u64
     }
 
     /// Total input blocks.
+    #[must_use]
     pub fn total_blocks(&self) -> u64 {
         self.locations.len() as u64
     }
 
     /// Blocks located.
+    #[must_use]
     pub fn available_blocks(&self) -> u64 {
         self.locations.iter().filter(|l| l.is_some()).count() as u64
     }
 
     /// Blocks missing.
+    #[must_use]
     pub fn missing_blocks(&self) -> u64 {
         self.total_blocks() - self.available_blocks()
     }
 
     /// Recovery blocks still needed for a repair (0 if enough are loaded).
+    #[must_use]
     pub fn blocks_needed(&self) -> u64 {
         self.missing_blocks().saturating_sub(self.recovery_blocks())
     }
 
     /// Whether the Reed-Solomon step is currently possible.
+    #[must_use]
     pub fn repair_possible(&self) -> bool {
         self.finalized && self.missing_blocks() <= self.recovery_blocks()
     }
@@ -1478,6 +1497,7 @@ impl Par2Repairer {
     }
 
     /// Current verification summary.
+    #[must_use]
     pub fn verify_result(&self) -> VerifyResult {
         let missing = self.missing_blocks();
         let recovery = self.recovery_blocks();

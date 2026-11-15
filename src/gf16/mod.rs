@@ -53,12 +53,14 @@ impl Tables {
 
     /// `log(v)`; `log(0)` is undefined and returns 0.
     #[inline(always)]
+    #[must_use]
     pub fn log(&self, v: u16) -> u16 {
         self.log[v as usize]
     }
 
     /// `alpha^e` for `e < 2 * ORDER`.
     #[inline(always)]
+    #[must_use]
     pub fn exp(&self, e: u32) -> u16 {
         self.exp[e as usize]
     }
@@ -74,12 +76,14 @@ pub fn tables() -> &'static Tables {
 
 /// Addition (and subtraction) in GF(2^16).
 #[inline(always)]
+#[must_use]
 pub const fn add(a: u16, b: u16) -> u16 {
     a ^ b
 }
 
 /// Multiplication via log tables.
 #[inline]
+#[must_use]
 pub fn mul(a: u16, b: u16) -> u16 {
     if a == 0 || b == 0 {
         return 0;
@@ -89,6 +93,7 @@ pub fn mul(a: u16, b: u16) -> u16 {
 }
 
 /// Multiplication by shift-and-add; independent of the tables (used to validate them).
+#[must_use]
 pub const fn mul_slow(mut a: u16, mut b: u16) -> u16 {
     let mut r: u32 = 0;
     while b != 0 {
@@ -107,6 +112,7 @@ pub const fn mul_slow(mut a: u16, mut b: u16) -> u16 {
 
 /// Multiplicative inverse. `inv(0)` is undefined and returns 0.
 #[inline]
+#[must_use]
 pub fn inv(a: u16) -> u16 {
     if a == 0 {
         return 0;
@@ -117,6 +123,7 @@ pub fn inv(a: u16) -> u16 {
 
 /// Division `a / b`. Division by zero returns 0.
 #[inline]
+#[must_use]
 pub fn div(a: u16, b: u16) -> u16 {
     if a == 0 || b == 0 {
         return 0;
@@ -127,6 +134,7 @@ pub fn div(a: u16, b: u16) -> u16 {
 
 /// Exponentiation `a^e` (with `0^0 == 1`).
 #[inline]
+#[must_use]
 pub fn pow(a: u16, e: u32) -> u16 {
     if e == 0 {
         return 1;
@@ -141,6 +149,7 @@ pub fn pow(a: u16, e: u32) -> u16 {
 
 /// `alpha^e` for any `e`.
 #[inline]
+#[must_use]
 pub fn alpha_pow(e: u32) -> u16 {
     tables().exp(e % ORDER)
 }
@@ -159,6 +168,7 @@ impl std::error::Error for TooManyInputSlices {}
 
 /// Whether `logbase` is a valid PAR2 input-constant exponent (coprime with 65535).
 #[inline]
+#[must_use]
 pub const fn is_valid_logbase(logbase: u32) -> bool {
     !logbase.is_multiple_of(3)
         && !logbase.is_multiple_of(5)
@@ -197,6 +207,7 @@ pub fn input_constants(count: usize) -> Result<Vec<u16>, TooManyInputSlices> {
 /// Coefficient of input slice with constant-log `logbase` in the recovery slice with
 /// exponent `exponent`: `(alpha^logbase)^exponent`.
 #[inline]
+#[must_use]
 pub fn rs_coefficient(logbase: u16, exponent: u32) -> u16 {
     let l = (u64::from(logbase) * u64::from(exponent)) % u64::from(ORDER);
     tables().exp(l as u32)
@@ -219,6 +230,7 @@ pub struct MulTables {
 
 impl MulTables {
     /// Build the tables for `coeff`.
+    #[must_use]
     pub fn new(coeff: u16) -> Self {
         let mut lo = [0u16; 256];
         let mut hi = [0u16; 256];
@@ -235,18 +247,21 @@ impl MulTables {
 
     /// The coefficient these tables multiply by.
     #[inline]
+    #[must_use]
     pub fn coeff(&self) -> u16 {
         self.coeff
     }
 
     /// `coeff * w`.
     #[inline(always)]
+    #[must_use]
     pub fn mul(&self, w: u16) -> u16 {
         self.lo[(w & 0xFF) as usize] ^ self.hi[(w >> 8) as usize]
     }
 
     /// `coeff * word(lo_byte, hi_byte)`.
     #[inline(always)]
+    #[must_use]
     pub fn mul_bytes(&self, lo: u8, hi: u8) -> u16 {
         self.lo[lo as usize] ^ self.hi[hi as usize]
     }
@@ -306,6 +321,7 @@ pub struct ShuffleTables {
 
 impl ShuffleTables {
     /// Build the tables for `coeff`.
+    #[must_use]
     pub fn new(coeff: u16) -> Self {
         let mut lo = [[0u8; 16]; 4];
         let mut hi = [[0u8; 16]; 4];
@@ -326,11 +342,13 @@ impl ShuffleTables {
 
     /// The coefficient these tables multiply by.
     #[inline]
+    #[must_use]
     pub fn coeff(&self) -> u16 {
         self.coeff
     }
 
     /// Reference evaluation: `coeff * w` through the nibble tables.
+    #[must_use]
     pub fn mul(&self, w: u16) -> u16 {
         let n = [
             (w & 0xF) as usize,

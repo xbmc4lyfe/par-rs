@@ -303,6 +303,7 @@ pub(crate) fn hash_ranges_parallel_with_budget(
 
 /// Ranges for every `slice_size` slice of a file: `slices` messages at `b * slice_size`, each
 /// reading what the file has there (`file_len` is the on-disk length) and padding to a full slice.
+#[must_use]
 pub fn slice_ranges(file: usize, file_len: u64, slice_size: u64, slices: u64) -> Vec<HashRange> {
     (0..slices)
         .map(|b| {

@@ -15,6 +15,7 @@ pub const NAME_CAPACITY: usize = 1024;
 
 /// Byte case folding equivalent to C `tolower` in the "C" locale.
 #[inline]
+#[must_use]
 pub fn ascii_lower(b: u8) -> u8 {
     b.to_ascii_lowercase()
 }
@@ -32,11 +33,13 @@ pub struct ParName {
 
 impl ParName {
     /// Whether this is the main (index) `.par2` file.
+    #[must_use]
     pub fn is_main(&self) -> bool {
         self.blocks == 0
     }
 
     /// Whether the block count is unknown (`.vol-` naming); callers estimate it from the size.
+    #[must_use]
     pub fn blocks_unknown(&self) -> bool {
         self.blocks < 0
     }
@@ -52,6 +55,7 @@ fn find_folded(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 
 /// C `atoi` semantics on bytes: skip leading whitespace, optional sign, then digits;
 /// saturates instead of overflowing.
+#[must_use]
 pub fn atoi(bytes: &[u8]) -> i32 {
     let mut i = 0;
     while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
@@ -175,6 +179,7 @@ pub fn find_main_pars_in_dir(dir: &std::path::Path) -> std::io::Result<Vec<std::
 }
 
 /// Raw bytes of an OS string (lossy UTF-8 on non-Unix platforms).
+#[must_use]
 pub fn os_str_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
     #[cfg(unix)]
     {
@@ -243,11 +248,13 @@ pub fn volume_range(name: &[u8]) -> Option<(u32, u32)> {
 
 /// Build a `par2cmdline`-style volume filename: `<base>.vol<first>+<count>.par2` with both
 /// numbers zero-padded to `width` digits.
+#[must_use]
 pub fn volume_filename(base: &str, first: u32, count: u32, width: usize) -> String {
     format!("{base}.vol{first:0width$}+{count:0width$}.par2")
 }
 
 /// Digits needed to print `max_value` (at least 2, like `par2cmdline`).
+#[must_use]
 pub fn volume_number_width(max_value: u32) -> usize {
     let mut w = 1;
     let mut v = max_value;
@@ -261,6 +268,7 @@ pub fn volume_number_width(max_value: u32) -> usize {
 /// Estimated block count of a *queued* (not yet downloaded) volume: when the name carries no
 /// block count (`parsed_blocks < 0`), estimate from the encoded (yEnc) size assuming ~2 %
 /// encoding overhead and 68 bytes of packet overhead per recovery slice.
+#[must_use]
 pub fn calc_queued_volume_blocks(parsed_blocks: i32, encoded_size: i64, slice_size: i64) -> i32 {
     if parsed_blocks >= 0 {
         return parsed_blocks;
@@ -274,6 +282,7 @@ pub fn calc_queued_volume_blocks(parsed_blocks: i32, encoded_size: i64, slice_si
 
 /// Estimated block count of a *completed* (on-disk) volume: when the name carries no block
 /// count, divide the file size by the per-slice packet size.
+#[must_use]
 pub fn calc_completed_volume_blocks(parsed_blocks: i32, disk_size: i64, slice_size: i64) -> i32 {
     if parsed_blocks >= 0 {
         return parsed_blocks;
@@ -298,6 +307,7 @@ pub fn calc_completed_volume_blocks(parsed_blocks: i32, disk_size: i64, slice_si
 ///
 /// Returns the selected indices (ascending) and the total number of blocks in **all**
 /// available volumes (`block_found`), so callers can report `N needed, M available`.
+#[must_use]
 pub fn select_more_pars(sorted_block_counts: &[i32], block_needed: i32) -> (Vec<usize>, i32) {
     debug_assert!(
         sorted_block_counts.windows(2).all(|w| w[0] <= w[1]),
@@ -353,6 +363,7 @@ pub fn select_more_pars(sorted_block_counts: &[i32], block_needed: i32) -> (Vec<
 
 /// Pick a twin set's volume for `left` missing blocks: the smallest volume with at least
 /// `left` blocks, otherwise the largest one. `sorted_volume_blocks` must be ascending.
+#[must_use]
 pub fn pick_twin_volume(sorted_volume_blocks: &[i32], left: i32) -> Option<usize> {
     if sorted_volume_blocks.is_empty() {
         return None;

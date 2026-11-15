@@ -58,6 +58,7 @@ pub enum PacketKind {
 
 impl PacketKind {
     /// Classify a 16-byte type field.
+    #[must_use]
     pub fn from_type(t: &[u8; 16]) -> Self {
         match t {
             b"PAR 2.0\0Main\0\0\0\0" => Self::Main,
@@ -77,6 +78,7 @@ impl PacketKind {
     }
 
     /// The 16-byte type field for a known kind (`None` for [`PacketKind::Unknown`]).
+    #[must_use]
     pub fn type_bytes(self) -> Option<[u8; 16]> {
         Some(match self {
             Self::Main => *b"PAR 2.0\0Main\0\0\0\0",
@@ -133,6 +135,7 @@ pub struct Par1Header {
 }
 
 /// Parse a PAR1 header at the start of `data`.
+#[must_use]
 pub fn parse_par1_header(data: &[u8]) -> Option<Par1Header> {
     if array::<8>(data, 0)? != PAR1_MAGIC {
         return None;
@@ -165,6 +168,7 @@ pub struct Par3PacketHeader {
 }
 
 /// Parse a PAR3 packet header at `off`.
+#[must_use]
 pub fn parse_par3_header(data: &[u8], off: usize) -> Option<Par3PacketHeader> {
     if array::<8>(data, off)? != PAR3_MAGIC {
         return None;
@@ -179,6 +183,7 @@ pub fn parse_par3_header(data: &[u8], off: usize) -> Option<Par3PacketHeader> {
 
 /// Detect the parity format of a buffer from its leading magic (searching the first 64 KiB
 /// for a PAR2 / PAR3 packet magic so a leading yEnc artefact does not hide it).
+#[must_use]
 pub fn detect_format(data: &[u8]) -> Option<ParFormat> {
     if data.starts_with(&PAR1_MAGIC) {
         return Some(ParFormat::Par1);
@@ -325,6 +330,7 @@ pub struct Par2FileName {
 }
 
 /// Parse `name.par2`, `name.volNNN+MM.par2` or `name.volNNN-MMM.par2` (case-insensitive).
+#[must_use]
 pub fn parse_par2_filename(name: &str) -> Option<Par2FileName> {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(".par2")?;
@@ -545,6 +551,7 @@ fn shaped(length: u64) -> bool {
 
 /// Decode a PAR2 name: `UTF-8` (lossily) with control characters, ANSI escape sequences, and
 /// path components removed. An empty result becomes `"_"`.
+#[must_use]
 pub fn sanitize_name(raw: &[u8]) -> String {
     let s = String::from_utf8_lossy(trim_nul(raw));
     // Drop `ESC [ ... <final byte>` sequences, then every other control character.
@@ -578,6 +585,7 @@ pub fn sanitize_name(raw: &[u8]) -> String {
 }
 
 /// Decode UTF-16LE (lossily) and sanitise like [`sanitize_name`].
+#[must_use]
 pub fn sanitize_utf16le_name(raw: &[u8]) -> String {
     let units: Vec<u16> = raw
         .as_chunks::<2>()
@@ -682,6 +690,7 @@ pub enum VerifyMode {
 
 /// Inspect a PAR2 buffer. With `verify_packet_md5` every packet whose body is fully present has
 /// its MD5 checked (recovery slices included, which costs one pass over their data).
+#[must_use]
 pub fn inspect_par2(data: &[u8], verify_packet_md5: bool) -> Par2Inspection {
     inspect_par2_with(
         data,
@@ -698,6 +707,7 @@ pub fn inspect_par2(data: &[u8], verify_packet_md5: bool) -> Par2Inspection {
 /// A packet whose MD5 fails, or whose type is unknown and unverified, is not trusted for its
 /// declared length either: the scanner resynchronises right after its magic, so a garbage header
 /// cannot swallow the real packet that follows it.
+#[must_use]
 pub fn inspect_par2_with(data: &[u8], verify: VerifyMode) -> Par2Inspection {
     let mut r = Par2Inspection {
         format: detect_format(data),

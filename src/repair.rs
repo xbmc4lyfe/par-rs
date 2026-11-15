@@ -129,6 +129,7 @@ impl RepairPlan {
     }
 
     /// Coefficient of present slice `i` in syndrome `j`.
+    #[must_use]
     pub fn coefficient(&self, slice: usize, syndrome: usize) -> Option<u16> {
         let log = *self.logs.get(slice)?;
         let e = *self.used_exponents.get(syndrome)?;

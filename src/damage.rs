@@ -31,22 +31,26 @@ pub struct ByteRange {
 
 impl ByteRange {
     /// New range.
+    #[must_use]
     pub const fn new(offset: i64, size: i64) -> Self {
         Self { offset, size }
     }
 
     /// Exclusive end.
+    #[must_use]
     pub const fn end(&self) -> i64 {
         self.offset + self.size
     }
 
     /// Whether the range is empty or negative.
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.size <= 0
     }
 }
 
 /// Sort by offset and merge overlapping / adjacent ranges, dropping empty ones.
+#[must_use]
 pub fn normalize_ranges(ranges: &[ByteRange]) -> Vec<ByteRange> {
     let mut v: Vec<ByteRange> = ranges.iter().copied().filter(|r| !r.is_empty()).collect();
     v.sort_unstable();
@@ -66,6 +70,7 @@ pub fn normalize_ranges(ranges: &[ByteRange]) -> Vec<ByteRange> {
 
 /// Number of distinct `slice_size`-byte blocks touched by `holes` (damaged byte ranges).
 /// Overlapping holes within one block are counted once.
+#[must_use]
 pub fn blocks_touched(holes: &[ByteRange], slice_size: u64) -> i32 {
     if slice_size == 0 {
         return 0;
@@ -101,6 +106,7 @@ pub fn blocks_touched(holes: &[ByteRange], slice_size: u64) -> i32 {
 
 /// Whether `[from, to)` is contiguously tiled by `sorted_ranges` (sorted by offset; overlaps
 /// allowed). An empty interval is trivially covered.
+#[must_use]
 pub fn range_covered(sorted_ranges: &[ByteRange], from: i64, to: i64) -> bool {
     if from >= to {
         return true;
@@ -122,6 +128,7 @@ pub fn range_covered(sorted_ranges: &[ByteRange], from: i64, to: i64) -> bool {
 }
 
 /// Gaps of `[0, file_size)` not covered by `covered` (any order, overlaps allowed).
+#[must_use]
 pub fn compute_holes(covered: &[ByteRange], file_size: i64) -> Vec<ByteRange> {
     let mut holes = Vec::new();
     if file_size <= 0 {
@@ -157,6 +164,7 @@ pub struct FileDamage<'a> {
 }
 
 /// Projected number of damaged input blocks across all files.
+#[must_use]
 pub fn project_par_damage(files: &[FileDamage<'_>], slice_size: u64) -> i32 {
     let mut total: i64 = 0;
     for f in files {
@@ -169,6 +177,7 @@ pub fn project_par_damage(files: &[FileDamage<'_>], slice_size: u64) -> i32 {
 }
 
 /// Whether the projected damage exceeds what the available recovery blocks can repair.
+#[must_use]
 pub fn par_cannot_cover(damaged_blocks: i32, available_recovery_blocks: i32) -> bool {
     damaged_blocks > available_recovery_blocks.max(0)
 }
@@ -192,6 +201,7 @@ pub struct Segment {
 
 impl Segment {
     /// Exclusive end.
+    #[must_use]
     pub const fn end(&self) -> i64 {
         self.offset + self.size
     }
@@ -308,6 +318,7 @@ pub fn smart_calc_range_crc(
 /// Zero-read verification of a completely downloaded file: compares the download CRC
 /// (extended with zeros to `block_count * slice_size`) with the CRC obtained by combining
 /// the IFSC per-slice CRCs. Port of `ParChecker::VerifySuccessDataFile`.
+#[must_use]
 pub fn verify_success_file_crc(
     download_crc: u32,
     file_size: u64,
@@ -328,6 +339,7 @@ pub fn verify_success_file_crc(
 /// a block is presumed valid when a contiguous chain of successful segments starts at or
 /// before the block and reaches its end. Port of the first loop of
 /// `ParChecker::VerifyPartialDataFile`.
+#[must_use]
 pub fn presumed_valid_blocks(
     segments: &[Segment],
     file_size: i64,

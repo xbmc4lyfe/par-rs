@@ -77,6 +77,7 @@ pub struct FileVerification {
 
 impl FileVerification {
     /// Every slice verified at its natural offset and the size matches.
+    #[must_use]
     pub fn is_intact(&self) -> bool {
         self.size_ok
             && self.slices.iter().all(|s| *s == SliceStatus::Verified)
@@ -128,6 +129,7 @@ pub struct SetVerifier {
 impl SetVerifier {
     /// Build a verifier; files are sorted by file id. `None` when `block_size == 0`, a file's
     /// slice count disagrees with its size, or the block size does not fit in memory.
+    #[must_use]
     pub fn new(block_size: u64, mut files: Vec<SourceSpec>) -> Option<Self> {
         if block_size == 0 || usize::try_from(block_size).is_err() {
             return None;
@@ -164,6 +166,7 @@ impl SetVerifier {
 
     /// Verifier for the primary set of an inspection (the set of its first `Main` packet).
     /// Files without an IFSC packet are skipped (they cannot be slice-verified).
+    #[must_use]
     pub fn from_inspection(insp: &Par2Inspection) -> Option<Self> {
         let main = insp.main.first()?;
         let files: Vec<SourceSpec> = main
@@ -195,26 +198,31 @@ impl SetVerifier {
     }
 
     /// Block (slice) size.
+    #[must_use]
     pub fn block_size(&self) -> u64 {
         self.block_size
     }
 
     /// Total input slices.
+    #[must_use]
     pub fn total_slices(&self) -> usize {
         self.total
     }
 
     /// Files in verifier (file id) order.
+    #[must_use]
     pub fn files(&self) -> &[SourceSpec] {
         &self.files
     }
 
     /// Index of the file with `file_id`.
+    #[must_use]
     pub fn file_index(&self, file_id: &[u8; 16]) -> Option<usize> {
         self.files.iter().position(|f| f.file_id == *file_id)
     }
 
     /// Global slice number of slice `slice` of file `file`.
+    #[must_use]
     pub fn global_slice(&self, file: usize, slice: usize) -> Option<usize> {
         let f = self.files.get(file)?;
         (slice < f.slices.len()).then(|| {
@@ -227,6 +235,7 @@ impl SetVerifier {
     }
 
     /// `(file, slice)` of a global slice number.
+    #[must_use]
     pub fn locate_global(&self, global: usize) -> Option<(usize, usize)> {
         let fi = self
             .first_slice
@@ -262,6 +271,7 @@ impl SetVerifier {
     }
 
     /// Check one slice's bytes (`data.len() <= block_size`, zero padded) against expectations.
+    #[must_use]
     pub fn slice_matches(&self, expected: &SliceChecksum, data: &[u8]) -> bool {
         let bs = usize::try_from(self.block_size).unwrap_or(usize::MAX);
         if data.len() > bs {
@@ -280,6 +290,7 @@ impl SetVerifier {
     }
 
     /// Verify `data` as the contents of file `file`.
+    #[must_use]
     pub fn verify_file(&self, file: usize, data: &[u8]) -> FileVerification {
         let Some(spec) = self.files.get(file) else {
             return FileVerification {
@@ -417,6 +428,7 @@ impl SetVerifier {
     }
 
     /// Verify several buffers (`(file index, contents)`) and locate every slice of the set.
+    #[must_use]
     pub fn verify_files(&self, buffers: &[(usize, &[u8])]) -> VerificationReport {
         let mut report = VerificationReport {
             total_slices: self.total,
@@ -460,6 +472,7 @@ impl SetVerifier {
     }
 
     /// Repairability given `recovery_slices` usable recovery slices.
+    #[must_use]
     pub fn assess(&self, report: &VerificationReport, recovery_slices: usize) -> RepairAssessment {
         let missing = report.missing.len();
         RepairAssessment {

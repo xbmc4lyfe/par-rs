@@ -121,6 +121,7 @@ impl fmt::Debug for Matrix {
 
 impl Matrix {
     /// Zero matrix.
+    #[must_use]
     pub fn zeros(rows: usize, cols: usize) -> Self {
         Self {
             rows,
@@ -130,6 +131,7 @@ impl Matrix {
     }
 
     /// Identity matrix.
+    #[must_use]
     pub fn identity(n: usize) -> Self {
         let mut m = Self::zeros(n, n);
         for i in 0..n {
@@ -139,17 +141,20 @@ impl Matrix {
     }
 
     /// Rows.
+    #[must_use]
     pub fn rows(&self) -> usize {
         self.rows
     }
 
     /// Columns.
+    #[must_use]
     pub fn cols(&self) -> usize {
         self.cols
     }
 
     /// Element.
     #[inline]
+    #[must_use]
     pub fn get(&self, r: usize, c: usize) -> u16 {
         let i = (r * self.cols + c) * 2;
         u16::from_le_bytes([self.data[i], self.data[i + 1]])
@@ -163,11 +168,13 @@ impl Matrix {
     }
 
     /// Row `r` as bytes.
+    #[must_use]
     pub fn row_bytes(&self, r: usize) -> &[u8] {
         &self.data[r * self.cols * 2..(r + 1) * self.cols * 2]
     }
 
     /// Row `r` as `u16` values.
+    #[must_use]
     pub fn row(&self, r: usize) -> Vec<u16> {
         (0..self.cols).map(|c| self.get(r, c)).collect()
     }
@@ -209,6 +216,7 @@ impl Matrix {
     }
 
     /// Matrix product.
+    #[must_use]
     pub fn mul(&self, other: &Matrix) -> Matrix {
         assert_eq!(self.cols, other.rows, "matrix dimension mismatch");
         let mut out = Matrix::zeros(self.rows, other.cols);
@@ -229,6 +237,7 @@ impl Matrix {
     }
 
     /// Gauss-Jordan inversion. Returns `None` if singular.
+    #[must_use]
     pub fn inverse(&self, kernel: &Kernel) -> Option<Matrix> {
         self.inverse_controlled(kernel, &|| false).ok().flatten()
     }
@@ -982,6 +991,7 @@ pub struct MemoryOutputs {
 
 impl MemoryOutputs {
     /// Zeroed outputs.
+    #[must_use]
     pub fn new(count: usize, slice_size: usize) -> Self {
         Self {
             slices: vec![vec![0u8; slice_size]; count],
@@ -1035,6 +1045,7 @@ pub fn encode_in_memory(
 }
 
 /// Reference (scalar, direct) encoder for tests and self-checks.
+#[must_use]
 pub fn encode_reference(slice_size: usize, inputs: &[&[u8]], exponents: &[u32]) -> Vec<Vec<u8>> {
     let logs = gf16::input_constant_logs(inputs.len()).expect("too many inputs");
     exponents

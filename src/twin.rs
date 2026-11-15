@@ -22,6 +22,7 @@ pub struct FileSig {
 
 impl FileSig {
     /// From a parsed file description.
+    #[must_use]
     pub fn from_desc(fd: &FileDescPacket) -> Self {
         Self {
             name: fd.name.clone(),
@@ -31,6 +32,7 @@ impl FileSig {
     }
 
     /// Local (sanitised) name.
+    #[must_use]
     pub fn local_name(&self) -> String {
         crate::packet::translate_filename_from_par2_to_local(&self.name)
     }
@@ -45,6 +47,7 @@ pub fn sigs_of_set(set: &PacketSet) -> Vec<FileSig> {
 ///
 /// Returns the signatures and whether a valid Main packet was found (the data is a
 /// complete, usable set description rather than just surviving `FileDesc` packets).
+#[must_use]
 pub fn par2_set(data: &[u8]) -> (Vec<FileSig>, bool) {
     match load_par2_bytes(data, ScanOptions::METADATA) {
         Ok(set) => {
@@ -60,6 +63,7 @@ pub fn par2_set(data: &[u8]) -> (Vec<FileSig>, bool) {
 /// If no Main packet survived, the size is estimated from `FileDesc`/`IFSC` pairs: the
 /// smallest multiple of 4 consistent with every file's length and slice count. Returns `0`
 /// when nothing usable is present or the estimate is contradictory.
+#[must_use]
 pub fn block_size(data: &[u8]) -> u64 {
     let Ok(set) = load_par2_bytes(data, ScanOptions::METADATA) else {
         return 0;
@@ -68,6 +72,7 @@ pub fn block_size(data: &[u8]) -> u64 {
 }
 
 /// Same as [`block_size`] for an already parsed set.
+#[must_use]
 pub fn block_size_of_set(set: &PacketSet) -> u64 {
     if let Some(ss) = set.slice_size() {
         return ss;
@@ -100,6 +105,7 @@ pub fn block_size_of_set(set: &PacketSet) -> u64 {
 
 /// FNV-1a 64-bit fingerprint of a set of signatures: `"{hash:016x}-{count}"`, or `""` for an
 /// empty set. Lines are `"<md5_lower_hex>:<length>\n"`, sorted and de-duplicated.
+#[must_use]
 pub fn fingerprint(sigs: &[FileSig]) -> String {
     let lines: BTreeSet<String> = sigs
         .iter()
@@ -132,6 +138,7 @@ pub enum TwinRelation {
 
 impl TwinRelation {
     /// Numeric code (`0`, `1`, `2`) as used by the nzbget-rs call sites.
+    #[must_use]
     pub fn code(self) -> i32 {
         self as i32
     }
@@ -142,6 +149,7 @@ impl TwinRelation {
 /// `own_names[i]` and `own_md5s[i]` describe the same file. Returns
 /// [`TwinRelation::Twin`] (0), [`TwinRelation::DescribesOtherFiles`] (1) or
 /// [`TwinRelation::NamesFilesOtherwise`] (2).
+#[must_use]
 pub fn compare_twin_par2_data(
     own_names: &[&[u8]],
     own_md5s: &[[u8; 16]],
@@ -170,6 +178,7 @@ pub fn compare_twin_par2_data(
 }
 
 /// Convenience over [`compare_twin_par2_data`] taking the source signatures.
+#[must_use]
 pub fn compare_twin_sets(own: &[FileSig], twin_data: &[u8]) -> TwinRelation {
     let names: Vec<&[u8]> = own.iter().map(|s| s.name.as_slice()).collect();
     let md5s: Vec<[u8; 16]> = own.iter().map(|s| s.md5).collect();
@@ -178,6 +187,7 @@ pub fn compare_twin_sets(own: &[FileSig], twin_data: &[u8]) -> TwinRelation {
 
 /// Map from a twin's names to the source names for files with identical content (for renaming
 /// obfuscated downloads using an alternative set). Only unambiguous MD5 matches are returned.
+#[must_use]
 pub fn name_mapping(own: &[FileSig], twin: &[FileSig]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut by_md5: std::collections::BTreeMap<[u8; 16], Vec<&FileSig>> = Default::default();
     for s in own {

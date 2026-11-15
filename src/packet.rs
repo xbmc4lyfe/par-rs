@@ -55,11 +55,13 @@ pub struct FileId(pub [u8; 16]);
 impl FileId {
     /// Numeric value in `libpar2` / specification order: a 16-byte unsigned little-endian integer.
     #[inline]
+    #[must_use]
     pub fn as_u128(&self) -> u128 {
         u128::from_le_bytes(self.0)
     }
 
     /// Lower-case hex.
+    #[must_use]
     pub fn to_hex(&self) -> String {
         hex(&self.0)
     }
@@ -95,6 +97,7 @@ pub struct SetId(pub [u8; 16]);
 
 impl SetId {
     /// Lower-case hex (the form used by `ParRenamer` for set-id based filenames).
+    #[must_use]
     pub fn to_hex(&self) -> String {
         hex(&self.0)
     }
@@ -113,6 +116,7 @@ impl fmt::Display for SetId {
 }
 
 /// Lower-case hex of a byte string.
+#[must_use]
 pub fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -146,6 +150,7 @@ pub enum PacketType {
 
 impl PacketType {
     /// Classify a raw type field.
+    #[must_use]
     pub fn from_bytes(t: &[u8; 16]) -> Self {
         match *t {
             TYPE_MAIN => PacketType::Main,
@@ -174,6 +179,7 @@ pub struct PacketHeader {
 impl PacketHeader {
     /// Parse and validate the fixed header fields (magic, `length >= 64`, `length % 4 == 0`).
     /// Does **not** check that the packet fits the source; see [`PacketHeader::fits`].
+    #[must_use]
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < HEADER_LEN || bytes[..8] != MAGIC {
             return None;
@@ -191,6 +197,7 @@ impl PacketHeader {
     }
 
     /// Whether a packet starting at `offset` fits inside a source of `source_len` bytes.
+    #[must_use]
     pub fn fits(&self, offset: u64, source_len: u64) -> bool {
         offset
             .checked_add(self.length)
@@ -198,16 +205,19 @@ impl PacketHeader {
     }
 
     /// Packet kind.
+    #[must_use]
     pub fn kind(&self) -> PacketType {
         PacketType::from_bytes(&self.packet_type)
     }
 
     /// Body length (`length - 64`).
+    #[must_use]
     pub fn body_len(&self) -> u64 {
         self.length - HEADER_LEN as u64
     }
 
     /// Serialise.
+    #[must_use]
     pub fn to_bytes(&self) -> [u8; HEADER_LEN] {
         let mut out = [0u8; HEADER_LEN];
         out[..8].copy_from_slice(&MAGIC);
@@ -294,6 +304,7 @@ impl FileSource {
     }
 
     /// Underlying file.
+    #[must_use]
     pub fn file(&self) -> &File {
         &self.file
     }
@@ -402,6 +413,7 @@ pub struct RawPacket {
 
 impl RawPacket {
     /// Offset of the body.
+    #[must_use]
     pub fn body_offset(&self) -> u64 {
         self.offset + HEADER_LEN as u64
     }
@@ -455,11 +467,13 @@ impl<'a, S: PacketSource + ?Sized> PacketIter<'a, S> {
     }
 
     /// Scan statistics so far.
+    #[must_use]
     pub fn stats(&self) -> ScanStats {
         self.stats
     }
 
     /// Current offset.
+    #[must_use]
     pub fn position(&self) -> u64 {
         self.pos
     }
@@ -705,16 +719,19 @@ impl MainPacket {
     }
 
     /// Total number of files.
+    #[must_use]
     pub fn total_file_count(&self) -> usize {
         self.recoverable_file_ids.len() + self.non_recoverable_file_ids.len()
     }
 
     /// Number of slices needed to cover `file_length` bytes.
+    #[must_use]
     pub fn slice_count_for(&self, file_length: u64) -> u64 {
         file_length.div_ceil(self.slice_size)
     }
 
     /// Serialise the body (without header).
+    #[must_use]
     pub fn encode_body(&self) -> Vec<u8> {
         encode_main_body(
             self.slice_size,
@@ -773,26 +790,31 @@ impl FileDescPacket {
     }
 
     /// File ID recomputed from the packet contents.
+    #[must_use]
     pub fn computed_file_id(&self) -> FileId {
         compute_file_id(&self.hash_16k, self.file_length, &self.name)
     }
 
     /// Whether the stored file ID matches the recomputed one.
+    #[must_use]
     pub fn id_consistent(&self) -> bool {
         self.computed_file_id() == self.file_id
     }
 
     /// Local (sanitised) filename.
+    #[must_use]
     pub fn local_name(&self) -> String {
         translate_filename_from_par2_to_local(&self.name)
     }
 
     /// Raw name interpreted as text (UTF-8, or Latin-1 if invalid), without sanitising.
+    #[must_use]
     pub fn name_lossy(&self) -> String {
         bytes_to_string_latin1_fallback(&self.name)
     }
 
     /// Serialise the body.
+    #[must_use]
     pub fn encode_body(&self) -> Vec<u8> {
         encode_file_desc_body(
             &self.file_id,
@@ -847,11 +869,13 @@ impl IfscPacket {
     }
 
     /// Number of slices.
+    #[must_use]
     pub fn slice_count(&self) -> usize {
         self.slices.len()
     }
 
     /// Serialise the body.
+    #[must_use]
     pub fn encode_body(&self) -> Vec<u8> {
         encode_ifsc_body(&self.file_id, &self.slices)
     }
@@ -866,6 +890,7 @@ pub struct CreatorPacket {
 
 impl CreatorPacket {
     /// Parse a body.
+    #[must_use]
     pub fn parse(body: &[u8]) -> Self {
         let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
         Self {
@@ -874,6 +899,7 @@ impl CreatorPacket {
     }
 
     /// Client string (lossy UTF-8).
+    #[must_use]
     pub fn client(&self) -> String {
         String::from_utf8_lossy(&self.raw).into_owned()
     }
@@ -926,6 +952,7 @@ impl RecoverySliceRef {
     }
 
     /// Header of the packet this reference points at, reconstructed for MD5 verification.
+    #[must_use]
     pub fn header_length(&self) -> u64 {
         self.slice_size + 4 + HEADER_LEN as u64
     }
@@ -982,6 +1009,7 @@ pub enum Packet {
 
 impl Packet {
     /// Set ID of the packet.
+    #[must_use]
     pub fn set_id(&self, raw: &RawPacket) -> SetId {
         raw.header.set_id
     }
@@ -1024,6 +1052,7 @@ pub fn parse_packet<S: PacketSource + ?Sized>(
 
 /// Decode bytes as UTF-8, falling back to Latin-1 (each byte becomes the code point of the
 /// same value) when the bytes are not valid UTF-8.
+#[must_use]
 pub fn bytes_to_string_latin1_fallback(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_owned(),
@@ -1045,6 +1074,7 @@ fn url_encode_byte(out: &mut Vec<u8>, b: u8) {
 /// * a leading `/` is URL-encoded,
 /// * every `..` that is part of a `../` sequence is URL-encoded,
 /// * invalid UTF-8 is interpreted as Latin-1.
+#[must_use]
 pub fn translate_filename_from_par2_to_local(raw: &[u8]) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(raw.len() + 8);
     for &b in raw {
@@ -1079,6 +1109,7 @@ pub fn translate_filename_from_par2_to_local(raw: &[u8]) -> String {
 // ---------------------------------------------------------------------------------------------
 
 /// `file_id = MD5(hash_16k ‖ file_length(LE u64) ‖ name)`.
+#[must_use]
 pub fn compute_file_id(hash_16k: &[u8; 16], file_length: u64, name: &[u8]) -> FileId {
     let mut ctx = Md5::new();
     ctx.update(hash_16k);
@@ -1088,6 +1119,7 @@ pub fn compute_file_id(hash_16k: &[u8; 16], file_length: u64, name: &[u8]) -> Fi
 }
 
 /// `set_id = MD5(main packet body)`.
+#[must_use]
 pub fn compute_set_id(main_body: &[u8]) -> SetId {
     SetId(md5(main_body))
 }
@@ -1100,6 +1132,7 @@ fn pad4(v: &mut Vec<u8>) {
 }
 
 /// Serialise a Main packet body. File IDs are sorted as the specification requires.
+#[must_use]
 pub fn encode_main_body(
     slice_size: u64,
     recoverable: &[FileId],
@@ -1119,6 +1152,7 @@ pub fn encode_main_body(
 }
 
 /// Serialise a `FileDesc` body.
+#[must_use]
 pub fn encode_file_desc_body(
     file_id: &FileId,
     hash_full: &[u8; 16],
@@ -1137,6 +1171,7 @@ pub fn encode_file_desc_body(
 }
 
 /// Serialise an IFSC body.
+#[must_use]
 pub fn encode_ifsc_body(file_id: &FileId, slices: &[SliceChecksum]) -> Vec<u8> {
     let mut body = Vec::with_capacity(16 + 20 * slices.len());
     body.extend_from_slice(&file_id.0);
@@ -1148,6 +1183,7 @@ pub fn encode_ifsc_body(file_id: &FileId, slices: &[SliceChecksum]) -> Vec<u8> {
 }
 
 /// Serialise a Creator body.
+#[must_use]
 pub fn encode_creator_body(client: &[u8]) -> Vec<u8> {
     let mut body = client.to_vec();
     pad4(&mut body);
@@ -1158,6 +1194,7 @@ pub fn encode_creator_body(client: &[u8]) -> Vec<u8> {
 }
 
 /// Build a complete packet (header + body) with the correct MD5.
+#[must_use]
 pub fn encode_packet(set_id: &SetId, packet_type: &[u8; 16], body: &[u8]) -> Vec<u8> {
     debug_assert!(
         body.len().is_multiple_of(4),
@@ -1182,6 +1219,7 @@ pub fn encode_packet(set_id: &SetId, packet_type: &[u8; 16], body: &[u8]) -> Vec
 
 /// Build the 68-byte prefix (header + exponent) of a recovery slice packet whose payload is
 /// `data`. The MD5 covers set id, type, exponent, and payload.
+#[must_use]
 pub fn encode_recovery_packet_prefix(
     set_id: &SetId,
     exponent: u32,
@@ -1214,6 +1252,7 @@ pub struct RecoveryPacketHasher {
 
 impl RecoveryPacketHasher {
     /// Start hashing a recovery packet.
+    #[must_use]
     pub fn new(set_id: SetId, exponent: u32) -> Self {
         let mut ctx = Md5::new();
         ctx.update(set_id.0);
@@ -1234,6 +1273,7 @@ impl RecoveryPacketHasher {
     }
 
     /// Produce the 68-byte header + exponent prefix.
+    #[must_use]
     pub fn finish(self) -> [u8; HEADER_LEN + 4] {
         let header = PacketHeader {
             length: HEADER_LEN as u64 + 4 + self.len,
@@ -1322,11 +1362,13 @@ pub struct PacketSet {
 
 impl PacketSet {
     /// Empty set bound to nothing yet.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Empty set bound to `set_id`.
+    #[must_use]
     pub fn for_set(set_id: SetId) -> Self {
         Self {
             set_id: Some(set_id),
@@ -1335,6 +1377,7 @@ impl PacketSet {
     }
 
     /// Slice size, if a Main packet is present.
+    #[must_use]
     pub fn slice_size(&self) -> Option<u64> {
         self.main.as_ref().map(|m| m.slice_size)
     }
@@ -1503,6 +1546,7 @@ impl PacketSet {
     }
 
     /// File id of the first description (in `libpar2` order) with this 16k hash.
+    #[must_use]
     pub fn file_id_by_hash16k(&self, hash_16k: &[u8; 16]) -> Option<FileId> {
         self.file_descs
             .iter()
@@ -1512,6 +1556,7 @@ impl PacketSet {
 
     /// File IDs in Main-packet order (recoverable first), or in `libpar2` map order when no
     /// Main packet is available.
+    #[must_use]
     pub fn file_ids_in_main_order(&self) -> Vec<FileId> {
         match &self.main {
             Some(m) => m.all_file_ids().copied().collect(),
@@ -1521,6 +1566,7 @@ impl PacketSet {
 
     /// Whether the metadata is complete enough for verification/repair: a `Main` packet and a
     /// `FileDesc` packet for every recoverable file.
+    #[must_use]
     pub fn is_complete(&self) -> bool {
         match &self.main {
             Some(m) => m
@@ -1532,6 +1578,7 @@ impl PacketSet {
     }
 
     /// Total number of input slices across the recoverable files (requires Main + `FileDescs`).
+    #[must_use]
     pub fn total_input_slices(&self) -> Option<u64> {
         let m = self.main.as_ref()?;
         let mut total = 0u64;
@@ -1543,6 +1590,7 @@ impl PacketSet {
     }
 
     /// Number of recovery slices available.
+    #[must_use]
     pub fn recovery_count(&self) -> usize {
         self.recovery.len()
     }
@@ -1594,6 +1642,7 @@ pub struct Par2Collection {
 
 impl Par2Collection {
     /// Empty collection.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -1645,6 +1694,7 @@ impl Par2Collection {
 
     /// The set with a Main packet and the most packets, if any (useful when a directory
     /// contains stray packets of another set).
+    #[must_use]
     pub fn primary_set(&self) -> Option<&PacketSet> {
         self.sets
             .values()

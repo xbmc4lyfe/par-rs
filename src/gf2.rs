@@ -17,6 +17,7 @@ pub const GF2_POLY: u32 = 0xEDB8_8320;
 pub const GF2_ORDER: u64 = (1u64 << 32) - 1;
 
 /// Multiply two polynomials modulo `P` (reflected representation; `1 << 31` is the unit).
+#[must_use]
 pub const fn multmodp(a: u32, b: u32) -> u32 {
     if a == 0 || b == 0 {
         return 0;
@@ -56,6 +57,7 @@ const X2N: [u32; 32] = {
 };
 
 /// `x^(n · 2^k) mod P`.
+#[must_use]
 pub fn x2nmodp(n: u64, k: u32) -> u32 {
     let mut p: u32 = 1 << 31; // x^0
     let mut n = n;
@@ -72,6 +74,7 @@ pub fn x2nmodp(n: u64, k: u32) -> u32 {
 }
 
 /// `x^n_bits mod P`: the operator that shifts a register past `n_bits` zero bits.
+#[must_use]
 pub fn xpow(n_bits: u64) -> u32 {
     x2nmodp(n_bits, 0)
 }
@@ -120,31 +123,37 @@ fn table(b: u8) -> u32 {
 }
 
 /// CRC-32 of `crc1`'s data followed by `crc2`'s data (`len2` bytes long).
+#[must_use]
 pub fn crc32_combine(crc1: u32, crc2: u32, len2: usize) -> u32 {
     crc32_combine_u64(crc1, crc2, len2 as u64)
 }
 
 /// [`crc32_combine`] with a 64-bit length.
+#[must_use]
 pub fn crc32_combine_u64(crc1: u32, crc2: u32, len2: u64) -> u32 {
     multmodp(xpow_bytes(len2), crc1) ^ crc2
 }
 
 /// CRC-32 of `len` zero bytes.
+#[must_use]
 pub fn crc32_zeros(len: usize) -> u32 {
     crc32_zeros_u64(len as u64)
 }
 
 /// [`crc32_zeros`] with a 64-bit length.
+#[must_use]
 pub fn crc32_zeros_u64(len: u64) -> u32 {
     multmodp(xpow_bytes(len), 0xFFFF_FFFF) ^ 0xFFFF_FFFF
 }
 
 /// Given the CRC of `data ‖ zeros(zero_len)`, recover the CRC of `data`.
+#[must_use]
 pub fn crc32_unzero(padded_crc: u32, zero_len: usize) -> u32 {
     crc32_unzero_u64(padded_crc, zero_len as u64)
 }
 
 /// [`crc32_unzero`] with a 64-bit length.
+#[must_use]
 pub fn crc32_unzero_u64(padded_crc: u32, zero_len: u64) -> u32 {
     multmodp(
         xpow_bytes_inv(zero_len),
@@ -153,21 +162,25 @@ pub fn crc32_unzero_u64(padded_crc: u32, zero_len: u64) -> u32 {
 }
 
 /// Alias of [`crc32_unzero`].
+#[must_use]
 pub fn crc32_zero_unpad(padded_crc: u32, zero_len: usize) -> u32 {
     crc32_unzero(padded_crc, zero_len)
 }
 
 /// CRC-32 (IEEE) of `data`.
+#[must_use]
 pub fn crc32(data: &[u8]) -> u32 {
     crc32fast::hash(data)
 }
 
 /// Given `crc(A ‖ B)` and `crc(B)` (`len_b` bytes), recover `crc(A)`.
+#[must_use]
 pub fn crc32_uncombine_suffix(crc_ab: u32, crc_b: u32, len_b: u64) -> u32 {
     multmodp(xpow_bytes_inv(len_b), crc_ab ^ crc_b)
 }
 
 /// Given `crc(A ‖ B)` and `crc(A)`, recover `crc(B)` (`len_b` bytes).
+#[must_use]
 pub fn crc32_uncombine_prefix(crc_ab: u32, crc_a: u32, len_b: u64) -> u32 {
     crc_ab ^ multmodp(xpow_bytes(len_b), crc_a)
 }
@@ -197,6 +210,7 @@ impl Crc32Shift {
     pub const MIN_PARTS: usize = 48;
 
     /// Operator for `len` bytes.
+    #[must_use]
     pub fn new(len: u64) -> Self {
         Self::from_operator(xpow_bytes(len), len)
     }
@@ -217,6 +231,7 @@ impl Crc32Shift {
     }
 
     /// The number of bytes this operator appends.
+    #[must_use]
     pub fn byte_len(&self) -> u64 {
         self.len
     }
@@ -225,6 +240,7 @@ impl Crc32Shift {
     /// (raw register semantics; see [`crc32_zeros`] for finalised checksums).
     #[inline]
     #[allow(clippy::indexing_slicing)] // indices are bytes of `crc`
+    #[must_use]
     pub fn apply(&self, crc: u32) -> u32 {
         let [b0, b1, b2, b3] = crc.to_le_bytes();
         self.tables[0][b0 as usize]
@@ -236,6 +252,7 @@ impl Crc32Shift {
     /// [`crc32_combine`] with `len2 == self.len()`: `CRC` of `crc1`'s data followed by
     /// `crc2`'s data.
     #[inline]
+    #[must_use]
     pub fn combine(&self, crc1: u32, crc2: u32) -> u32 {
         self.apply(crc1) ^ crc2
     }
@@ -367,6 +384,7 @@ pub fn fold_yenc_indexed_parts(
 
 /// Fold PAR2 IFSC slice CRCs (each over a `block_size` slice, the last one zero padded) into
 /// the whole-file CRC-32. `None` when the slice count does not match `file_size / block_size`.
+#[must_use]
 pub fn fold_ifsc_crcs(slice_crcs: &[u32], block_size: u64, file_size: u64) -> Option<u32> {
     if slice_crcs.len() >= Crc32Shift::MIN_PARTS {
         return fold_ifsc_crcs_with(&Crc32Shift::new(block_size), slice_crcs, file_size);
@@ -378,6 +396,7 @@ pub fn fold_ifsc_crcs(slice_crcs: &[u32], block_size: u64, file_size: u64) -> Op
 
 /// [`fold_ifsc_crcs`] with a prebuilt operator for the set's block size (`shift.byte_len()`), for
 /// callers folding many files of one set: four lookups per slice instead of a multiply.
+#[must_use]
 pub fn fold_ifsc_crcs_with(shift: &Crc32Shift, slice_crcs: &[u32], file_size: u64) -> Option<u32> {
     fold_ifsc_impl(slice_crcs, shift.byte_len(), file_size, |a, c| {
         shift.combine(a, c)
@@ -426,6 +445,7 @@ fn fold_ifsc_impl(
 ///
 /// `None` when `grid_size` is not a positive multiple of `block_size`, `block_size == 0`, or
 /// the slice count does not fit `file_size`. A zero-length file has no intervals.
+#[must_use]
 pub fn ifsc_interval_crcs(
     slice_crcs: &[u32],
     block_size: u64,
@@ -488,6 +508,7 @@ pub struct RollingCrc32 {
 
 impl RollingCrc32 {
     /// Table for windows of `window_size` bytes (`None` for an empty window).
+    #[must_use]
     pub fn new(window_size: u64) -> Option<Self> {
         if window_size == 0 {
             return None;
@@ -507,16 +528,19 @@ impl RollingCrc32 {
     }
 
     /// Window length in bytes.
+    #[must_use]
     pub fn window_size(&self) -> u64 {
         self.window
     }
 
     /// CRC-32 of the initial window (`window` must be exactly `window_size` bytes).
+    #[must_use]
     pub fn first(&self, window: &[u8]) -> Option<u32> {
         (window.len() as u64 == self.window).then(|| crc32(window))
     }
 
     /// CRC-32 of the window after dropping `out_byte` at its front and appending `in_byte`.
+    #[must_use]
     pub fn roll(&self, crc: u32, out_byte: u8, in_byte: u8) -> u32 {
         let raw = crc ^ 0xFFFF_FFFF;
         let stepped = (raw >> 8) ^ table(((raw ^ u32::from(in_byte)) & 0xFF) as u8);
@@ -526,6 +550,7 @@ impl RollingCrc32 {
 }
 
 /// Greatest common divisor.
+#[must_use]
 pub fn gcd(a: u64, b: u64) -> u64 {
     let (mut a, mut b) = (a, b);
     while b != 0 {
@@ -537,6 +562,7 @@ pub fn gcd(a: u64, b: u64) -> u64 {
 }
 
 /// Least common multiple (`None` on overflow or zero input).
+#[must_use]
 pub fn lcm(a: u64, b: u64) -> Option<u64> {
     if a == 0 || b == 0 {
         return None;
@@ -547,6 +573,7 @@ pub fn lcm(a: u64, b: u64) -> Option<u64> {
 /// LCM of several article sizes: the grid on which every size's article boundaries coincide
 /// (for example, `LCM(716_800, 768_000) = 10_752_000`, that is, 15 articles of the first size and 14 of
 /// the second).
+#[must_use]
 pub fn lcm_grid(sizes: &[u64]) -> Option<u64> {
     let mut it = sizes.iter();
     let mut acc = *it.next()?;
@@ -559,6 +586,7 @@ pub fn lcm_grid(sizes: &[u64]) -> Option<u64> {
 /// Fold consecutive part checksums `(crc32, length)` onto `grid_size` intervals: entry `k` is
 /// the CRC-32 of file bytes `[k · grid, (k + 1) · grid)`, the last entry covering the tail.
 /// `None` when a part straddles a grid boundary (its CRC cannot be split) or `grid_size == 0`.
+#[must_use]
 pub fn compute_interval_crcs(parts: &[(u32, u64)], grid_size: u64) -> Option<Vec<u32>> {
     if grid_size == 0 {
         return None;

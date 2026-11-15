@@ -112,6 +112,7 @@ pub struct RenamerReport {
 
 impl RenamerReport {
     /// Number of renames.
+    #[must_use]
     pub fn renamed_count(&self) -> usize {
         self.renamed.len()
     }
@@ -760,6 +761,7 @@ fn bytes_to_os_string(b: &[u8]) -> std::ffi::OsString {
 }
 
 /// Lower-case hex set id as used in generated par2 names.
+#[must_use]
 pub fn set_id_name(set_id: &SetId) -> String {
     hex(&set_id.0)
 }

@@ -15,6 +15,7 @@ pub struct DonorReadBudget {
 }
 impl DonorReadBudget {
     /// Choose an aggregate requested-byte allowance. Reuse this ledger across calls.
+    #[must_use]
     pub const fn new(total_limit_bytes: u64) -> Self {
         Self {
             limit: total_limit_bytes,
@@ -22,14 +23,17 @@ impl DonorReadBudget {
         }
     }
     /// Aggregate conservative requested-byte limit.
+    #[must_use]
     pub const fn limit_bytes(&self) -> u64 {
         self.limit
     }
     /// Requested bytes charged before engine-issued DATA attempts, without refunds.
+    #[must_use]
     pub const fn charged_bytes(&self) -> u64 {
         self.charged
     }
     /// Unspent requested-byte allowance, not a measurement of physical I/O remaining.
+    #[must_use]
     pub const fn remaining_bytes(&self) -> u64 {
         self.limit - self.charged
     }

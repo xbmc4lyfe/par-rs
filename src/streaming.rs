@@ -290,16 +290,19 @@ impl Par2Repairer {
     }
 
     /// Whether streaming mode is enabled.
+    #[must_use]
     pub fn streaming_enabled(&self) -> bool {
         self.streaming.is_some()
     }
 
     /// Streaming counters.
+    #[must_use]
     pub fn streaming_stats(&self) -> Option<StreamingStats> {
         self.streaming.as_ref().map(|s| s.stats)
     }
 
     /// Current streaming summary.
+    #[must_use]
     pub fn streaming_status(&self) -> Option<StreamingStatus> {
         let st = self.streaming.as_ref()?;
         let total = self.locations.len() as u64;
@@ -328,6 +331,7 @@ impl Par2Repairer {
     }
 
     /// State of one block.
+    #[must_use]
     pub fn block_state(&self, file_index: usize, block_index: u32) -> Option<BlockState> {
         let st = self.streaming.as_ref()?;
         let f = self.files.get(file_index)?;
@@ -801,6 +805,7 @@ impl Par2Repairer {
 
     /// Number of recovery blocks still needed to repair right now in streaming mode (pending
     /// blocks count as missing), or the plain estimate otherwise.
+    #[must_use]
     pub fn blocks_needed_now(&self) -> u64 {
         self.streaming_status()
             .map_or_else(|| self.blocks_needed(), |s| s.blocks_needed_now)
@@ -1697,6 +1702,7 @@ pub struct BitVec {
 
 impl BitVec {
     /// Bitset with `n` cleared bits.
+    #[must_use]
     pub fn new(n: usize) -> Self {
         Self {
             words: vec![0; n.div_ceil(64)],
@@ -1705,6 +1711,7 @@ impl BitVec {
     }
     /// Bit `i`.
     #[inline]
+    #[must_use]
     pub fn get(&self, i: usize) -> bool {
         self.words
             .get(i / 64)
@@ -1724,6 +1731,7 @@ impl BitVec {
         }
     }
     /// Number of set bits.
+    #[must_use]
     pub fn count_ones(&self) -> usize {
         self.ones
     }
@@ -2155,11 +2163,13 @@ impl StreamingParSession {
     }
 
     /// Whether this session has been permanently cancelled.
+    #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.inner.control.cancelled.load(Ordering::Acquire)
     }
 
     /// Cumulative logical I/O categories; a concurrent snapshot is not atomic.
+    #[must_use]
     pub fn io_stats(&self) -> LiveIoStats {
         self.inner.control.stats()
     }
@@ -2167,16 +2177,19 @@ impl StreamingParSession {
     /// Snapshot of cumulative selected-target repair wall times and write bytes.
     /// Fields are sampled independently; take snapshots outside active repair calls
     /// for exact deltas. Decode time includes the nested target write callbacks.
+    #[must_use]
     pub fn repair_phase_stats(&self) -> RepairPhaseStats {
         self.inner.control.repair_stats()
     }
 
     /// Set id.
+    #[must_use]
     pub fn set_id(&self) -> SetId {
         self.inner.set_id
     }
 
     /// Slice size.
+    #[must_use]
     pub fn slice_size(&self) -> u64 {
         self.inner.slice_size as u64
     }
@@ -2235,6 +2248,7 @@ impl StreamingParSession {
 
     /// File id of the first file (in `libpar2` order) whose 16k hash matches: the key a
     /// downloader has after article 1 of an obfuscated file.
+    #[must_use]
     pub fn file_id_by_hash16k(&self, hash_16k: &[u8; 16]) -> Option<FileId> {
         self.inner
             .files
@@ -2956,6 +2970,7 @@ impl StreamingParSession {
     }
 
     /// Slices folded so far and folds performed inline because a folder queue was full.
+    #[must_use]
     pub fn fold_stats(&self) -> (u64, usize) {
         (
             self.inner.folds.load(Ordering::Relaxed),
