@@ -95,6 +95,7 @@ fn complete_verify_purges_par_files_once() {
     let mut r = fx.repairer(RepairOptions::default());
     assert!(r.verify(None, &mut NullObserver).unwrap().all_complete);
     assert_eq!(r.purge_candidates(), r.par_files);
+    assert_eq!(r.purge_state.par_files, r.par_files);
     let report = r.purge(&mut NullObserver);
     assert!(report.all_removed(), "{report:?}");
     let mut removed: Vec<_> = report.removed().map(Path::to_path_buf).collect();
@@ -132,7 +133,7 @@ fn verified_repair_purges_backups_and_par_files() {
 }
 
 #[test]
-fn unverified_repair_needs_a_fresh_verify() {
+fn unverified_repair_is_never_purgeable_by_the_same_repairer() {
     let fx = Fx::new("noverify");
     fx.damage_a();
     let mut r = fx.repairer(RepairOptions {
@@ -147,11 +148,114 @@ fn unverified_repair_needs_a_fresh_verify() {
         &r.purge(&mut NullObserver),
         &PurgeKept::NotVerified
     ));
-    assert!(fx.dir.join("a.bin.1").exists());
+    // Damage the rebuilt file again: a re-verify skips files already marked complete, so it
+    // must not make purging safe.
+    fx.damage_a();
     assert!(r.verify(None, &mut NullObserver).unwrap().all_complete);
+    assert!(kept_all(
+        &r.purge(&mut NullObserver),
+        &PurgeKept::NotVerified
+    ));
+    assert!(fx.dir.join("a.bin.1").exists());
+    assert!(!fx.par_files().is_empty());
+    // A fresh repairer hashes everything and sees the damage.
+    let mut fresh = fx.repairer(RepairOptions::default());
+    assert!(!fresh.verify(None, &mut NullObserver).unwrap().all_complete);
+    assert!(kept_all(
+        &fresh.purge(&mut NullObserver),
+        &PurgeKept::NotVerified
+    ));
+    // Once the target is good again, a fresh full verify allows the purge.
+    std::fs::write(fx.dir.join("a.bin"), &fx.a).unwrap();
+    let mut fresh = fx.repairer(RepairOptions::default());
+    assert!(fresh.verify(None, &mut NullObserver).unwrap().all_complete);
+    let report = fresh.purge(&mut NullObserver);
+    assert!(report.all_removed(), "{report:?}");
+    assert!(fx.par_files().is_empty());
+    // A fresh repairer does not know the old backup; it stays.
+    assert!(fx.dir.join("a.bin.1").exists());
+}
+
+#[test]
+fn second_verify_is_not_a_full_hash() {
+    let fx = Fx::new("reverify");
+    let mut r = fx.repairer(RepairOptions::default());
+    assert!(r.verify(None, &mut NullObserver).unwrap().all_complete);
+    // Corrupt after the first verify; the second one skips complete files.
+    fx.damage_a();
+    assert!(r.verify(None, &mut NullObserver).unwrap().all_complete);
+    assert!(kept_all(
+        &r.purge(&mut NullObserver),
+        &PurgeKept::NotVerified
+    ));
+    assert!(!fx.par_files().is_empty());
+}
+
+#[test]
+fn foreign_empty_and_temporary_par_files_are_never_candidates() {
+    let fx = Fx::new("foreign");
+    // A volume of another set and an empty file named like volumes of this set.
+    let other = build_set(
+        "other",
+        &[("z.bin", &[9u8; 3000][..])],
+        &SetOptions {
+            slice_size: 1024,
+            recovery_blocks: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let odir = fx.dir.join("other");
+    std::fs::create_dir(&odir).unwrap();
+    let written = other.write_to(&odir, "other").unwrap();
+    let vol = written
+        .iter()
+        .find(|p| p.to_string_lossy().contains(".vol"))
+        .unwrap();
+    std::fs::copy(vol, fx.dir.join("set.vol99+02.par2")).unwrap();
+    std::fs::write(fx.dir.join("set.vol98+01.par2"), b"").unwrap();
+    let mut r = fx.repairer(RepairOptions::default());
+    let first_index = std::fs::read(fx.dir.join("set.par2")).unwrap();
+    r.load_par2_bytes(first_index, "in-memory index").unwrap();
+    assert!(r.verify(None, &mut NullObserver).unwrap().all_complete);
+    let candidates = r.purge_candidates();
+    assert!(!candidates.contains(&fx.dir.join("set.vol99+02.par2")));
+    assert!(!candidates.contains(&fx.dir.join("set.vol98+01.par2")));
+    assert!(
+        candidates.iter().all(|p| p.starts_with(&fx.dir)),
+        "{candidates:?}"
+    );
     let report = r.purge(&mut NullObserver);
     assert!(report.all_removed(), "{report:?}");
-    assert!(!fx.dir.join("a.bin.1").exists());
+    assert!(fx.dir.join("set.vol99+02.par2").exists());
+    assert!(fx.dir.join("set.vol98+01.par2").exists());
+}
+
+#[test]
+fn split_fragments_are_not_purged() {
+    let fx = Fx::new("fragments");
+    std::fs::remove_file(fx.dir.join("b.bin")).unwrap();
+    std::fs::write(fx.dir.join("b.bin.001"), &fx.b[..4096]).unwrap();
+    std::fs::write(fx.dir.join("b.bin.002"), &fx.b[4096..]).unwrap();
+    let mut r = fx.repairer(RepairOptions::default());
+    r.verify(None, &mut NullObserver).unwrap();
+    r.add_split_fragments(&fx.dir.clone(), &mut NullObserver)
+        .unwrap();
+    let RepairResult::Repaired { leftovers, .. } = r.repair(&mut NullObserver).unwrap() else {
+        panic!("expected a repair");
+    };
+    // Fragments the repair used are user input: never purge candidates, whether or not the
+    // repair lists them as leftovers.
+    let candidates = r.purge_candidates();
+    for frag in ["b.bin.001", "b.bin.002"] {
+        assert!(!candidates.contains(&fx.dir.join(frag)), "{candidates:?}");
+        if leftovers.contains(&fx.dir.join(frag)) {
+            assert!(!r.purge_state.backups.contains(&fx.dir.join(frag)));
+        }
+    }
+    assert!(r.purge(&mut NullObserver).all_removed());
+    assert!(fx.dir.join("b.bin.001").exists() && fx.dir.join("b.bin.002").exists());
+    assert_eq!(std::fs::read(fx.dir.join("b.bin")).unwrap(), fx.b);
 }
 
 #[test]
@@ -168,15 +272,15 @@ fn guards_keep_targets_aliases_directories_and_missing_paths() {
         (subdir.clone(), Some(PurgeKept::NotAFile)),
         (missing.clone(), Some(PurgeKept::Missing)),
     ];
-    r.purge_state.leftovers = vec![spelled, subdir.clone(), missing];
+    r.purge_state.backups = vec![spelled, subdir.clone(), missing];
     #[cfg(unix)]
     {
         let hard = fx.dir.join("b.hardlink");
         std::fs::hard_link(fx.dir.join("b.bin"), &hard).unwrap();
         let link = fx.dir.join("a.symlink");
         std::os::unix::fs::symlink(fx.dir.join("a.bin"), &link).unwrap();
-        r.purge_state.leftovers.push(hard.clone());
-        r.purge_state.leftovers.push(link.clone());
+        r.purge_state.backups.push(hard.clone());
+        r.purge_state.backups.push(link.clone());
         expected.push((hard, Some(PurgeKept::ProtectedTarget)));
         // The link itself goes; its target stays.
         expected.push((link, None));

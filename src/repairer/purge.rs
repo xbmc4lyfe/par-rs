@@ -1,14 +1,14 @@
 //! Verified purge (par2cmdline `-p`): once every protected file is verified complete, remove
-//! the repair's leftovers (backups such as `name.1` and used split fragments) and the PAR2
-//! files of the set, reporting every path as removed or kept.
+//! the backups the repair made (such as `name.1`) and the PAR2 files of the set, reporting
+//! every path as removed or kept.
 
 use super::*;
 
 /// Why [`Par2Repairer::purge`] kept a path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PurgeKept {
-    /// The set is not verified complete: verify found damage, a repair has not been
-    /// re-verified (`verify_repaired` off and no later `verify`), or nothing was verified.
+    /// The set is not verified complete: verify found damage or did not hash every target
+    /// itself, a repair was not re-verified, or nothing was verified.
     NotVerified,
     /// The path no longer exists.
     Missing,
@@ -29,7 +29,7 @@ pub struct PurgeEntry {
     pub kept: Option<PurgeKept>,
 }
 
-/// Outcome of [`Par2Repairer::purge`]: leftovers first, then PAR2 files in load order.
+/// Outcome of [`Par2Repairer::purge`]: backups first, then PAR2 files in load order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PurgeReport {
     /// Every candidate, in the order considered.
@@ -61,10 +61,24 @@ impl PurgeReport {
 /// Purge bookkeeping kept on the repairer.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PurgeState {
-    /// Every target was verified complete by the last verify or re-verified repair.
+    /// Every target was hashed and found complete by the last verify (one that read every
+    /// target itself), or by that verify plus a re-verified repair.
     pub(crate) safe: bool,
-    /// Leftovers of the last successful repair that were not deleted yet.
-    pub(crate) leftovers: Vec<PathBuf>,
+    /// The last verify hashed every target itself (see `Par2Repairer::verify`).
+    pub(crate) fully_hashed: bool,
+    /// Backups made by the last successful repair that were not deleted yet.
+    pub(crate) backups: Vec<PathBuf>,
+    /// Loaded files made solely of this set's packets (not foreign, empty or temporary).
+    pub(crate) par_files: Vec<PathBuf>,
+}
+
+impl PurgeState {
+    /// Forget the verdict (the files may have changed); keep the list of PAR2 files.
+    pub(crate) fn reset_verdict(&mut self) {
+        self.safe = false;
+        self.fully_hashed = false;
+        self.backups.clear();
+    }
 }
 
 /// File identity used to refuse removing another name of a protected file.
@@ -83,15 +97,17 @@ fn identity(_meta: &std::fs::Metadata) -> Option<Identity> {
 }
 
 impl Par2Repairer {
-    /// Paths [`purge`](Self::purge) would consider: the last repair's leftovers that were not
-    /// deleted yet, then every loaded PAR2 file, without duplicates.
+    /// Paths [`purge`](Self::purge) would consider: the backups the last repair made that were
+    /// not deleted yet, then every loaded PAR2 file of this set, without duplicates. Split
+    /// fragments, files of other sets (or without packets) and the temporary copies made by
+    /// [`load_par2_bytes`](Self::load_par2_bytes) are never candidates.
     pub fn purge_candidates(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
         for p in self
             .purge_state
-            .leftovers
+            .backups
             .iter()
-            .chain(self.par_files.iter())
+            .chain(self.purge_state.par_files.iter())
         {
             if !out.contains(p) {
                 out.push(p.clone());
@@ -100,18 +116,21 @@ impl Par2Repairer {
         out
     }
 
-    /// Remove the repair leftovers and the PAR2 files once every protected file is verified
+    /// Remove the repair backups and the PAR2 files once every protected file is verified
     /// complete (par2cmdline `-p`). Every candidate from
     /// [`purge_candidates`](Self::purge_candidates) is reported as removed or kept:
     ///
-    /// - nothing is removed unless the last [`verify`](Self::verify) found every file
-    ///   complete, or the last [`repair`](Self::repair) succeeded with `verify_repaired` on;
+    /// - nothing is removed unless the last [`verify`](Self::verify) hashed every target
+    ///   itself and found it complete, or such a verify was followed by a
+    ///   [`repair`](Self::repair) that succeeded with `verify_repaired` on. A verify that skips
+    ///   files already marked complete (after streaming, quick verification or a repair
+    ///   without `verify_repaired`) does not count: verify again with a new repairer;
     /// - a path that is a protected file, or another name for one (a hard link, or a spelling
     ///   that resolves to it), is kept, as is anything that is not a regular file or symbolic
     ///   link (a symbolic link itself is removed, never its target).
     ///
-    /// Removing PAR2 files drops the set: the purge state is cleared afterwards, so a second
-    /// call keeps everything as [`PurgeKept::NotVerified`].
+    /// Removing PAR2 files drops the set: the verdict is cleared afterwards, so a second call
+    /// keeps everything as [`PurgeKept::NotVerified`].
     pub fn purge(&mut self, observer: &mut dyn RepairObserver) -> PurgeReport {
         let candidates = self.purge_candidates();
         let mut report = PurgeReport::default();
@@ -174,7 +193,7 @@ impl Par2Repairer {
             }
             report.entries.push(PurgeEntry { path, kept });
         }
-        self.purge_state = PurgeState::default();
+        self.purge_state.reset_verdict();
         report
     }
 }

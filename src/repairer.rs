@@ -689,6 +689,12 @@ impl Par2Repairer {
     /// Load one par2 file (index or volume). Metadata is verified; recovery payloads are only
     /// indexed. Returns the number of recovery slices added.
     pub fn load_par2_file(&mut self, path: &Path) -> Result<usize, RepairError> {
+        self.load_par2_path(path, true)
+    }
+
+    /// [`load_par2_file`](Self::load_par2_file); `purgeable` records the file as a PAR2 file
+    /// of this set that [`purge`](Self::purge) may remove (not for internal temporary copies).
+    fn load_par2_path(&mut self, path: &Path, purgeable: bool) -> Result<usize, RepairError> {
         let before = self.packets.recovery.len();
         let source_id = self.par_files.len();
         let stats = self
@@ -705,6 +711,14 @@ impl Par2Repairer {
                     return Err(RepairError::WrongSet { expected, found });
                 }
             }
+        }
+        // Only a file made solely of this set's packets is the set's own PAR2 file.
+        if purgeable
+            && stats.foreign == 0
+            && stats.added + stats.duplicates > 0
+            && !self.purge_state.par_files.iter().any(|p| p == path)
+        {
+            self.purge_state.par_files.push(path.to_path_buf());
         }
         if self.finalized {
             // New recovery slices may have arrived; nothing else changes.
@@ -762,7 +776,7 @@ impl Par2Repairer {
         ));
         std::fs::write(&tmp, &data)
             .map_err(io_ctx(format!("writing temporary copy of {label}")))?;
-        self.load_par2_file(&tmp)
+        self.load_par2_path(&tmp, false)
     }
 
     /// Build the file and block tables. Must be called after loading and before verifying.
@@ -849,7 +863,7 @@ impl Par2Repairer {
         self.finalized = true;
         self.verified = false;
         self.streaming = None;
-        self.purge_state = purge::PurgeState::default();
+        self.purge_state.reset_verdict();
         Ok(())
     }
 
@@ -1048,6 +1062,12 @@ impl Par2Repairer {
             return Err(RepairError::NotFinalized);
         }
         observer.stage(Stage::Verifying);
+        // Purging needs a verify that hashed every target itself: none already marked
+        // complete (by streaming, an unverified repair or an earlier verify) and no
+        // quick verification from download checksums.
+        let hashes_everything =
+            quick.is_none() && self.files.iter().all(|f| f.status != FileStatus::Complete);
+        self.purge_state.reset_verdict();
         let ss = self.block_size();
         let total_files = self.files.len().max(1);
         // ---- phase 1: zero-read checks ----
@@ -1332,7 +1352,9 @@ impl Par2Repairer {
         }
         observer.progress(1000, "Verification finished");
         self.verified = true;
-        self.purge_state.safe = self.files.iter().all(|f| f.status == FileStatus::Complete);
+        self.purge_state.fully_hashed = hashes_everything;
+        self.purge_state.safe =
+            hashes_everything && self.files.iter().all(|f| f.status == FileStatus::Complete);
         Ok(self.verify_result())
     }
 
@@ -1791,6 +1813,7 @@ impl Par2Repairer {
         check_recovery_matrix_memory(missing_total, self.options.mem_limit_bytes)?;
         // From here the targets change; only a re-verified success makes purging safe again.
         self.purge_state.safe = false;
+        self.purge_state.backups.clear();
         let (mut copies, mut backups) =
             rename::Copies::prepare(self, incomplete.len(), self.verification_memory())?;
         observer.stage(Stage::Repairing);
@@ -2227,12 +2250,15 @@ impl Par2Repairer {
                 }
             }
         }
-        self.purge_state.leftovers = leftovers
+        // par2cmdline `-p` removes the backups it made, not split fragments (user input).
+        self.purge_state.backups = leftovers
             .iter()
-            .filter(|p| p.symlink_metadata().is_ok())
+            .filter(|p| !self.split_fragments.contains(p) && p.symlink_metadata().is_ok())
             .cloned()
             .collect();
+        // Untouched files were hashed by a full verify; rebuilt ones were re-hashed just now.
         self.purge_state.safe = self.options.verify_repaired
+            && self.purge_state.fully_hashed
             && self.files.iter().all(|f| f.status == FileStatus::Complete);
         observer.progress(1000, "Repair complete");
         Ok(RepairResult::Repaired {
