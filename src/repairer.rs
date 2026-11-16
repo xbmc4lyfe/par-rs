@@ -1475,6 +1475,125 @@ impl Par2Repairer {
         Ok(self.verify_result())
     }
 
+    /// Verify one file as soon as its download completes, from what the downloader already
+    /// knows (incremental ParQuick), and keep the verdict: a file this call reports complete is
+    /// skipped by later [`verify`](Self::verify) calls, so the final verify only reads the files
+    /// that did not pass. Call after [`finalize`](Self::finalize), any number of times.
+    ///
+    /// The file passes when its size matches and either:
+    /// - `md5_full`, the MD5 of the whole file as written, equals the expected one; or
+    /// - with no `md5_full`, `info` proves every slice through the slice CRCs (as the quick
+    ///   path of [`verify`](Self::verify) does: [`QuickInfo::Success`] with the whole-file
+    ///   CRC, or [`QuickInfo::Partial`] whose segments cover every slice intact). Files
+    ///   without IFSC checksums, or with a slice CRC that occurs elsewhere in the set, cannot
+    ///   pass this way.
+    ///
+    /// Returns whether the file passed. Nothing is recorded otherwise (including a mismatching
+    /// `md5_full`, or a target name that is not part of the set), and the final verify checks
+    /// the file in full. Like quick verification, a pass does not make
+    /// [`purge`](Self::purge) safe.
+    ///
+    /// # Errors
+    /// [`RepairError::NotFinalized`] before [`finalize`](Self::finalize), and
+    /// [`RepairError::Io`] when reading the file for a [`QuickInfo::Partial`] check fails.
+    pub fn quick_verify_file(
+        &mut self,
+        target_filename: &str,
+        info: &QuickInfo,
+        md5_full: Option<[u8; 16]>,
+        observer: &mut dyn RepairObserver,
+    ) -> Result<bool, RepairError> {
+        if !self.finalized {
+            return Err(RepairError::NotFinalized);
+        }
+        let Some(fi) = self
+            .files
+            .iter()
+            .position(|f| f.target_filename == target_filename)
+        else {
+            return Ok(false);
+        };
+        if self.files[fi].status == FileStatus::Complete {
+            return Ok(true);
+        }
+        let path = self.files[fi].target_path.clone();
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return Ok(false);
+        };
+        let size = meta.len();
+        if !meta.is_file() || size != self.files[fi].file_length {
+            return Ok(false);
+        }
+        let passed = if let Some(md5) = md5_full {
+            md5 == self.files[fi].hash_full
+        } else if let Some(cs) = self.checksums[fi].as_ref() {
+            if cs.iter().any(|e| self.duplicate_crcs.contains(&e.crc32)) {
+                false
+            } else {
+                let crcs: Vec<u32> = cs.iter().map(|e| e.crc32).collect();
+                let ss = self.block_size();
+                let verdict = match info {
+                    QuickInfo::Success { crc } => damage::quick_verify(
+                        &DownloadStatus::Success { crc: *crc },
+                        size,
+                        &crcs,
+                        ss,
+                        &mut damage::NoDiskAccess,
+                    ),
+                    QuickInfo::Partial { segments } => {
+                        let mut f = File::open(&path)
+                            .map_err(io_ctx(format!("opening {}", path.display())))?;
+                        damage::quick_verify(
+                            &DownloadStatus::Partial { segments },
+                            size,
+                            &crcs,
+                            ss,
+                            &mut f,
+                        )
+                    }
+                    QuickInfo::Failure => Ok(QuickVerdict::NeedsFullScan),
+                }
+                .map_err(io_ctx(format!("quick-verifying {}", path.display())))?;
+                verdict == QuickVerdict::Complete
+            }
+        } else {
+            false
+        };
+        if !passed {
+            return Ok(false);
+        }
+        let ss = self.block_size();
+        let di = self.disk_file_index(&path);
+        // Every slice now lives at its natural offset in the file that passed; locations an
+        // earlier verify recorded for an older copy of it are replaced.
+        let first = self.files[fi].first_block;
+        let count = self.files[fi].block_count as usize;
+        for b in 0..count {
+            self.locations[first + b] = Some(BlockLocation {
+                file: di,
+                offset: b as u64 * ss,
+            });
+        }
+        // Not hashed here: purging needs a verify that hashed every target itself.
+        self.purge_state.fully_hashed = false;
+        self.purge_state.safe = false;
+        let f = &mut self.files[fi];
+        f.available_blocks = count as u32;
+        f.target_exists = true;
+        f.status = FileStatus::Complete;
+        f.complete_file = Some(path);
+        if !f.quick_verified {
+            f.quick_verified = true;
+            self.quick_verified_files += 1;
+        }
+        observer.message(
+            Level::Detail,
+            &format!("Quickly verified good file {target_filename}"),
+        );
+        observer.file_verified(&self.files[fi]);
+        Ok(true)
+    }
+
     fn verification_memory(&self) -> u64 {
         self.options
             .mem_limit_bytes
