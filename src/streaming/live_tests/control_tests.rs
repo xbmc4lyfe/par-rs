@@ -890,9 +890,17 @@ fn late_backfill_refuses_stale_disk_then_retries(mode: &str) {
     std::fs::write(&stale_path, &stale.1).unwrap();
     let before = session.io_stats().backfill_bytes_read;
     assert_eq!(session.on_recovery_volume_arrived(late, None).unwrap(), 0);
+    // The first, shared back-fill skipped only the slices it could not
+    // authenticate and folded the rest of the file; the retry re-reads just
+    // those (with "same-crc" only the first 1 KiB slice was wrong).
+    let missing = if mode == "same-crc" {
+        stale.1.len().min(1024) as u64
+    } else {
+        stale.1.len() as u64
+    };
     assert_eq!(
         session.io_stats().backfill_bytes_read - before,
-        stale.1.len() as u64,
+        missing,
         "deduplication must retry missing rows with exactly one source read"
     );
     assert!(fifth.lock().unwrap().folded_mask.get(stale_global));

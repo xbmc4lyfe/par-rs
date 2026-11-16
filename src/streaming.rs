@@ -1630,6 +1630,9 @@ pub struct LiveStatus {
 
 /// PAR2 recovery exponents are 16-bit, so no set has more distinct syndromes.
 const MAX_SYNDROME_SLOTS: usize = 65535;
+/// A shared back-fill releases the payload gate after re-reading about this much.
+/// Tests use a tiny chunk so every shared back-fill crosses chunk boundaries.
+const BACKFILL_CHUNK_BYTES: u64 = if cfg!(test) { 4096 } else { 64 << 20 };
 
 /// Session options.
 #[derive(Clone, Debug)]
@@ -1659,6 +1662,11 @@ pub struct SessionOptions {
     pub solve_mem_limit_bytes: u64,
     /// SIMD kernel.
     pub kernel: Kernel,
+    /// Leave the back-fill of newly allocated syndrome slots to
+    /// [`StreamingParSession::backfill_pending`] instead of running it inside
+    /// recovery-volume arrival and [`StreamingParSession::set_max_syndrome_slots`].
+    /// A repair still back-fills first.
+    pub defer_backfill: bool,
 }
 
 impl Default for SessionOptions {
@@ -1674,6 +1682,7 @@ impl Default for SessionOptions {
             solve_threads: 0,
             solve_mem_limit_bytes: 256 << 20,
             kernel: Kernel::detect(),
+            defer_backfill: false,
         }
     }
 }
@@ -1929,6 +1938,10 @@ struct SessionInner {
     /// slot cap was full. Raising the cap absorbs them again.
     cap_rejected: Mutex<Vec<(PathBuf, usize)>>,
     needs_backfill: AtomicBool,
+    /// Bumped (under the exclusive payload gate) each time a slot is added.
+    slot_generation: AtomicU64,
+    /// One back-fill at a time; concurrent ones would only re-read the same slices.
+    backfill_lock: Mutex<()>,
     pool: Option<FoldPool>,
     /// Slices folded (counter for statistics).
     folds: AtomicU64,
@@ -2192,6 +2205,8 @@ impl StreamingParSession {
             slot_limit,
             cap_rejected: Mutex::new(Vec::new()),
             needs_backfill: AtomicBool::new(false),
+            slot_generation: AtomicU64::new(0),
+            backfill_lock: Mutex::new(()),
             pool,
             folds: AtomicU64::new(0),
             inline_folds: AtomicUsize::new(0),
@@ -3074,21 +3089,52 @@ impl StreamingParSession {
     /// missing ones from the target files (needed for slots allocated after slices were
     /// verified and evicted from RAM). Every reread is authenticated against IFSC again;
     /// a pending cache commit or source change must never seed a new syndrome.
+    ///
+    /// With `flush`, queued folds are applied first (callers holding the
+    /// exclusive payload gate). Without it, payloads may fold concurrently:
+    /// every fold sets the slot's `folded_mask` under the slot lock, so a slice
+    /// is folded into a slot exactly once by whichever path gets there first.
+    ///
+    /// The exclusive callers (`flush`) stop at the first slice that cannot be
+    /// re-read. A shared back-fill instead skips it (a slice verified from
+    /// RAM may not be committed to disk yet) and goes on with the rest; it
+    /// then returns that first error and stays pending, so a later call only
+    /// re-reads what is still missing.
     fn backfill_slots(
         &self,
         target_files: Option<&HashMap<usize, &File>>,
+        flush: bool,
     ) -> Result<(), RepairError> {
         self.inner.control.ensure_running()?;
-        self.flush();
+        if flush {
+            self.flush();
+        }
         self.inner.control.ensure_running()?;
+        if let Some(e) = self.backfill_range(target_files, flush, 0..self.inner.logs.len())? {
+            return Err(e);
+        }
+        self.inner.needs_backfill.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Folds the verified slices in `range` into every slot that misses them.
+    /// In shared (non-`flush`) mode a slice that cannot be re-read is skipped and
+    /// the first such error is returned as `Ok(Some(e))`; strict mode fails on it.
+    fn backfill_range(
+        &self,
+        target_files: Option<&HashMap<usize, &File>>,
+        flush: bool,
+        range: std::ops::Range<usize>,
+    ) -> Result<Option<RepairError>, RepairError> {
+        let mut skipped: Option<RepairError> = None;
         let verified: Vec<usize> = {
             let t = self
                 .inner
                 .tracker
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (0..t.states.len())
-                .filter(|&g| t.states[g] == SliceState::VerifiedGood)
+            range
+                .filter(|&g| g < t.states.len() && t.states[g] == SliceState::VerifiedGood)
                 .collect()
         };
         let slots: Vec<Arc<Mutex<SyndromeSlot>>> = self
@@ -3112,7 +3158,15 @@ impl StreamingParSession {
             if needs.is_empty() {
                 continue;
             }
-            let data = self.read_slice_from_disk(g, target_files)?;
+            let data = match self.read_slice_from_disk(g, target_files) {
+                Ok(data) => data,
+                Err(e) if !flush && !matches!(e, RepairError::Cancelled) => {
+                    self.inner.control.ensure_running()?;
+                    skipped.get_or_insert(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let mut split = vec![0u8; ss];
             {
                 let (lo, hi) = split.split_at_mut(ss / 2);
@@ -3135,8 +3189,7 @@ impl StreamingParSession {
             self.inner.control.ensure_running()?;
         }
         self.inner.control.ensure_running()?;
-        self.inner.needs_backfill.store(false, Ordering::Release);
-        Ok(())
+        Ok(skipped)
     }
 
     fn read_slice_from_disk(
@@ -3326,7 +3379,7 @@ impl StreamingParSession {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
             for (path, blocks) in &rejected {
-                if let Err(e) = self.absorb_recovery_volume(path, None) {
+                if let Err(e) = self.absorb_recovery_packets(path, None) {
                     let mut list = self
                         .inner
                         .cap_rejected
@@ -3346,11 +3399,95 @@ impl StreamingParSession {
         if let Some(e) = first_error {
             return Err(e);
         }
+        // One back-fill for every volume absorbed again (a failed read earlier
+        // also leaves it pending, so it is retried here).
+        if !self.inner.opts.defer_backfill {
+            self.backfill_pending()?;
+        }
         self.inner.control.ensure_running()?;
         Ok(cap)
     }
 
     fn absorb_recovery_volume(
+        &self,
+        path: &Path,
+        queued_id: Option<u64>,
+    ) -> Result<usize, RepairError> {
+        let absorbed = self.absorb_recovery_packets(path, queued_id)?;
+        if !self.inner.opts.defer_backfill {
+            self.backfill_pending()?;
+        }
+        Ok(absorbed)
+    }
+
+    /// Back-fill syndrome slots allocated after slices were verified, by
+    /// re-reading those slices from disk. Live payloads keep folding meanwhile
+    /// (shared payload gate); arrivals and repairs wait. Returns whether a
+    /// back-fill ran.
+    ///
+    /// # Errors
+    /// [`RepairError::Cancelled`] after [`cancel`](Self::cancel), or an I/O
+    /// error re-reading a slice; the back-fill is then retried on the next call.
+    pub fn backfill_pending(&self) -> Result<bool, RepairError> {
+        if !self.inner.needs_backfill.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        // Only this function takes `backfill_lock`, so taking it before the gate
+        // cannot invert a lock order.
+        let _one = self
+            .inner
+            .backfill_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total = self.inner.logs.len();
+        let chunk = usize::try_from(BACKFILL_CHUNK_BYTES / self.inner.slice_size.max(1) as u64)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let mut ran = false;
+        // Each round re-reads in chunks and releases the payload gate between
+        // them, so a volume arrival, cap growth or repair waits for one chunk,
+        // not the whole pass. Slots are only added under the write gate, which
+        // bumps `slot_generation`: a round that saw it change goes again, and
+        // `folded_mask` keeps already folded slices from folding twice.
+        while self.inner.needs_backfill.load(Ordering::Acquire) {
+            ran = true;
+            let generation = self.inner.slot_generation.load(Ordering::Acquire);
+            let mut skipped: Option<RepairError> = None;
+            let mut start: usize = 0;
+            loop {
+                let end = start.saturating_add(chunk).min(total);
+                let _payload = self
+                    .inner
+                    .payload_gate
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.inner.control.ensure_running()?;
+                if let Some(e) = self.backfill_range(None, false, start..end)? {
+                    skipped.get_or_insert(e);
+                }
+                if end >= total {
+                    if let Some(e) = skipped {
+                        return Err(e);
+                    }
+                    // Still under the gate: no slot can appear before this store.
+                    if self.inner.slot_generation.load(Ordering::Acquire) == generation {
+                        self.inner.needs_backfill.store(false, Ordering::Release);
+                    }
+                    break;
+                }
+                start = end;
+            }
+        }
+        Ok(ran)
+    }
+
+    /// Whether slots allocated since the last back-fill still miss verified slices.
+    #[must_use]
+    pub fn needs_backfill(&self) -> bool {
+        self.inner.needs_backfill.load(Ordering::Acquire)
+    }
+
+    fn absorb_recovery_packets(
         &self,
         path: &Path,
         queued_id: Option<u64>,
@@ -3466,6 +3603,7 @@ impl StreamingParSession {
                     recovery_added: false,
                 }));
                 list.push(Arc::clone(&s));
+                self.inner.slot_generation.fetch_add(1, Ordering::AcqRel);
                 self.inner.needs_backfill.store(true, Ordering::Release);
                 s
             };
@@ -3528,11 +3666,6 @@ impl StreamingParSession {
                 (n, Some(i)) => rejected[i].1 = n,
                 (n, None) => rejected.push((path.to_path_buf(), n)),
             }
-        }
-        // A failed read/authentication leaves missing rows and must be retried
-        // even when all recovery packets in this arrival are already absorbed.
-        if self.inner.needs_backfill.load(Ordering::Acquire) {
-            self.backfill_slots(None)?;
         }
         Ok(absorbed)
     }
@@ -3831,7 +3964,7 @@ impl StreamingParSession {
         }
         {
             let _backfill = self.inner.control.phase(RepairPhase::Backfill);
-            self.backfill_slots(admitted.as_ref())?;
+            self.backfill_slots(admitted.as_ref(), true)?;
         }
         let ss = self.inner.slice_size;
         let (missing, present, ready_exps): (Vec<usize>, Vec<bool>, Vec<u32>) = {
@@ -5295,6 +5428,68 @@ mod live_tests {
             fx.files[0].1
         );
         std::fs::remove_dir_all(&fx.dir).unwrap();
+    }
+
+    #[test]
+    fn deferred_backfill_waits_for_the_caller_and_repair_still_back_fills() {
+        for explicit in [true, false] {
+            let fx = fixture("defer", &[15_000, 9_000], 1000, 6, VolumeScheme::Single);
+            let s = StreamingParSession::new(
+                &fx.set,
+                &fx.dir,
+                SessionOptions {
+                    preallocated_syndrome_slots: 2,
+                    max_syndrome_slots: 5,
+                    max_staging_bytes: 0,
+                    defer_backfill: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for (name, data) in &fx.files {
+                let id = fid(&fx, name);
+                let path = fx.dir.join(name);
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len(data.len() as u64)
+                    .unwrap();
+                for (si, chunk) in data.chunks(1000).enumerate() {
+                    if name == "part00.rar" && matches!(si, 1 | 6 | 11 | 14) {
+                        s.on_article_failed_permanently(&id, (si * 1000) as u64, 1000)
+                            .unwrap();
+                        continue;
+                    }
+                    write_at(&path, (si * 1000) as u64, chunk);
+                    s.on_article_finished(
+                        &id,
+                        (si * 1000) as u64,
+                        chunk.len() as u64,
+                        crc32(chunk),
+                        Some(chunk),
+                    )
+                    .unwrap();
+                }
+            }
+            assert!(!s.needs_backfill());
+            assert_eq!(s.on_recovery_volume_arrived(&fx.vols[0], None).unwrap(), 5);
+            // New slots 2..4 still miss the verified slices.
+            assert!(s.needs_backfill());
+            assert_eq!(s.io_stats().backfill_bytes_read, 0);
+            if explicit {
+                assert!(s.backfill_pending().unwrap());
+                assert!(!s.needs_backfill());
+                assert!(s.io_stats().backfill_bytes_read > 0);
+                assert!(!s.backfill_pending().unwrap());
+            }
+            let f0 = fid(&fx, "part00.rar");
+            let rep = s.repair_available_targets_now(&[f0]).unwrap();
+            assert_eq!(rep.repaired_slices.len(), 4);
+            assert_eq!(
+                std::fs::read(fx.dir.join("part00.rar")).unwrap(),
+                fx.files[0].1
+            );
+            std::fs::remove_dir_all(&fx.dir).unwrap();
+        }
     }
 
     #[test]
