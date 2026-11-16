@@ -3200,6 +3200,22 @@ impl StreamingParSession {
         result
     }
 
+    /// Re-run the volume selector without new damage: when a volume that was
+    /// in flight arrives with fewer usable blocks than it promised, the
+    /// remaining shortfall would otherwise wait for the next damaged slice.
+    /// Returns an unpause instruction when more recovery blocks must be fetched.
+    pub fn request_unpause(&self) -> Option<UnpauseAction> {
+        if self.is_cancelled() {
+            return None;
+        }
+        let mut t = self
+            .inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::schedule_unpause(&mut t)
+    }
+
     /// Recovery slices of arrived volumes that were turned away because the
     /// slot cap was full (counted when framed, before hashing, so an upper
     /// bound). Raising the cap with
@@ -4333,6 +4349,34 @@ mod live_tests {
         // Repeated failure on the same slice: no new action.
         let (ev, action3) = s.on_article_failed_permanently(&f0, 5000, 10).unwrap();
         assert!(ev.is_empty() && action3.is_none());
+        // Everything is covered by volumes in flight: nothing more to fetch.
+        assert!(s.request_unpause().is_none());
+        // A volume in flight came back short (here: its promise is dropped):
+        // the selector runs again without waiting for new damage.
+        let promised = s
+            .inner
+            .tracker
+            .lock()
+            .unwrap()
+            .unpaused_in_flight
+            .remove(&action2.volume_ids_to_unpause[0]);
+        assert_eq!(promised, Some(1));
+        assert_eq!(s.status().needed_recovery_blocks, 1);
+        let again = s.request_unpause().unwrap();
+        assert_eq!(again.volume_ids_to_unpause.len(), 1);
+        assert_eq!(s.status().needed_recovery_blocks, 0);
+        s.inner
+            .tracker
+            .lock()
+            .unwrap()
+            .unpaused_in_flight
+            .remove(&again.volume_ids_to_unpause[0]);
+        s.inner
+            .tracker
+            .lock()
+            .unwrap()
+            .unpaused_in_flight
+            .insert(action2.volume_ids_to_unpause[0], 1);
         // Unpaused volumes arrive: in-flight drops, ready rises.
         for id in action
             .volume_ids_to_unpause
