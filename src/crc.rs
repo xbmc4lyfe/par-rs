@@ -471,9 +471,6 @@ mod hw {
 
             let k1k2 = _mm_set_epi64x(K2 as i64, K1 as i64);
             let k3k4 = _mm_set_epi64x(K4 as i64, K3 as i64);
-            let k5 = _mm_set_epi64x(0, K5 as i64);
-            let poly = _mm_set_epi64x(MU as i64, PP as i64);
-            let mask32 = _mm_set_epi32(0, -1, 0, -1);
 
             let mut x1 = _mm_loadu_si128(p as *const __m128i);
             let mut x2 = _mm_loadu_si128(p.add(16) as *const __m128i);
@@ -515,6 +512,25 @@ mod hw {
             x1 = _mm_clmulepi64_si128(x1, k3k4, 0x11);
             x1 = _mm_xor_si128(_mm_xor_si128(x1, x4), x5);
 
+            finish(x1, p, len)
+        }
+    }
+
+    /// Fold the remaining `len` bytes at `p` into the 128-bit remainder `x1`, reduce it to the
+    /// register and run the last bytes through the table kernel.
+    ///
+    /// # Safety
+    /// Only inlined into functions that enable `pclmulqdq,sse4.1,ssse3`; `p..p + len` must be
+    /// readable.
+    #[inline(always)]
+    unsafe fn finish(mut x1: core::arch::x86_64::__m128i, mut p: *const u8, mut len: usize) -> u32 {
+        use core::arch::x86_64::*;
+        // SAFETY: as documented above.
+        unsafe {
+            let k3k4 = _mm_set_epi64x(K4 as i64, K3 as i64);
+            let k5 = _mm_set_epi64x(0, K5 as i64);
+            let poly = _mm_set_epi64x(MU as i64, PP as i64);
+            let mask32 = _mm_set_epi32(0, -1, 0, -1);
             while len >= 16 {
                 let y = _mm_loadu_si128(p as *const __m128i);
                 let x5 = _mm_clmulepi64_si128(x1, k3k4, 0x00);
@@ -545,12 +561,207 @@ mod hw {
         }
     }
 
+    /// `x` folded forward by the distance the per-128-bit-lane constants `k` encode, plus
+    /// `next` (AVX-512, four lanes at once).
+    #[inline(always)]
+    unsafe fn fold512(
+        x: core::arch::x86_64::__m512i,
+        k: core::arch::x86_64::__m512i,
+        next: core::arch::x86_64::__m512i,
+    ) -> core::arch::x86_64::__m512i {
+        use core::arch::x86_64::*;
+        // SAFETY: only inlined into functions that enable `avx512f,vpclmulqdq`.
+        unsafe {
+            _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_clmulepi64_epi128::<0x00>(x, k),
+                _mm512_clmulepi64_epi128::<0x11>(x, k),
+                next,
+            )
+        }
+    }
+
+    /// As [`fold512`] for two 128-bit lanes (AVX2 with VPCLMULQDQ).
+    #[inline(always)]
+    unsafe fn fold256(
+        x: core::arch::x86_64::__m256i,
+        k: core::arch::x86_64::__m256i,
+        next: core::arch::x86_64::__m256i,
+    ) -> core::arch::x86_64::__m256i {
+        use core::arch::x86_64::*;
+        // SAFETY: only inlined into functions that enable `avx2,vpclmulqdq`.
+        unsafe {
+            _mm256_xor_si256(
+                _mm256_xor_si256(
+                    _mm256_clmulepi64_epi128::<0x00>(x, k),
+                    _mm256_clmulepi64_epi128::<0x11>(x, k),
+                ),
+                next,
+            )
+        }
+    }
+
+    /// As [`fold512`] for one 128-bit lane.
+    #[inline(always)]
+    unsafe fn fold128(
+        x: core::arch::x86_64::__m128i,
+        k: core::arch::x86_64::__m128i,
+        next: core::arch::x86_64::__m128i,
+    ) -> core::arch::x86_64::__m128i {
+        use core::arch::x86_64::*;
+        // SAFETY: only inlined into functions that enable `pclmulqdq`.
+        unsafe {
+            _mm_xor_si128(
+                _mm_xor_si128(
+                    _mm_clmulepi64_si128::<0x00>(x, k),
+                    _mm_clmulepi64_si128::<0x11>(x, k),
+                ),
+                next,
+            )
+        }
+    }
+
+    /// The fold constants for a distance of `bits`, in one 128-bit lane.
+    #[inline(always)]
+    unsafe fn lane_constants(bits: u32) -> core::arch::x86_64::__m128i {
+        use core::arch::x86_64::*;
+        // SAFETY: SSE2 is a baseline x86_64 feature.
+        unsafe {
+            _mm_set_epi64x(
+                fold_constant(bits - 32) as i64,
+                fold_constant(bits + 32) as i64,
+            )
+        }
+    }
+
+    /// Carry-less multiply folding over four 512-bit accumulators (256 bytes per round).
+    /// `data.len() >= 256`.
+    #[target_feature(enable = "avx512f,vpclmulqdq,pclmulqdq,sse4.1,ssse3")]
+    unsafe fn crc32_vpclmul512(crc: u32, data: &[u8]) -> u32 {
+        use core::arch::x86_64::*;
+        debug_assert!(data.len() >= 256);
+        // SAFETY: the caller guarantees the CPU features and `data.len() >= 256`; every load
+        // reads within `data`.
+        unsafe {
+            let mut p = data.as_ptr();
+            let mut len = data.len();
+            let load = |q: *const u8| _mm512_loadu_si512(q as *const __m512i);
+            let mut x = [load(p), load(p.add(64)), load(p.add(128)), load(p.add(192))];
+            x[0] = _mm512_xor_si512(x[0], _mm512_zextsi128_si512(_mm_cvtsi32_si128(crc as i32)));
+            p = p.add(256);
+            len -= 256;
+            let k2048 = _mm512_broadcast_i32x4(lane_constants(2048));
+            while len >= 256 {
+                for (i, xi) in x.iter_mut().enumerate() {
+                    *xi = fold512(*xi, k2048, load(p.add(64 * i)));
+                }
+                p = p.add(256);
+                len -= 256;
+            }
+            let k512 = _mm512_broadcast_i32x4(lane_constants(512));
+            let y = fold512(fold512(fold512(x[0], k512, x[1]), k512, x[2]), k512, x[3]);
+            let k128 = lane_constants(128);
+            let mut x1 = _mm512_extracti32x4_epi32::<0>(y);
+            x1 = fold128(x1, k128, _mm512_extracti32x4_epi32::<1>(y));
+            x1 = fold128(x1, k128, _mm512_extracti32x4_epi32::<2>(y));
+            x1 = fold128(x1, k128, _mm512_extracti32x4_epi32::<3>(y));
+            finish(x1, p, len)
+        }
+    }
+
+    /// Carry-less multiply folding over four 256-bit accumulators (128 bytes per round).
+    /// `data.len() >= 128`.
+    #[target_feature(enable = "avx2,vpclmulqdq,pclmulqdq,sse4.1,ssse3")]
+    unsafe fn crc32_vpclmul256(crc: u32, data: &[u8]) -> u32 {
+        use core::arch::x86_64::*;
+        debug_assert!(data.len() >= 128);
+        // SAFETY: the caller guarantees the CPU features and `data.len() >= 128`; every load
+        // reads within `data`.
+        unsafe {
+            let mut p = data.as_ptr();
+            let mut len = data.len();
+            let load = |q: *const u8| _mm256_loadu_si256(q as *const __m256i);
+            let mut x = [load(p), load(p.add(32)), load(p.add(64)), load(p.add(96))];
+            x[0] = _mm256_xor_si256(x[0], _mm256_zextsi128_si256(_mm_cvtsi32_si128(crc as i32)));
+            p = p.add(128);
+            len -= 128;
+            let k1024 = _mm256_broadcastsi128_si256(lane_constants(1024));
+            while len >= 128 {
+                for (i, xi) in x.iter_mut().enumerate() {
+                    *xi = fold256(*xi, k1024, load(p.add(32 * i)));
+                }
+                p = p.add(128);
+                len -= 128;
+            }
+            let k256 = _mm256_broadcastsi128_si256(lane_constants(256));
+            let y = fold256(fold256(fold256(x[0], k256, x[1]), k256, x[2]), k256, x[3]);
+            let x1 = fold128(
+                _mm256_extracti128_si256::<0>(y),
+                lane_constants(128),
+                _mm256_extracti128_si256::<1>(y),
+            );
+            finish(x1, p, len)
+        }
+    }
+
+    /// Shortest input for [`crc32_vpclmul512`] and [`crc32_vpclmul256`]: below it the 128-bit
+    /// kernel's shorter reduction wins.
+    pub(super) const VPCLMUL512_MIN: usize = 512;
+    pub(super) const VPCLMUL256_MIN: usize = 256;
+
+    /// Widest carry-less multiply available, detected once: 2 = 512-bit, 1 = 256-bit, 0 = none.
+    fn vpclmul_width() -> u8 {
+        static WIDTH: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *WIDTH.get_or_init(|| {
+            use std::arch::is_x86_feature_detected as has;
+            if !has!("vpclmulqdq") {
+                0
+            } else if has!("avx512f") {
+                2
+            } else if has!("avx2") {
+                1
+            } else {
+                0
+            }
+        })
+    }
+
     pub fn update_raw(state: u32, data: &[u8]) -> u32 {
         if data.len() < 64 {
             return super::update_slice8_raw(state, data);
         }
-        // SAFETY: caller checked `available()`.
-        unsafe { crc32_pclmul(state, data) }
+        // SAFETY: caller checked `available()` (`pclmulqdq`, `sse4.1`); the wider kernels are
+        // only called when `vpclmul_width` found their features.
+        unsafe {
+            match vpclmul_width() {
+                2 if data.len() >= VPCLMUL512_MIN => crc32_vpclmul512(state, data),
+                1 | 2 if data.len() >= VPCLMUL256_MIN && is_avx2() => crc32_vpclmul256(state, data),
+                _ => crc32_pclmul(state, data),
+            }
+        }
+    }
+
+    fn is_avx2() -> bool {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+
+    /// Every kernel the CPU has, for tests that compare each against the reference.
+    #[cfg(test)]
+    pub(super) fn each_kernel(state: u32, data: &[u8]) -> Vec<(&'static str, u32)> {
+        let mut out = Vec::new();
+        // SAFETY: each kernel runs only when its features were detected and the input is long
+        // enough for it.
+        unsafe {
+            if data.len() >= 64 {
+                out.push(("pclmul", crc32_pclmul(state, data)));
+            }
+            if vpclmul_width() >= 1 && is_avx2() && data.len() >= 128 {
+                out.push(("vpclmul256", crc32_vpclmul256(state, data)));
+            }
+            if vpclmul_width() == 2 && data.len() >= 256 {
+                out.push(("vpclmul512", crc32_vpclmul512(state, data)));
+            }
+        }
+        out
     }
 }
 
@@ -773,7 +984,7 @@ mod tests {
     fn kernels_agree_with_bitwise_reference() {
         for len in [
             0usize, 1, 7, 8, 15, 16, 63, 64, 65, 127, 128, 129, 143, 144, 255, 256, 257, 271, 383,
-            384, 1000, 4096, 70_000, 200_001,
+            384, 511, 512, 513, 527, 767, 768, 1000, 1023, 1024, 1025, 4096, 70_000, 200_001,
         ] {
             let data = pseudo_random(len, len as u64 + 1);
             let expect = bitwise_crc(&data);
@@ -785,7 +996,7 @@ mod tests {
             assert_eq!(crc32(&data), expect, "dispatch len={len}");
             if hw::available() {
                 assert_eq!(hw::update_raw(INIT, &data) ^ INIT, expect, "hw len={len}");
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
                 for (name, got) in hw::each_kernel(INIT, &data) {
                     assert_eq!(got ^ INIT, expect, "{name} len={len}");
                 }
