@@ -783,8 +783,12 @@ impl Kernel {
         out
     }
 
-    /// The fastest kernel this CPU can run.
+    /// The fastest kernel this CPU can run (the portable one when [`crate::cpu::SIMD_ENV`]
+    /// turns the CPU-specific paths off).
     pub(crate) fn best() -> Kernel {
+        if !crate::cpu::simd_enabled() {
+            return Kernel::Portable;
+        }
         #[cfg(target_arch = "aarch64")]
         return Kernel::Neon;
         #[cfg(target_arch = "x86_64")]
@@ -805,9 +809,12 @@ impl Kernel {
             Kernel::Neon => run::<neon::V, GROUPS>(msgs, out),
             #[cfg(target_arch = "x86_64")]
             Kernel::Sse2 => run::<sse2::V, GROUPS>(msgs, out),
-            // SAFETY: `Avx2` is only produced when the CPU has AVX2.
             #[cfg(target_arch = "x86_64")]
-            Kernel::Avx2 => unsafe { run_avx2(msgs, out) },
+            Kernel::Avx2 => {
+                assert!(std::arch::is_x86_feature_detected!("avx2"));
+                // SAFETY: checked just above (a cached atomic load).
+                unsafe { run_avx2(msgs, out) }
+            }
         }
     }
 
@@ -819,9 +826,12 @@ impl Kernel {
             Kernel::Neon => stream_dispatch::<neon::V, GROUPS>(states, blocks),
             #[cfg(target_arch = "x86_64")]
             Kernel::Sse2 => stream_dispatch::<sse2::V, GROUPS>(states, blocks),
-            // SAFETY: `Avx2` is only produced when the CPU has AVX2.
             #[cfg(target_arch = "x86_64")]
-            Kernel::Avx2 => unsafe { stream_avx2(states, blocks) },
+            Kernel::Avx2 => {
+                assert!(std::arch::is_x86_feature_detected!("avx2"));
+                // SAFETY: checked just above (a cached atomic load).
+                unsafe { stream_avx2(states, blocks) }
+            }
         }
     }
 }
@@ -920,7 +930,11 @@ mod tests {
             .collect();
         let expect: Vec<[u8; 16]> = bufs.iter().map(|b| md5(b)).collect();
         let kernels = Kernel::available();
-        assert_eq!(kernels[0], Kernel::best());
+        if crate::cpu::simd_enabled() {
+            assert_eq!(kernels[0], Kernel::best());
+        } else {
+            assert_eq!(Kernel::best(), Kernel::Portable);
+        }
         for kernel in kernels {
             // Every batch size, so each group count and partial group runs.
             for count in 2..=bufs.len() {

@@ -147,8 +147,14 @@ lookups per slice instead of a 32-step multiply) once a set has enough slices to
 
 What makes the hashing phases fast:
 
-* **Multi-lane MD5** (`md5simd`): per-slice digests are independent messages, so 16 of them share
-  one NEON/SSE2 instruction stream (4 lanes × 4 interleaved groups to hide the chain latency).
+* **Multi-lane MD5** (`md5simd`): per-slice digests are independent messages, so they share one
+  vector instruction stream: 32 on NEON (4 lanes × 8 interleaved groups to hide the chain
+  latency), 16 on AVX2 (8 lanes × 2) or SSE2 (4 × 4).
+* **CRC-32**: `pmull` folding on `AArch64` (about 60 GB/s per M4 core at any size from 128
+  bytes), `pclmulqdq` folding on `x86_64`.
+* **CPU-specific paths** are all chosen at runtime with a portable fallback, so one binary runs
+  on any `x86_64` or `AArch64` CPU. Set `PAR_RS_SIMD=off` to force the fallbacks (`just test`
+  runs the suite both ways).
 * **Parallel hashing** (`parhash`): slice CRC+MD5 jobs are spread over all cores; whole-file MD5
   chains run one file per thread.
 * **Verify** checks every slice at its expected offset first (all cores); only files that fail get

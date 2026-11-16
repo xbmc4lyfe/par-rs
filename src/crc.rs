@@ -576,10 +576,11 @@ pub enum CrcKernel {
 
 static KERNEL: OnceLock<CrcKernel> = OnceLock::new();
 
-/// The CRC kernel selected for this process (detected once).
+/// The CRC kernel selected for this process (detected once; the table kernel when
+/// [`crate::cpu::SIMD_ENV`] turns the CPU-specific paths off).
 pub fn kernel() -> CrcKernel {
     *KERNEL.get_or_init(|| {
-        if hw::available() {
+        if crate::cpu::simd_enabled() && hw::available() {
             CrcKernel::Hardware
         } else {
             CrcKernel::Software
