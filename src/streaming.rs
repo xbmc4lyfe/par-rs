@@ -291,6 +291,7 @@ impl Par2Repairer {
             st.stats.blocks_folded += 1;
         }
         self.streaming = Some(st);
+        self.streamed_since_finalize = true;
         Ok(self.streaming_status().expect("just enabled"))
     }
 
