@@ -64,9 +64,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Sapphire Rapids: AVX-512 (BW, VBMI), GFNI, VPCLMULQDQ. Alder Lake: AVX2 with VEX GFNI
-        # and VPCLMULQDQ, no AVX-512. Coffee Lake: AVX2 only (the oldest supported CPU).
-        cpu: [spr, adl, cfl]
+        # Sapphire Rapids: AVX-512 (BW, VBMI), GFNI, VPCLMULQDQ. Skylake server: AVX-512 without
+        # GFNI or VPCLMULQDQ. Alder Lake: AVX2 with VEX GFNI and VPCLMULQDQ, no AVX-512. Skylake
+        # client: AVX2 only, the same instruction set as Coffee Lake (the oldest supported CPU).
+        cpu: [spr, skx, adl, skl]
     steps:
       - name: Check out the repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
