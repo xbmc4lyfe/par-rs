@@ -77,6 +77,8 @@ struct Pool<'a> {
     stop: AtomicBool,
     cancel: Option<&'a AtomicBool>,
     out: Mutex<Vec<(u32, [u8; 16])>>,
+    /// Ask the OS not to cache what is read ([`crate::fsio::read_uncached`]).
+    uncached: bool,
 }
 
 impl Pool<'_> {
@@ -116,7 +118,11 @@ impl Pool<'_> {
                     && file.as_ref().map(|(i, _)| *i) != Some(ranges[0].file)
                 {
                     drop(file.take());
-                    file = Some((ranges[0].file, File::open(self.paths[ranges[0].file])?));
+                    let f = File::open(self.paths[ranges[0].file])?;
+                    if self.uncached {
+                        crate::fsio::read_uncached(&f);
+                    }
+                    file = Some((ranges[0].file, f));
                 }
                 let mut scalar = (ranges.len() == 1).then(Md5::new);
                 let mut states = vec![MD5_INIT; ranges.len()];
@@ -235,6 +241,28 @@ pub(crate) fn hash_ranges_parallel_with_budget(
     cancel: Option<&AtomicBool>,
     progress: &mut dyn FnMut(u64),
 ) -> io::Result<Vec<(u32, [u8; 16])>> {
+    hash_ranges_budgeted(
+        paths,
+        ranges,
+        threads,
+        memory_bytes,
+        cancel,
+        false,
+        progress,
+    )
+}
+
+/// [`hash_ranges_parallel_with_budget`]; `uncached` asks the OS not to cache what is read
+/// (for files read once, such as recovery volumes).
+pub(crate) fn hash_ranges_budgeted(
+    paths: &[&Path],
+    ranges: &[HashRange],
+    threads: usize,
+    memory_bytes: u64,
+    cancel: Option<&AtomicBool>,
+    uncached: bool,
+    progress: &mut dyn FnMut(u64),
+) -> io::Result<Vec<(u32, [u8; 16])>> {
     if ranges.is_empty() {
         return Ok(Vec::new());
     }
@@ -280,6 +308,7 @@ pub(crate) fn hash_ranges_parallel_with_budget(
         stop: AtomicBool::new(false),
         cancel,
         out: Mutex::new(vec![(0u32, [0u8; 16]); ranges.len()]),
+        uncached,
     };
     std::thread::scope(|s| {
         for _ in 1..threads {

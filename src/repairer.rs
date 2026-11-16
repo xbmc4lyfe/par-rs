@@ -571,6 +571,8 @@ pub struct Par2Repairer {
     pub(crate) streaming: Option<crate::streaming::SyndromeState>,
     /// Whether [`purge`](Self::purge) may remove files, and the leftovers it would remove.
     pub(crate) purge_state: purge::PurgeState,
+    /// See [`set_uncached_recovery_reads`](Self::set_uncached_recovery_reads).
+    pub(crate) uncached_recovery_reads: bool,
 }
 
 impl Par2Repairer {
@@ -597,6 +599,7 @@ impl Par2Repairer {
             quick_verified_files: 0,
             streaming: None,
             purge_state: purge::PurgeState::default(),
+            uncached_recovery_reads: false,
         }
     }
 
@@ -613,6 +616,16 @@ impl Par2Repairer {
 
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Keep recovery volumes out of the page cache during [`repair`](Self::repair). A repair
+    /// reads them once (packet checks, then reconstruction), and gigabytes of them would push
+    /// out data the host still wants cached, such as the files it extracts next. On macOS the
+    /// reads use `F_NOCACHE`; on Linux their cached pages are dropped with
+    /// `posix_fadvise(DONTNEED)` once reconstruction ends. Off by default; results do not
+    /// change.
+    pub fn set_uncached_recovery_reads(&mut self, on: bool) {
+        self.uncached_recovery_reads = on;
     }
 
     /// Options.
@@ -1042,12 +1055,13 @@ impl Par2Repairer {
                 None => expected.push(None),
             }
         }
-        let digests = hash_ranges_parallel_with_budget(
+        let digests = crate::parhash::hash_ranges_budgeted(
             &paths,
             &ranges,
             self.hash_threads(),
             self.verification_memory(),
             Some(&self.cancel),
+            self.uncached_recovery_reads,
             &mut |_| {},
         )
         .map_err(hash_err)?;
@@ -1808,11 +1822,15 @@ impl Par2Repairer {
     // Repair
     // -----------------------------------------------------------------------------------------
 
-    /// Preserve the damaged original under its backup name. The backup is a copy (a reflink
-    /// clone where the file system offers one, so it costs nothing) and the original stays in
-    /// place to be patched; returns `(backup, in_place)`. When the copy fails (no space on a
-    /// file system without reflinks) the original is renamed instead and `in_place` is false.
-    fn make_backup(&self, path: &Path) -> Result<(PathBuf, bool), RepairError> {
+    /// Preserve the damaged original under its backup name. The backup is a copy (a
+    /// copy-on-write clone where the file system offers one: `clonefile` on APFS, `FICLONE` on
+    /// btrfs and XFS, so it costs no data writes) and the original stays in
+    /// place to be patched; returns the backup and how it was copied. When the copy fails (no
+    /// space on a file system without clones) the original is renamed instead (`None`).
+    fn make_backup(
+        &self,
+        path: &Path,
+    ) -> Result<(PathBuf, Option<crate::fsio::CopyKind>), RepairError> {
         let mut n = 1;
         loop {
             let candidate = match self.options.backup {
@@ -1832,8 +1850,8 @@ impl Par2Repairer {
                 }
             };
             if !candidate.exists() {
-                if std::fs::copy(path, &candidate).is_ok() {
-                    return Ok((candidate, true));
+                if let Ok(kind) = crate::fsio::clone_or_copy(path, &candidate) {
+                    return Ok((candidate, Some(kind)));
                 }
                 let _ = std::fs::remove_file(&candidate);
                 std::fs::rename(path, &candidate).map_err(io_ctx(format!(
@@ -1841,7 +1859,7 @@ impl Par2Repairer {
                     path.display(),
                     candidate.display()
                 )))?;
-                return Ok((candidate, false));
+                return Ok((candidate, None));
             }
             n += 1;
         }
@@ -1907,13 +1925,19 @@ impl Par2Repairer {
             }
             let target = self.files[fi].target_path.clone();
             if target.is_file() {
-                let (backup, patched_in_place) = self.make_backup(&target)?;
+                let (backup, copied) = self.make_backup(&target)?;
+                let patched_in_place = copied.is_some();
                 observer.message(
                     Level::Info,
                     &format!(
-                        "Kept damaged file {} as {}",
+                        "Kept damaged file {} as {}{}",
                         target.display(),
-                        backup.display()
+                        backup.display(),
+                        match copied {
+                            Some(crate::fsio::CopyKind::Clone) => " (copy-on-write clone)",
+                            Some(crate::fsio::CopyKind::Copy) => " (copy)",
+                            None => " (renamed)",
+                        }
                     ),
                 );
                 // Blocks located in the target are read from the pristine backup from now on
@@ -2056,6 +2080,11 @@ impl Par2Repairer {
             .collect();
         let mut blocks_recovered = 0u64;
         if !missing_globals.is_empty() {
+            // Recovery volumes are read from here to the end of this block (or an early
+            // return): drop what they left in the page cache afterwards.
+            let _uncache = self
+                .uncached_recovery_reads
+                .then(|| DropCachedOnExit(self.par_files.clone()));
             let logs =
                 input_constant_logs(self.locations.len()).map_err(|_| RepairError::Singular)?;
             let present: Vec<bool> = self
@@ -2136,6 +2165,9 @@ impl Par2Repairer {
                 let fidx = reader
                     .file_index(path)
                     .map_err(io_ctx(format!("opening {}", path.display())))?;
+                if self.uncached_recovery_reads {
+                    crate::fsio::read_uncached(&reader.files[fidx]);
+                }
                 let sidx = reader.slices.len();
                 reader
                     .slices
@@ -2373,6 +2405,18 @@ impl Par2Repairer {
         self.files[fi].status = FileStatus::Complete;
         self.files[fi].complete_file = Some(target);
         self.files[fi].target_exists = true;
+    }
+}
+
+/// Drops the cached pages of its files when it goes out of scope
+/// ([`crate::fsio::drop_cached`]).
+struct DropCachedOnExit(Vec<PathBuf>);
+
+impl Drop for DropCachedOnExit {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            crate::fsio::drop_cached(p);
+        }
     }
 }
 

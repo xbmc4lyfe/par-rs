@@ -123,6 +123,7 @@ name = "par-rs"
 version = "0.2.0"
 dependencies = [
  "crc32fast",
+ "libc",
  "md-5",
  "memchr",
  "memmap2",
