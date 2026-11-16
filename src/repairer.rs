@@ -656,7 +656,10 @@ impl Par2Repairer {
     /// another file) and check each against its MD5 and CRC-32, instead of every slice of
     /// every rebuilt file. An in-place repair of a large file with a few damaged slices then
     /// reads a few slices instead of the whole file. Slices the repair did not write keep the
-    /// verdict of the verify before it, and files that were not repaired keep theirs.
+    /// verdict of the verify before it, and files that were not repaired keep theirs. That
+    /// verdict counts only when the verify matched the slice on disk against its MD5: files
+    /// that were quick-verified from download CRCs, and every file during a streaming session
+    /// (which checks the bytes it was handed, not the file), are read back in full.
     ///
     /// The result is slice-verified, never purge-safe: [`last_repair_check`] reports
     /// [`RepairCheck::RebuiltSlices`] and [`purge`](Self::purge) keeps every file. Files
@@ -2060,11 +2063,16 @@ impl Par2Repairer {
         }
         let mut copied: u64 = 0;
         let mut buf = vec![0u8; (ss as usize).clamp(4, 4 << 20)];
-        // Per rebuilt file: the slices an in-place repair leaves untouched (not written).
+        // Per rebuilt file: the slices an in-place repair leaves untouched (not written) and
+        // whose bytes on disk an earlier verify matched against their MD5. Streaming checks
+        // the bytes it was handed rather than the file, and quick verification trusts the
+        // download CRCs, so their files have no such slices.
         let mut untouched: HashMap<usize, Vec<bool>> = HashMap::new();
+        let streaming_session = self.streaming.is_some();
         for &fi in &to_rebuild {
             let f = &self.files[fi];
             let mut kept = vec![false; f.block_count as usize];
+            let md5_checked_on_disk = !streaming_session && !f.quick_verified;
             // A damaged original patched in place already holds its good blocks at their
             // natural offsets; only blocks that live elsewhere are copied in.
             let cloned_from = in_place.get(&fi).copied();
@@ -2089,7 +2097,7 @@ impl Par2Repairer {
                 };
                 if cloned_from == Some(loc.file) && loc.offset == u64::from(b) * ss {
                     // Already in place through the clone.
-                    kept[b as usize] = true;
+                    kept[b as usize] = md5_checked_on_disk;
                     copied += 1;
                     continue;
                 }

@@ -2,8 +2,8 @@
 //! `Par2Repairer::set_verify_rebuilt_slices_only`: the post-repair check reads back only the
 //! slices the repair wrote, and the result is slice-verified, never purge-safe.
 use par_rs::{
-    NullObserver, Par2Repairer, PurgeKept, RepairCheck, RepairObserver, RepairOptions,
-    RepairResult, SetOptions, Stage, build_set,
+    NullObserver, Par2Repairer, PurgeKept, QuickInfo, RepairCheck, RepairObserver, RepairOptions,
+    RepairResult, Segment, SetOptions, Stage, build_set, crc::crc32,
 };
 use std::path::{Path, PathBuf};
 
@@ -150,5 +150,41 @@ fn no_read_back_without_verify_repaired() {
     r.repair(&mut NullObserver).unwrap();
     assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), a);
     assert_eq!(r.last_repair_check(), Some(RepairCheck::Skipped));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn quick_verified_files_are_read_back_in_full() {
+    // Slices placed from download CRCs were never MD5-checked on disk, so the check reads
+    // every slice of the file rather than trusting them.
+    let (dir, a, _) = fixture("quick", false);
+    let damaged = std::fs::read(dir.join("a.bin")).unwrap();
+    let segments: Vec<Segment> = damaged
+        .chunks(4096)
+        .enumerate()
+        .map(|(i, chunk)| Segment {
+            offset: (i * 4096) as i64,
+            size: chunk.len() as i64,
+            crc: crc32(chunk),
+            // The articles holding the three damaged bytes failed.
+            success: ![1usize, 12, 36].contains(&i),
+        })
+        .collect();
+    let mut r = Par2Repairer::new(&dir, RepairOptions::default());
+    r.set_verify_rebuilt_slices_only(true);
+    r.load_par2_set(&dir.join("set.par2")).unwrap();
+    r.finalize().unwrap();
+    let mut quick = |name: &str| -> Option<QuickInfo> {
+        (name == "a.bin").then(|| QuickInfo::Partial {
+            segments: segments.clone(),
+        })
+    };
+    let v = r.verify(Some(&mut quick), &mut NullObserver).unwrap();
+    assert_eq!(v.quick_verified_files, 1);
+    let mut obs = ReadBack::default();
+    r.repair(&mut obs).unwrap();
+    assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), a);
+    assert_eq!(r.last_repair_check(), Some(RepairCheck::RebuiltSlices));
+    assert_eq!(obs.max_permille, 1000);
     std::fs::remove_dir_all(&dir).unwrap();
 }
