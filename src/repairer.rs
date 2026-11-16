@@ -540,6 +540,24 @@ pub enum RepairResult {
     },
 }
 
+/// How [`Par2Repairer::repair`] checked what it rebuilt; see
+/// [`Par2Repairer::last_repair_check`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairCheck {
+    /// Every slice of every rebuilt file was read back and matched its checksums (the
+    /// default). Together with a full [`verify`](Par2Repairer::verify) before the repair, the
+    /// whole set is verified and [`purge`](Par2Repairer::purge) may remove files.
+    Full,
+    /// Only the slices the repair wrote (reconstructed or copied in) were read back and
+    /// matched their MD5 and CRC-32; slices an in-place repair left untouched kept the
+    /// verdict of the verify before it. The repaired files are slice-verified, not fully
+    /// verified: `purge` keeps everything. See
+    /// [`set_verify_rebuilt_slices_only`](Par2Repairer::set_verify_rebuilt_slices_only).
+    RebuiltSlices,
+    /// Nothing was read back (`RepairOptions::verify_repaired` is off).
+    Skipped,
+}
+
 /// The repairer.
 pub struct Par2Repairer {
     pub(crate) options: RepairOptions,
@@ -573,6 +591,10 @@ pub struct Par2Repairer {
     pub(crate) purge_state: purge::PurgeState,
     /// See [`set_uncached_recovery_reads`](Self::set_uncached_recovery_reads).
     pub(crate) uncached_recovery_reads: bool,
+    /// See [`set_verify_rebuilt_slices_only`](Self::set_verify_rebuilt_slices_only).
+    pub(crate) verify_rebuilt_slices_only: bool,
+    /// See [`last_repair_check`](Self::last_repair_check).
+    pub(crate) last_repair_check: Option<RepairCheck>,
 }
 
 impl Par2Repairer {
@@ -600,6 +622,8 @@ impl Par2Repairer {
             streaming: None,
             purge_state: purge::PurgeState::default(),
             uncached_recovery_reads: false,
+            verify_rebuilt_slices_only: false,
+            last_repair_check: None,
         }
     }
 
@@ -626,6 +650,29 @@ impl Par2Repairer {
     /// change.
     pub fn set_uncached_recovery_reads(&mut self, on: bool) {
         self.uncached_recovery_reads = on;
+    }
+
+    /// After a repair, read back only the slices it wrote (reconstructed, or copied in from
+    /// another file) and check each against its MD5 and CRC-32, instead of every slice of
+    /// every rebuilt file. An in-place repair of a large file with a few damaged slices then
+    /// reads a few slices instead of the whole file. Slices the repair did not write keep the
+    /// verdict of the verify before it, and files that were not repaired keep theirs.
+    ///
+    /// The result is slice-verified, never purge-safe: [`last_repair_check`] reports
+    /// [`RepairCheck::RebuiltSlices`] and [`purge`](Self::purge) keeps every file. Files
+    /// without slice checksums (no IFSC packet) are still hashed in full. Only applies when
+    /// `RepairOptions::verify_repaired` is on (the default). Off by default.
+    ///
+    /// [`last_repair_check`]: Self::last_repair_check
+    pub fn set_verify_rebuilt_slices_only(&mut self, on: bool) {
+        self.verify_rebuilt_slices_only = on;
+    }
+
+    /// How the last successful [`repair`](Self::repair) that rebuilt files checked them, or
+    /// `None` before any.
+    #[must_use]
+    pub fn last_repair_check(&self) -> Option<RepairCheck> {
+        self.last_repair_check
     }
 
     /// Options.
@@ -2013,8 +2060,11 @@ impl Par2Repairer {
         }
         let mut copied: u64 = 0;
         let mut buf = vec![0u8; (ss as usize).clamp(4, 4 << 20)];
+        // Per rebuilt file: the slices an in-place repair leaves untouched (not written).
+        let mut untouched: HashMap<usize, Vec<bool>> = HashMap::new();
         for &fi in &to_rebuild {
             let f = &self.files[fi];
+            let mut kept = vec![false; f.block_count as usize];
             // A damaged original patched in place already holds its good blocks at their
             // natural offsets; only blocks that live elsewhere are copied in.
             let cloned_from = in_place.get(&fi).copied();
@@ -2039,6 +2089,7 @@ impl Par2Repairer {
                 };
                 if cloned_from == Some(loc.file) && loc.offset == u64::from(b) * ss {
                     // Already in place through the clone.
+                    kept[b as usize] = true;
                     copied += 1;
                     continue;
                 }
@@ -2077,6 +2128,7 @@ impl Par2Repairer {
                 }
             }
             targets.insert(fi, target);
+            untouched.insert(fi, kept);
         }
 
         lap(observer, "target files");
@@ -2278,9 +2330,19 @@ impl Par2Repairer {
 
         // ---- 4. verify repaired files ----
         let mut failed: Vec<String> = Vec::new();
+        let slices_only = self.verify_rebuilt_slices_only;
+        let check = if !self.options.verify_repaired {
+            RepairCheck::Skipped
+        } else if slices_only {
+            RepairCheck::RebuiltSlices
+        } else {
+            RepairCheck::Full
+        };
         if self.options.verify_repaired {
             observer.stage(Stage::VerifyingRepaired);
             let ss = self.block_size();
+            // Slices read back per rebuilt file (all of them unless `slices_only`).
+            let mut checked: Vec<Vec<bool>> = Vec::with_capacity(to_rebuild.len());
             let paths: Vec<&Path> = to_rebuild
                 .iter()
                 .map(|&fi| self.files[fi].target_path.as_path())
@@ -2291,14 +2353,20 @@ impl Par2Repairer {
             for (k, &fi) in to_rebuild.iter().enumerate() {
                 let size = std::fs::metadata(paths[k]).map_or(0, |m| m.len());
                 sizes.push(size);
+                let n = self.files[fi].block_count as usize;
+                let read: Vec<bool> = match untouched.get(&fi) {
+                    Some(kept) if slices_only => kept.iter().map(|&k| !k).collect(),
+                    _ => vec![true; n],
+                };
                 if self.checksums[fi].is_some() {
-                    ranges.extend(slice_ranges(
-                        k,
-                        size,
-                        ss,
-                        u64::from(self.files[fi].block_count),
-                    ));
+                    ranges.extend(
+                        slice_ranges(k, size, ss, n as u64)
+                            .into_iter()
+                            .zip(&read)
+                            .filter_map(|(r, &read)| read.then_some(r)),
+                    );
                 }
+                checked.push(read);
                 if self.checksums[fi].is_none() || self.options.full_file_md5 {
                     full_idx.push(k);
                 }
@@ -2326,12 +2394,16 @@ impl Par2Repairer {
             for (k, &fi) in to_rebuild.iter().enumerate() {
                 let mut ok = sizes[k] == self.files[fi].file_length;
                 if let Some(exp) = self.checksums[fi].as_deref() {
-                    let n = self.files[fi].block_count as usize;
-                    let got = &results[cursor..cursor + n];
-                    cursor += n;
+                    let expected: Vec<&ChecksumEntry> = exp
+                        .iter()
+                        .zip(&checked[k])
+                        .filter_map(|(e, &read)| read.then_some(e))
+                        .collect();
+                    let got = &results[cursor..cursor + expected.len()];
+                    cursor += expected.len();
                     ok &= got
                         .iter()
-                        .zip(exp)
+                        .zip(expected)
                         .all(|((c, m), e)| *c == e.crc32 && *m == e.md5);
                 }
                 if let Some(j) = full_idx.iter().position(|&x| x == k) {
@@ -2354,6 +2426,18 @@ impl Par2Repairer {
         }
         if !failed.is_empty() {
             return Err(RepairError::VerificationFailed { files: failed });
+        }
+        if check == RepairCheck::RebuiltSlices {
+            observer.message(
+                Level::Info,
+                &format!(
+                    "Slice-verified the rebuilt slices of {} files (not a full verification)",
+                    to_rebuild.len()
+                ),
+            );
+        }
+        if !to_rebuild.is_empty() {
+            self.last_repair_check = Some(check);
         }
         // Leftovers: backups plus split fragments whose blocks were used and that are not targets.
         let mut leftovers: Vec<PathBuf> = backups;
@@ -2382,7 +2466,7 @@ impl Par2Repairer {
             .cloned()
             .collect();
         // Untouched files were hashed by a full verify; rebuilt ones were re-hashed just now.
-        self.purge_state.safe = self.options.verify_repaired
+        self.purge_state.safe = check == RepairCheck::Full
             && self.purge_state.fully_hashed
             && self.files.iter().all(|f| f.status == FileStatus::Complete);
         observer.progress(1000, "Repair complete");
