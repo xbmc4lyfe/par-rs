@@ -1564,24 +1564,28 @@ impl Par2Repairer {
         }
         let ss = self.block_size();
         let di = self.disk_file_index(&path);
-        for b in 0..self.files[fi].block_count {
-            self.set_location(
-                BlockRef {
-                    file_index: fi as u32,
-                    block_index: b,
-                },
-                BlockLocation {
-                    file: di,
-                    offset: u64::from(b) * ss,
-                },
-            );
+        // Every slice now lives at its natural offset in the file that passed; locations an
+        // earlier verify recorded for an older copy of it are replaced.
+        let first = self.files[fi].first_block;
+        let count = self.files[fi].block_count as usize;
+        for b in 0..count {
+            self.locations[first + b] = Some(BlockLocation {
+                file: di,
+                offset: b as u64 * ss,
+            });
         }
+        // Not hashed here: purging needs a verify that hashed every target itself.
+        self.purge_state.fully_hashed = false;
+        self.purge_state.safe = false;
         let f = &mut self.files[fi];
+        f.available_blocks = count as u32;
         f.target_exists = true;
         f.status = FileStatus::Complete;
         f.complete_file = Some(path);
-        f.quick_verified = true;
-        self.quick_verified_files += 1;
+        if !f.quick_verified {
+            f.quick_verified = true;
+            self.quick_verified_files += 1;
+        }
         observer.message(
             Level::Detail,
             &format!("Quickly verified good file {target_filename}"),

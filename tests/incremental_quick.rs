@@ -2,8 +2,8 @@
 //! `Par2Repairer::quick_verify_file`: verify files one by one as their downloads complete,
 //! and let the final verify skip the ones that passed.
 use par_rs::{
-    FileStatus, NullObserver, Par2Repairer, QuickInfo, RepairOptions, RepairResult, SetOptions,
-    build_set, crc::crc32, hasher::md5,
+    FileStatus, NullObserver, Par2Repairer, QuickInfo, RepairOptions, RepairResult, Segment,
+    SetOptions, build_set, crc::crc32, hasher::md5,
 };
 use std::path::PathBuf;
 
@@ -196,5 +196,87 @@ fn needs_finalize_and_never_makes_purge_safe() {
     assert!(r.verify(None, &mut NullObserver).unwrap().all_complete);
     let report = r.purge(&mut NullObserver);
     assert!(!report.entries.is_empty() && report.removed().next().is_none());
+    std::fs::remove_dir_all(&f.dir).unwrap();
+}
+
+#[test]
+fn a_pass_after_a_full_verify_still_blocks_purge() {
+    // A full verify while a.bin is missing and c.bin damaged; a.bin then arrives and passes
+    // on its download CRC alone. Nothing hashed a.bin, so purge must keep everything.
+    let f = fixture("after-verify");
+    std::fs::remove_file(f.dir.join("a.bin")).unwrap();
+    let mut bad_c = f.c.clone();
+    bad_c[10] ^= 1;
+    std::fs::write(f.dir.join("c.bin"), &bad_c).unwrap();
+    let mut r = repairer(&f);
+    r.verify(None, &mut NullObserver).unwrap();
+    std::fs::write(f.dir.join("a.bin"), &f.a).unwrap();
+    let ok = QuickInfo::Success { crc: crc32(&f.a) };
+    assert!(
+        r.quick_verify_file("a.bin", &ok, None, &mut NullObserver)
+            .unwrap()
+    );
+    assert!(matches!(
+        r.repair(&mut NullObserver).unwrap(),
+        RepairResult::Repaired { .. }
+    ));
+    assert_eq!(std::fs::read(f.dir.join("c.bin")).unwrap(), f.c);
+    let report = r.purge(&mut NullObserver);
+    assert!(report.removed().next().is_none(), "{report:?}");
+    assert!(f.dir.join("set.par2").exists());
+    std::fs::remove_dir_all(&f.dir).unwrap();
+}
+
+fn segments(bytes: &[u8], failed: &[usize]) -> Vec<Segment> {
+    bytes
+        .chunks(4096)
+        .enumerate()
+        .map(|(i, chunk)| Segment {
+            offset: (i * 4096) as i64,
+            size: chunk.len() as i64,
+            crc: crc32(chunk),
+            success: !failed.contains(&i),
+        })
+        .collect()
+}
+
+#[test]
+fn partial_passes_once_every_slice_is_intact_and_counts_once() {
+    let f = fixture("partial");
+    let mut r = repairer(&f);
+    // A verify with download info where one article of a.bin failed: quick-verified damaged.
+    let mut bad_a = f.a.clone();
+    bad_a[4096 * 3 + 7] ^= 1;
+    std::fs::write(f.dir.join("a.bin"), &bad_a).unwrap();
+    let failed = segments(&bad_a, &[3]);
+    let mut quick = |name: &str| -> Option<QuickInfo> {
+        (name == "a.bin").then(|| QuickInfo::Partial {
+            segments: failed.clone(),
+        })
+    };
+    let v = r.verify(Some(&mut quick), &mut NullObserver).unwrap();
+    assert_eq!(v.quick_verified_files, 1);
+    assert_eq!(status(&r, "a.bin"), FileStatus::Damaged);
+    // Still one failed article: no pass.
+    let info = QuickInfo::Partial {
+        segments: failed.clone(),
+    };
+    assert!(
+        !r.quick_verify_file("a.bin", &info, None, &mut NullObserver)
+            .unwrap()
+    );
+    // The article is downloaded again: every slice is intact now, and it passes.
+    std::fs::write(f.dir.join("a.bin"), &f.a).unwrap();
+    let info = QuickInfo::Partial {
+        segments: segments(&f.a, &[]),
+    };
+    assert!(
+        r.quick_verify_file("a.bin", &info, None, &mut NullObserver)
+            .unwrap()
+    );
+    assert_eq!(status(&r, "a.bin"), FileStatus::Complete);
+    let v = r.verify(None, &mut NullObserver).unwrap();
+    assert_eq!(v.quick_verified_files, 1, "counted once");
+    assert!(v.all_complete);
     std::fs::remove_dir_all(&f.dir).unwrap();
 }
