@@ -54,3 +54,41 @@ jobs:
           par2 --version
       - name: Run repository checks
         run: just ci
+
+  sde:
+    name: CPU-specific kernels under Intel SDE
+    # GitHub's x86 runners have AVX2 but not AVX-512, GFNI or VPCLMULQDQ. Intel's Software
+    # Development Emulator runs the kernel tests on emulated CPUs that do, so every runtime
+    # dispatch path is checked against the portable code, as Rust's stdarch CI does.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Sapphire Rapids: AVX-512 (BW, VBMI), GFNI, VPCLMULQDQ. Alder Lake: AVX2 with VEX GFNI
+        # and VPCLMULQDQ, no AVX-512. Coffee Lake: AVX2 only (the oldest supported CPU).
+        cpu: [spr, adl, cfl]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.100.0
+      - name: Install Intel SDE
+        env:
+          SDE: sde-external-10.13.1-2026-07-28-lin
+          SDE_SHA256: 94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://downloadmirror.intel.com/924984/$SDE.tar.xz" -o "$RUNNER_TEMP/sde.tar.xz"
+          echo "$SDE_SHA256  $RUNNER_TEMP/sde.tar.xz" | sha256sum --check --strict
+          tar -xJf "$RUNNER_TEMP/sde.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$SDE" >> "$GITHUB_PATH"
+      - name: Build the library tests
+        run: |
+          bin=$(cargo test --locked --release --lib --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test) | .executable' \
+            | tail -n 1)
+          echo "TEST_BIN=$bin" >> "$GITHUB_ENV"
+      - name: Run the kernel tests on the emulated CPU
+        run: sde64 -${{ matrix.cpu }} -- "$TEST_BIN" gf16 md5simd crc cpu
