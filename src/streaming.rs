@@ -3088,11 +3088,18 @@ impl StreamingParSession {
     /// exclusive payload gate). Without it, payloads may fold concurrently:
     /// every fold sets the slot's `folded_mask` under the slot lock, so a slice
     /// is folded into a slot exactly once by whichever path gets there first.
+    ///
+    /// The exclusive callers (`flush`) stop at the first slice that cannot be
+    /// re-read. A shared back-fill instead skips it (a slice verified from
+    /// RAM may not be committed to disk yet) and goes on with the rest; it
+    /// then returns that first error and stays pending, so a later call only
+    /// re-reads what is still missing.
     fn backfill_slots(
         &self,
         target_files: Option<&HashMap<usize, &File>>,
         flush: bool,
     ) -> Result<(), RepairError> {
+        let mut skipped: Option<RepairError> = None;
         self.inner.control.ensure_running()?;
         if flush {
             self.flush();
@@ -3129,7 +3136,15 @@ impl StreamingParSession {
             if needs.is_empty() {
                 continue;
             }
-            let data = self.read_slice_from_disk(g, target_files)?;
+            let data = match self.read_slice_from_disk(g, target_files) {
+                Ok(data) => data,
+                Err(e) if !flush && !matches!(e, RepairError::Cancelled) => {
+                    self.inner.control.ensure_running()?;
+                    skipped.get_or_insert(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let mut split = vec![0u8; ss];
             {
                 let (lo, hi) = split.split_at_mut(ss / 2);
@@ -3152,6 +3167,9 @@ impl StreamingParSession {
             self.inner.control.ensure_running()?;
         }
         self.inner.control.ensure_running()?;
+        if let Some(e) = skipped {
+            return Err(e);
+        }
         self.inner.needs_backfill.store(false, Ordering::Release);
         Ok(())
     }
