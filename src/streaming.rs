@@ -3392,6 +3392,28 @@ impl StreamingParSession {
         Self::schedule_unpause_beyond(&mut t, on_disk)
     }
 
+    /// A volume that was unpaused for recovery failed outright and left nothing
+    /// on disk: stop counting its blocks as in flight and re-run the volume
+    /// selector, so a replacement is fetched. The volume is not chosen again.
+    /// Returns an unpause instruction when more recovery blocks must be fetched.
+    pub fn on_recovery_volume_lost(&self, queued_id: u64) -> Option<UnpauseAction> {
+        if self.is_cancelled() {
+            return None;
+        }
+        {
+            let mut t = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            t.unpaused_in_flight.remove(&queued_id);
+            if let Some(v) = t.queued_volumes.iter_mut().find(|v| v.id == queued_id) {
+                v.paused = false;
+            }
+        }
+        self.request_unpause()
+    }
+
     /// Recovery slices of arrived volumes that were turned away because the
     /// slot cap was full (counted when framed, before hashing, so an upper
     /// bound). Raising the cap with
@@ -4517,6 +4539,45 @@ mod live_tests {
         assert!(b.set(0));
         assert_eq!(b.count_ones(), 2);
         assert!(b.get(129));
+    }
+
+    #[test]
+    fn lost_recovery_volume_is_replaced_and_not_chosen_again() {
+        let fx = fixture(
+            "lost",
+            &[20_000, 10_000],
+            1000,
+            12,
+            VolumeScheme::Uniform(1),
+        );
+        let s = StreamingParSession::new(
+            &fx.set,
+            &fx.dir,
+            SessionOptions {
+                preallocated_syndrome_slots: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (i, v) in fx.vols.iter().enumerate() {
+            s.register_queued_volume(QueuedVolume {
+                id: 100 + i as u64,
+                blocks: vol_blocks(v),
+                paused: true,
+            });
+        }
+        let f0 = fid(&fx, "part00.rar");
+        let (_, action) = s.on_article_failed_permanently(&f0, 2900, 700).unwrap();
+        let first = action.unwrap().volume_ids_to_unpause;
+        assert_eq!(first.len(), 2);
+        assert_eq!(s.status().unpaused_in_flight, 2);
+        // One of them fails outright: its block is fetched from another volume.
+        let again = s.on_recovery_volume_lost(first[0]).unwrap();
+        assert_eq!(again.volume_ids_to_unpause.len(), 1);
+        assert!(!first.contains(&again.volume_ids_to_unpause[0]));
+        assert_eq!(s.status().unpaused_in_flight, 2);
+        // Losing an unknown id changes nothing.
+        assert!(s.on_recovery_volume_lost(9999).is_none());
     }
 
     #[test]
