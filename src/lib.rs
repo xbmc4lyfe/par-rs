@@ -115,6 +115,7 @@ pub mod ffi;
     clippy::panic
 )]
 pub mod filenames;
+mod fsio;
 pub mod geometry;
 #[allow(
     clippy::indexing_slicing,
