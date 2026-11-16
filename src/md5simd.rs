@@ -3,34 +3,45 @@
 //!
 //! MD5 is a serial dependency chain (~5 cycles per step on one core, about 1 GB/s), but PAR2
 //! has to hash every slice separately: the per-slice IFSC digests are independent messages, so
-//! they can share one vector instruction stream. Each 128-bit vector carries four messages and
-//! [`GROUPS`] vectors are interleaved so the chain latency of one group is hidden by the others
-//! (eight on `AArch64`, whose 32 vector registers hold them; four on `x86_64`, which has 16).
+//! they can share one vector instruction stream. Each vector carries one message per 32-bit
+//! lane (four in 128 bits, eight in 256) and several vectors are interleaved so the chain
+//! latency of one group is hidden by the others.
 //! Equal-length messages (every PAR2 slice is zero padded to `slice_size`) run in perfect
 //! lockstep; mixed lengths are sorted and lanes idle once their message is finished.
 //!
 //! Results are bit-identical to the scalar `md5` implementation ([`md5_many`] is checked
-//! against it in the tests). NEON is used on `AArch64`, SSE2 on `x86_64`, a portable lane array
-//! elsewhere.
+//! against it in the tests). Kernels:
+//!
+//! - `AArch64`: NEON, [`GROUPS`] interleaved 4-lane vectors (eight fit the 32 vector registers);
+//! - `x86_64`: AVX2 when the CPU has it (detected at runtime), two interleaved 8-lane vectors;
+//!   otherwise SSE2, four interleaved 4-lane vectors (both fill the 16 vector registers);
+//! - elsewhere: a portable lane array.
 
-/// Interleaved 4-lane groups per kernel invocation.
+/// Interleaved 4-lane groups per kernel invocation (NEON, SSE2 and portable kernels).
 ///
 /// On an Apple M4 one core hashes 4.7 GB/s with four groups, 5.9 GB/s with six and 6.1 GB/s
 /// with eight (`examples/cpu_paths.rs`): four groups leave the NEON pipes waiting on the
 /// MD5 dependency chain.
 #[cfg(target_arch = "aarch64")]
 pub const GROUPS: usize = 8;
-/// Interleaved 4-lane groups per kernel invocation.
+/// Interleaved 4-lane groups per kernel invocation (NEON, SSE2 and portable kernels).
 #[cfg(not(target_arch = "aarch64"))]
 pub const GROUPS: usize = 4;
 /// Messages hashed per kernel pass; callers batching work should use multiples of this.
 pub const LANES: usize = 4 * GROUPS;
 
-/// Four 32-bit lanes.
+/// Widest vector in 32-bit lanes.
+const MAX_W: usize = 8;
+
+/// A vector of `W` 32-bit lanes.
 trait Lanes: Copy {
+    /// Lanes per vector (at most [`MAX_W`]).
+    const W: usize;
     fn splat(x: u32) -> Self;
-    fn from_words(w: &[u32; 4]) -> Self;
-    fn to_words(self) -> [u32; 4];
+    /// Vector from `w[..W]`.
+    fn from_words(w: &[u32]) -> Self;
+    /// Word in lane `l`.
+    fn lane(self, l: usize) -> u32;
     fn add(self, o: Self) -> Self;
     fn xor(self, o: Self) -> Self;
     fn or(self, o: Self) -> Self;
@@ -58,29 +69,31 @@ trait Lanes: Copy {
     fn i(b: Self, c: Self, d: Self) -> Self {
         c.xor(b.or(d.not()))
     }
-    /// Transpose four lanes' 16 message words into 16 lane vectors.
+    /// Transpose `W` lanes' 16 message words (`w.len() == W`) into 16 lane vectors.
     #[inline(always)]
-    fn transpose(w: &[[u32; 16]; 4]) -> [Self; 16] {
+    fn transpose(w: &[[u32; 16]]) -> [Self; 16] {
         let mut out = [Self::splat(0); 16];
         for (i, o) in out.iter_mut().enumerate() {
-            *o = Self::from_words(&[w[0][i], w[1][i], w[2][i], w[3][i]]);
+            let column: [u32; MAX_W] = std::array::from_fn(|l| w.get(l).map_or(0, |r| r[i]));
+            *o = Self::from_words(&column);
         }
         out
     }
 }
 
 impl Lanes for [u32; 4] {
+    const W: usize = 4;
     #[inline(always)]
     fn splat(x: u32) -> Self {
         [x; 4]
     }
     #[inline(always)]
-    fn from_words(w: &[u32; 4]) -> Self {
-        *w
+    fn from_words(w: &[u32]) -> Self {
+        [w[0], w[1], w[2], w[3]]
     }
     #[inline(always)]
-    fn to_words(self) -> [u32; 4] {
-        self
+    fn lane(self, l: usize) -> u32 {
+        self[l]
     }
     #[inline(always)]
     fn add(self, o: Self) -> Self {
@@ -142,22 +155,24 @@ mod neon {
     pub struct V(pub uint32x4_t);
 
     impl Lanes for V {
+        const W: usize = 4;
         #[inline(always)]
         fn splat(x: u32) -> Self {
             // SAFETY: `NEON` is a baseline AArch64 feature.
             V(unsafe { vdupq_n_u32(x) })
         }
         #[inline(always)]
-        fn from_words(w: &[u32; 4]) -> Self {
+        fn from_words(w: &[u32]) -> Self {
+            let w = &w[..4];
             // SAFETY: `w` has exactly four words.
             V(unsafe { vld1q_u32(w.as_ptr()) })
         }
         #[inline(always)]
-        fn to_words(self) -> [u32; 4] {
+        fn lane(self, l: usize) -> u32 {
             let mut out = [0u32; 4];
             // SAFETY: `out` has exactly four words.
             unsafe { vst1q_u32(out.as_mut_ptr(), self.0) };
-            out
+            out[l]
         }
         #[inline(always)]
         fn add(self, o: Self) -> Self {
@@ -205,7 +220,8 @@ mod neon {
             V(unsafe { veorq_u32(c.0, vornq_u32(b.0, d.0)) })
         }
         #[inline(always)]
-        fn transpose(w: &[[u32; 16]; 4]) -> [Self; 16] {
+        fn transpose(w: &[[u32; 16]]) -> [Self; 16] {
+            let w = &w[..4];
             let mut out = [Self::splat(0); 16];
             for q in 0..4 {
                 // SAFETY: each row has 16 words; `q * 4 + 3 < 16`.
@@ -250,22 +266,24 @@ mod sse2 {
     pub struct V(pub __m128i);
 
     impl Lanes for V {
+        const W: usize = 4;
         #[inline(always)]
         fn splat(x: u32) -> Self {
             // SAFETY: `SSE2` is a baseline x86_64 feature.
             V(unsafe { _mm_set1_epi32(x as i32) })
         }
         #[inline(always)]
-        fn from_words(w: &[u32; 4]) -> Self {
-            // SAFETY: unaligned load of 16 bytes from a 16-byte array.
+        fn from_words(w: &[u32]) -> Self {
+            let w = &w[..4];
+            // SAFETY: unaligned load of 16 bytes from a 16-byte slice.
             V(unsafe { _mm_loadu_si128(w.as_ptr() as *const __m128i) })
         }
         #[inline(always)]
-        fn to_words(self) -> [u32; 4] {
+        fn lane(self, l: usize) -> u32 {
             let mut out = [0u32; 4];
             // SAFETY: unaligned store of 16 bytes into a 16-byte array.
             unsafe { _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, self.0) };
-            out
+            out[l]
         }
         #[inline(always)]
         fn add(self, o: Self) -> Self {
@@ -308,7 +326,8 @@ mod sse2 {
             V(unsafe { _mm_or_si128(_mm_and_si128(b.0, d.0), _mm_andnot_si128(d.0, c.0)) })
         }
         #[inline(always)]
-        fn transpose(w: &[[u32; 16]; 4]) -> [Self; 16] {
+        fn transpose(w: &[[u32; 16]]) -> [Self; 16] {
+            let w = &w[..4];
             let mut out = [Self::splat(0); 16];
             for q in 0..4 {
                 // SAFETY: each row has 16 words; `q * 4 + 3 < 16`.
@@ -325,6 +344,133 @@ mod sse2 {
                     out[q * 4 + 1] = V(_mm_unpackhi_epi64(t0, t2));
                     out[q * 4 + 2] = V(_mm_unpacklo_epi64(t1, t3));
                     out[q * 4 + 3] = V(_mm_unpackhi_epi64(t1, t3));
+                }
+            }
+            out
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    //! Eight 32-bit lanes. These methods use AVX2 intrinsics and are only ever inlined into
+    //! the `#[target_feature(enable = "avx2")]` entry points below `run`.
+    use super::Lanes;
+    use std::arch::x86_64::*;
+
+    #[derive(Clone, Copy)]
+    pub struct V(pub __m256i);
+
+    impl Lanes for V {
+        const W: usize = 8;
+        #[inline(always)]
+        fn splat(x: u32) -> Self {
+            // SAFETY: only reached from `avx2` target-feature functions.
+            V(unsafe { _mm256_set1_epi32(x as i32) })
+        }
+        #[inline(always)]
+        fn from_words(w: &[u32]) -> Self {
+            let w = &w[..8];
+            // SAFETY: unaligned load of 32 bytes from a 32-byte slice; AVX2 as above.
+            V(unsafe { _mm256_loadu_si256(w.as_ptr() as *const __m256i) })
+        }
+        #[inline(always)]
+        fn lane(self, l: usize) -> u32 {
+            let mut out = [0u32; 8];
+            // SAFETY: unaligned store of 32 bytes into a 32-byte array; AVX2 as above.
+            unsafe { _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, self.0) };
+            out[l]
+        }
+        #[inline(always)]
+        fn add(self, o: Self) -> Self {
+            // SAFETY: AVX2 arithmetic, as above.
+            V(unsafe { _mm256_add_epi32(self.0, o.0) })
+        }
+        #[inline(always)]
+        fn xor(self, o: Self) -> Self {
+            // SAFETY: AVX2 arithmetic, as above.
+            V(unsafe { _mm256_xor_si256(self.0, o.0) })
+        }
+        #[inline(always)]
+        fn or(self, o: Self) -> Self {
+            // SAFETY: AVX2 arithmetic, as above.
+            V(unsafe { _mm256_or_si256(self.0, o.0) })
+        }
+        #[inline(always)]
+        fn and(self, o: Self) -> Self {
+            // SAFETY: AVX2 arithmetic, as above.
+            V(unsafe { _mm256_and_si256(self.0, o.0) })
+        }
+        #[inline(always)]
+        fn not(self) -> Self {
+            // SAFETY: AVX2 arithmetic, as above.
+            V(unsafe { _mm256_xor_si256(self.0, _mm256_set1_epi32(-1)) })
+        }
+        #[inline(always)]
+        fn rotl<const S: i32, const R: i32>(self) -> Self {
+            // SAFETY: AVX2 arithmetic, as above; `S` is 1..=31 and `R == 32 - S`.
+            V(unsafe {
+                _mm256_or_si256(
+                    _mm256_slli_epi32::<S>(self.0),
+                    _mm256_srli_epi32::<R>(self.0),
+                )
+            })
+        }
+        #[inline(always)]
+        fn f(b: Self, c: Self, d: Self) -> Self {
+            // SAFETY: AVX2 arithmetic, as above (`andnot(b, d)` = !b & d).
+            V(
+                unsafe {
+                    _mm256_or_si256(_mm256_and_si256(b.0, c.0), _mm256_andnot_si256(b.0, d.0))
+                },
+            )
+        }
+        #[inline(always)]
+        fn g(b: Self, c: Self, d: Self) -> Self {
+            // SAFETY: AVX2 arithmetic, as above (`andnot(d, c)` = !d & c).
+            V(
+                unsafe {
+                    _mm256_or_si256(_mm256_and_si256(b.0, d.0), _mm256_andnot_si256(d.0, c.0))
+                },
+            )
+        }
+        #[inline(always)]
+        fn transpose(w: &[[u32; 16]]) -> [Self; 16] {
+            let w = &w[..8];
+            let mut out = [Self::splat(0); 16];
+            for q in 0..2 {
+                // SAFETY: each row has 16 words and `q * 8 + 8 <= 16`; AVX2 as above.
+                unsafe {
+                    let r: [__m256i; 8] = std::array::from_fn(|l| {
+                        _mm256_loadu_si256(w[l].as_ptr().add(q * 8) as *const __m256i)
+                    });
+                    let t0 = _mm256_unpacklo_epi32(r[0], r[1]);
+                    let t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+                    let t2 = _mm256_unpacklo_epi32(r[2], r[3]);
+                    let t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+                    let t4 = _mm256_unpacklo_epi32(r[4], r[5]);
+                    let t5 = _mm256_unpackhi_epi32(r[4], r[5]);
+                    let t6 = _mm256_unpacklo_epi32(r[6], r[7]);
+                    let t7 = _mm256_unpackhi_epi32(r[6], r[7]);
+                    // Per 128-bit half: u0 = words 0 / 4, u1 = 1 / 5, u2 = 2 / 6, u3 = 3 / 7
+                    // of rows 0..4 (u4..u7: rows 4..8).
+                    let u0 = _mm256_unpacklo_epi64(t0, t2);
+                    let u1 = _mm256_unpackhi_epi64(t0, t2);
+                    let u2 = _mm256_unpacklo_epi64(t1, t3);
+                    let u3 = _mm256_unpackhi_epi64(t1, t3);
+                    let u4 = _mm256_unpacklo_epi64(t4, t6);
+                    let u5 = _mm256_unpackhi_epi64(t4, t6);
+                    let u6 = _mm256_unpacklo_epi64(t5, t7);
+                    let u7 = _mm256_unpackhi_epi64(t5, t7);
+                    let o = q * 8;
+                    out[o] = V(_mm256_permute2x128_si256::<0x20>(u0, u4));
+                    out[o + 1] = V(_mm256_permute2x128_si256::<0x20>(u1, u5));
+                    out[o + 2] = V(_mm256_permute2x128_si256::<0x20>(u2, u6));
+                    out[o + 3] = V(_mm256_permute2x128_si256::<0x20>(u3, u7));
+                    out[o + 4] = V(_mm256_permute2x128_si256::<0x31>(u0, u4));
+                    out[o + 5] = V(_mm256_permute2x128_si256::<0x31>(u1, u5));
+                    out[o + 6] = V(_mm256_permute2x128_si256::<0x31>(u2, u6));
+                    out[o + 7] = V(_mm256_permute2x128_si256::<0x31>(u3, u7));
                 }
             }
             out
@@ -464,9 +610,10 @@ fn block_words(msg: &[u8], t: usize, nblocks: usize, out: &mut [u32; 16]) {
     }
 }
 
-/// Smallest instantiated group count whose lanes hold `messages` (at most [`GROUPS`]).
-fn groups_for(messages: usize) -> usize {
-    match messages.div_ceil(4) {
+/// Smallest instantiated group count whose `w`-lane vectors hold `messages` (at most
+/// [`GROUPS`]; callers never pass more messages than their kernel's lanes).
+fn groups_for(messages: usize, w: usize) -> usize {
+    match messages.div_ceil(w) {
         0 | 1 => 1,
         2 => 2,
         3 | 4 => 4,
@@ -475,12 +622,15 @@ fn groups_for(messages: usize) -> usize {
     }
 }
 
+// `run`, `run_batch`, `stream_dispatch` and `stream_blocks` are `inline(always)` so that the
+// AVX2 entry points compile them, and the intrinsics they reach, with AVX2 enabled.
+#[inline(always)]
 fn run<L: Lanes, const G: usize>(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
     // Longest first so lockstep batches waste as little lane time as possible.
     let mut order: Vec<usize> = (0..msgs.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(msgs[i].len()));
-    for batch in order.chunks(4 * G) {
-        match groups_for(batch.len()) {
+    for batch in order.chunks(L::W * G) {
+        match groups_for(batch.len(), L::W) {
             1 => run_batch::<L, 1>(msgs, batch, out),
             2 => run_batch::<L, 2>(msgs, batch, out),
             4 => run_batch::<L, 4>(msgs, batch, out),
@@ -490,10 +640,13 @@ fn run<L: Lanes, const G: usize>(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
     }
 }
 
-/// Hash the messages `batch` indexes (at most `4 * G`) in lockstep.
+/// Hash the messages `batch` indexes (at most `W * G`) in lockstep.
+#[inline(always)]
 fn run_batch<L: Lanes, const G: usize>(msgs: &[&[u8]], batch: &[usize], out: &mut [[u8; 16]]) {
-    let lanes = 4 * G;
-    let mut words = [[0u32; 16]; 4];
+    let w = L::W;
+    let lanes = w * G;
+    let mut rows = [[0u32; 16]; MAX_W];
+    let words = &mut rows[..w];
     {
         let mut st = [[L::splat(0); 4]; G];
         for group in &mut st {
@@ -508,23 +661,23 @@ fn run_batch<L: Lanes, const G: usize>(msgs: &[&[u8]], batch: &[usize], out: &mu
         let mut m = [[L::splat(0); 16]; G];
         for t in 0..max_blocks {
             for (g, mg) in m.iter_mut().enumerate() {
-                for (l, w) in words.iter_mut().enumerate() {
-                    let lane = g * 4 + l;
+                for (l, row) in words.iter_mut().enumerate() {
+                    let lane = g * w + l;
                     match batch.get(lane) {
-                        Some(&i) => block_words(msgs[i], t, nblocks[lane], w),
-                        None => *w = [0; 16],
+                        Some(&i) => block_words(msgs[i], t, nblocks[lane], row),
+                        None => *row = [0; 16],
                     }
                 }
-                *mg = L::transpose(&words);
+                *mg = L::transpose(words);
             }
             compress::<L, G>(&mut st, &m);
             for (lane, &nb) in nblocks.iter().enumerate() {
                 if nb == t + 1 {
-                    let g = lane / 4;
-                    let l = lane % 4;
+                    let g = lane / w;
+                    let l = lane % w;
                     let mut digest = [0u8; 16];
                     for (j, s) in st[g].iter().enumerate() {
-                        digest[4 * j..4 * j + 4].copy_from_slice(&s.to_words()[l].to_le_bytes());
+                        digest[4 * j..4 * j + 4].copy_from_slice(&s.lane(l).to_le_bytes());
                     }
                     out[batch[lane]] = digest;
                 }
@@ -539,61 +692,154 @@ pub(crate) fn compress_blocks(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
     assert_eq!(states.len(), blocks.len());
     assert!(states.len() <= LANES);
     assert!(blocks.iter().all(|b| b.len().is_multiple_of(64)));
-    #[cfg(target_arch = "aarch64")]
-    stream_dispatch::<neon::V>(states, blocks);
-    #[cfg(target_arch = "x86_64")]
-    stream_dispatch::<sse2::V>(states, blocks);
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    stream_dispatch::<[u32; 4]>(states, blocks);
+    Kernel::best().stream(states, blocks);
 }
 
-fn stream_dispatch<L: Lanes>(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
+#[inline(always)]
+fn stream_dispatch<L: Lanes, const G: usize>(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
     if states.is_empty() {
         return;
     }
-    match groups_for(states.len()) {
-        1 => stream_blocks::<L, 1>(states, blocks),
-        2 => stream_blocks::<L, 2>(states, blocks),
-        4 => stream_blocks::<L, 4>(states, blocks),
-        6 => stream_blocks::<L, 6>(states, blocks),
-        _ => stream_blocks::<L, GROUPS>(states, blocks),
+    for (states, blocks) in states.chunks_mut(L::W * G).zip(blocks.chunks(L::W * G)) {
+        match groups_for(states.len(), L::W) {
+            1 => stream_blocks::<L, 1>(states, blocks),
+            2 => stream_blocks::<L, 2>(states, blocks),
+            4 => stream_blocks::<L, 4>(states, blocks),
+            6 => stream_blocks::<L, 6>(states, blocks),
+            _ => stream_blocks::<L, G>(states, blocks),
+        }
     }
 }
 
+#[inline(always)]
 fn stream_blocks<L: Lanes, const G: usize>(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
+    let w = L::W;
     let mut st = [[L::splat(0); 4]; G];
     for (g, group) in st.iter_mut().enumerate() {
         for (word, state) in group.iter_mut().enumerate() {
-            let lanes = std::array::from_fn(|lane| {
-                states.get(g * 4 + lane).map_or(INIT[word], |s| s[word])
+            let lanes: [u32; MAX_W] = std::array::from_fn(|lane| {
+                states.get(g * w + lane).map_or(INIT[word], |s| s[word])
             });
             *state = L::from_words(&lanes);
         }
     }
     let count = blocks.iter().map(|b| b.len() / 64).max().unwrap_or(0);
-    let mut words = [[0u32; 16]; 4];
+    let mut rows = [[0u32; 16]; MAX_W];
+    let words = &mut rows[..w];
     let mut messages = [[L::splat(0); 16]; G];
     for block in 0..count {
         for (g, message) in messages.iter_mut().enumerate() {
-            for (lane, words) in words.iter_mut().enumerate() {
+            for (lane, row) in words.iter_mut().enumerate() {
                 block_words(
-                    blocks.get(g * 4 + lane).copied().unwrap_or(&[]),
+                    blocks.get(g * w + lane).copied().unwrap_or(&[]),
                     block,
                     0,
-                    words,
+                    row,
                 );
             }
-            *message = L::transpose(&words);
+            *message = L::transpose(words);
         }
         compress::<L, G>(&mut st, &messages);
         for (lane, bytes) in blocks.iter().enumerate() {
             if bytes.len() / 64 == block + 1 {
-                for (word, state) in st[lane / 4].iter().enumerate() {
-                    states[lane][word] = state.to_words()[lane % 4];
+                for (word, state) in st[lane / w].iter().enumerate() {
+                    states[lane][word] = state.lane(lane % w);
                 }
             }
         }
     }
+}
+
+/// A multi-lane MD5 implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kernel {
+    /// Lane arrays, no SIMD.
+    Portable,
+    /// `AArch64` NEON.
+    #[cfg(target_arch = "aarch64")]
+    Neon,
+    /// `x86_64` SSE2.
+    #[cfg(target_arch = "x86_64")]
+    Sse2,
+    /// `x86_64` AVX2 (runtime detected).
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+}
+
+impl Kernel {
+    /// Every kernel this CPU can run, fastest first.
+    #[cfg(test)]
+    pub(crate) fn available() -> Vec<Kernel> {
+        #[cfg(target_arch = "aarch64")]
+        let out = vec![Kernel::Neon, Kernel::Portable];
+        #[cfg(target_arch = "x86_64")]
+        let out = if std::arch::is_x86_feature_detected!("avx2") {
+            vec![Kernel::Avx2, Kernel::Sse2, Kernel::Portable]
+        } else {
+            vec![Kernel::Sse2, Kernel::Portable]
+        };
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let out = vec![Kernel::Portable];
+        out
+    }
+
+    /// The fastest kernel this CPU can run.
+    pub(crate) fn best() -> Kernel {
+        #[cfg(target_arch = "aarch64")]
+        return Kernel::Neon;
+        #[cfg(target_arch = "x86_64")]
+        return if std::arch::is_x86_feature_detected!("avx2") {
+            Kernel::Avx2
+        } else {
+            Kernel::Sse2
+        };
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        return Kernel::Portable;
+    }
+
+    /// [`md5_many_into`] with this kernel (more than one message).
+    fn run(self, msgs: &[&[u8]], out: &mut [[u8; 16]]) {
+        match self {
+            Kernel::Portable => run::<[u32; 4], GROUPS>(msgs, out),
+            #[cfg(target_arch = "aarch64")]
+            Kernel::Neon => run::<neon::V, GROUPS>(msgs, out),
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Sse2 => run::<sse2::V, GROUPS>(msgs, out),
+            // SAFETY: `Avx2` is only produced when the CPU has AVX2.
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Avx2 => unsafe { run_avx2(msgs, out) },
+        }
+    }
+
+    /// [`compress_blocks`] with this kernel.
+    fn stream(self, states: &mut [[u32; 4]], blocks: &[&[u8]]) {
+        match self {
+            Kernel::Portable => stream_dispatch::<[u32; 4], GROUPS>(states, blocks),
+            #[cfg(target_arch = "aarch64")]
+            Kernel::Neon => stream_dispatch::<neon::V, GROUPS>(states, blocks),
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Sse2 => stream_dispatch::<sse2::V, GROUPS>(states, blocks),
+            // SAFETY: `Avx2` is only produced when the CPU has AVX2.
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Avx2 => unsafe { stream_avx2(states, blocks) },
+        }
+    }
+}
+
+/// Two interleaved 8-lane vectors: 16 lanes, the same [`LANES`] as SSE2.
+#[cfg(target_arch = "x86_64")]
+const AVX2_GROUPS: usize = 2;
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn run_avx2(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
+    run::<avx2::V, AVX2_GROUPS>(msgs, out);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn stream_avx2(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
+    stream_dispatch::<avx2::V, AVX2_GROUPS>(states, blocks);
 }
 
 /// MD5 of every message, in input order.
@@ -614,25 +860,14 @@ pub fn md5_many_into(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
         out[0] = crate::hasher::md5(msgs[0]);
         return;
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        run::<neon::V, GROUPS>(msgs, out);
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        run::<sse2::V, GROUPS>(msgs, out)
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        run::<[u32; 4], GROUPS>(msgs, out)
-    }
+    Kernel::best().run(msgs, out);
 }
 
 /// Portable reference (lane arrays, no SIMD); exposed for tests and self-checks.
 #[must_use]
 pub fn md5_many_portable(msgs: &[&[u8]]) -> Vec<[u8; 16]> {
     let mut out = vec![[0u8; 16]; msgs.len()];
-    run::<[u32; 4], 2>(msgs, &mut out);
+    Kernel::Portable.run(msgs, &mut out);
     out
 }
 
@@ -675,6 +910,40 @@ mod tests {
         for (i, m) in msgs.iter().enumerate() {
             assert_eq!(got[i], md5(m), "len {}", m.len());
             assert_eq!(portable[i], md5(m), "portable len {}", m.len());
+        }
+    }
+
+    #[test]
+    fn every_kernel_matches_scalar() {
+        let bufs: Vec<Vec<u8>> = (0..2 * LANES + 3)
+            .map(|i| data((i * 53) % 700 + i / 7 * 64, i as u32))
+            .collect();
+        let expect: Vec<[u8; 16]> = bufs.iter().map(|b| md5(b)).collect();
+        let kernels = Kernel::available();
+        assert_eq!(kernels[0], Kernel::best());
+        for kernel in kernels {
+            // Every batch size, so each group count and partial group runs.
+            for count in 2..=bufs.len() {
+                let msgs: Vec<&[u8]> = bufs[..count].iter().map(Vec::as_slice).collect();
+                let mut got = vec![[0u8; 16]; count];
+                kernel.run(&msgs, &mut got);
+                assert_eq!(got, expect[..count], "{kernel:?} count {count}");
+            }
+            // The resumable block API, fed in two steps.
+            for count in 1..=LANES {
+                let blocks: Vec<Vec<u8>> = (0..count)
+                    .map(|i| data(64 * (i % 5 + 1) * 2, 99 + i as u32))
+                    .collect();
+                let mut states = vec![INIT; count];
+                let halves: Vec<&[u8]> = blocks.iter().map(|b| &b[..b.len() / 2]).collect();
+                kernel.stream(&mut states, &halves);
+                let rest: Vec<&[u8]> = blocks.iter().map(|b| &b[b.len() / 2..]).collect();
+                kernel.stream(&mut states, &rest);
+                let mut reference = vec![INIT; count];
+                let all: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
+                Kernel::Portable.stream(&mut reference, &all);
+                assert_eq!(states, reference, "{kernel:?} stream count {count}");
+            }
         }
     }
 
