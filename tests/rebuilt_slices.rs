@@ -2,8 +2,9 @@
 //! `Par2Repairer::set_verify_rebuilt_slices_only`: the post-repair check reads back only the
 //! slices the repair wrote, and the result is slice-verified, never purge-safe.
 use par_rs::{
-    NullObserver, Par2Repairer, PurgeKept, QuickInfo, RepairCheck, RepairObserver, RepairOptions,
-    RepairResult, Segment, SetOptions, Stage, build_set, crc::crc32,
+    NullObserver, Par2Repairer, PurgeKept, QuickInfo, RepairCheck, RepairError, RepairObserver,
+    RepairOptions, RepairResult, Segment, SetOptions, Stage, StreamingOptions, build_set,
+    crc::crc32,
 };
 use std::path::{Path, PathBuf};
 
@@ -186,5 +187,36 @@ fn quick_verified_files_are_read_back_in_full() {
     assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), a);
     assert_eq!(r.last_repair_check(), Some(RepairCheck::RebuiltSlices));
     assert_eq!(obs.max_permille, 1000);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn slices_located_by_an_ended_streaming_session_are_read_back() {
+    // Streaming checks the bytes it is handed, not the file. Here it is handed the good bytes
+    // of slice 1 while the file on disk keeps a bad slice 1 (the write "failed"), then the
+    // session ends. Every slice is located, so the repair writes nothing; the slices-only
+    // check must still read slice 1 and fail the repair.
+    let (dir, a, _) = fixture("streamed", false);
+    let mut damaged = a.clone();
+    damaged[5000] ^= 0xFF;
+    std::fs::write(dir.join("a.bin"), &damaged).unwrap();
+    let mut r = Par2Repairer::new(&dir, RepairOptions::default());
+    r.set_verify_rebuilt_slices_only(true);
+    r.load_par2_set(&dir.join("set.par2")).unwrap();
+    r.finalize().unwrap();
+    let fi = r
+        .source_files()
+        .iter()
+        .position(|f| f.target_filename == "a.bin")
+        .unwrap();
+    r.enable_streaming(&StreamingOptions::default()).unwrap();
+    r.streaming_segment_data(fi, 4096, &a[4096..8192]).unwrap();
+    r.disable_streaming();
+    let v = r.verify(None, &mut NullObserver).unwrap();
+    assert_eq!(v.missing_blocks, 0, "{v:?}");
+    match r.repair(&mut NullObserver) {
+        Err(RepairError::VerificationFailed { files }) => assert_eq!(files, ["a.bin"]),
+        other => panic!("corrupt slice was not read back: {other:?}"),
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }

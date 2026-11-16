@@ -593,6 +593,9 @@ pub struct Par2Repairer {
     pub(crate) uncached_recovery_reads: bool,
     /// See [`set_verify_rebuilt_slices_only`](Self::set_verify_rebuilt_slices_only).
     pub(crate) verify_rebuilt_slices_only: bool,
+    /// A streaming session ran since [`finalize`](Self::finalize): the slices it located at
+    /// target offsets stay located after it ends, and were never checked on disk.
+    pub(crate) streamed_since_finalize: bool,
     /// See [`last_repair_check`](Self::last_repair_check).
     pub(crate) last_repair_check: Option<RepairCheck>,
 }
@@ -623,6 +626,7 @@ impl Par2Repairer {
             purge_state: purge::PurgeState::default(),
             uncached_recovery_reads: false,
             verify_rebuilt_slices_only: false,
+            streamed_since_finalize: false,
             last_repair_check: None,
         }
     }
@@ -658,8 +662,9 @@ impl Par2Repairer {
     /// reads a few slices instead of the whole file. Slices the repair did not write keep the
     /// verdict of the verify before it, and files that were not repaired keep theirs. That
     /// verdict counts only when the verify matched the slice on disk against its MD5: files
-    /// that were quick-verified from download CRCs, and every file during a streaming session
-    /// (which checks the bytes it was handed, not the file), are read back in full.
+    /// that were quick-verified from download CRCs, and every file once a streaming session
+    /// ran since [`finalize`](Self::finalize) (it checks the bytes it was handed, not the file,
+    /// and its slices stay located after it ends), are read back in full.
     ///
     /// The result is slice-verified, never purge-safe: [`last_repair_check`] reports
     /// [`RepairCheck::RebuiltSlices`] and [`purge`](Self::purge) keeps every file. Files
@@ -960,6 +965,7 @@ impl Par2Repairer {
         self.finalized = true;
         self.verified = false;
         self.streaming = None;
+        self.streamed_since_finalize = false;
         self.purge_state.reset_verdict();
         Ok(())
     }
@@ -2068,7 +2074,7 @@ impl Par2Repairer {
         // the bytes it was handed rather than the file, and quick verification trusts the
         // download CRCs, so their files have no such slices.
         let mut untouched: HashMap<usize, Vec<bool>> = HashMap::new();
-        let streaming_session = self.streaming.is_some();
+        let streaming_session = self.streamed_since_finalize || self.streaming.is_some();
         for &fi in &to_rebuild {
             let f = &self.files[fi];
             let mut kept = vec![false; f.block_count as usize];
