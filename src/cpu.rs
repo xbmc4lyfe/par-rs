@@ -2,8 +2,8 @@
 //! kernel is in use and how fast it runs ([`gf_kernel_benchmark`], for sizing thread counts and
 //! buffers).
 //!
-//! Every accelerated path is chosen at runtime: GF(2^16) kernels ([`crate::gf16::simd`]),
-//! hardware CRC-32 ([`crate::crc`]) and multi-lane MD5 ([`crate::md5simd`]). Each one checks
+//! Each accelerated path (the GF(2^16) kernels in [`crate::gf16::simd`], hardware CRC-32 in
+//! [`crate::crc`] and multi-lane MD5 in [`crate::md5simd`]) is chosen at runtime. Each one checks
 //! the CPU and falls back to portable code. Setting the environment variable
 //! [`SIMD_ENV`] (`PAR_RS_SIMD`) to `off` (or `0`, `false`, `no`, `scalar`) before the first
 //! use makes every one of them pick that portable fallback instead. Use it to test the
@@ -39,7 +39,7 @@ pub struct GfKernelReport {
     /// Every kernel this CPU supports that passes its self-test, fastest first (the scalar
     /// kernel is always last). Independent of [`SIMD_ENV`].
     pub supported: Vec<Isa>,
-    /// Multiply-accumulate throughput of `isa` on one thread, in MB/s (10^6 bytes): bytes of
+    /// Throughput of `isa` multiplying and accumulating on one thread, in MB/s (10^6 bytes): bytes of
     /// source data multiplied into one recovery or repaired slice per second. A repair of `m`
     /// slices from `n` inputs of `s` bytes does about `n * m * s` bytes of this work, so
     /// `n * m * s / (mb_per_sec_per_thread * 1e6 * threads)` estimates its compute time. The
