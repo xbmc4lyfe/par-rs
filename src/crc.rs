@@ -337,10 +337,11 @@ mod hw {
         super::fold_constant(128 - 32),
     ];
 
-    /// Shortest input [`crc32_pmull`] handles. On an Apple M4 it beats one `crc32x` stream from
-    /// here up (40 vs 20 GB/s at 128 bytes, 57 vs 11 GB/s at 1 KiB) and the three-stream
-    /// kernel at every size (about 60 vs 31 GB/s); see `examples/cpu_paths.rs`.
-    pub(super) const PMULL_MIN: usize = 128;
+    /// Shortest input given to [`crc32_pmull`] (it needs 128 bytes). Below this, crc32fast's
+    /// shorter fold is faster (setting up eight lanes costs more than it saves), and below
+    /// 32 bytes one `crc32x` stream is. On an Apple M4 the fold reaches about 70 GB/s from
+    /// 1 KiB up, against 31 GB/s for three `crc32x` streams; see `examples/cpu_paths.rs`.
+    pub(super) const PMULL_MIN: usize = 256;
 
     /// `x` folded forward by the distance `k` encodes, plus `next`.
     #[inline(always)]
@@ -353,12 +354,16 @@ mod hw {
         // SAFETY: the caller enables `aes` (which provides `pmull`).
         unsafe {
             let xp = vreinterpretq_p64_u64(x);
-            let lo = vmull_p64(vgetq_lane_p64::<0>(xp), vgetq_lane_p64::<0>(k));
-            let hi = vmull_high_p64(xp, k);
-            veorq_u64(
-                veorq_u64(vreinterpretq_u64_p128(lo), vreinterpretq_u64_p128(hi)),
-                next,
-            )
+            let lo =
+                vreinterpretq_u64_p128(vmull_p64(vgetq_lane_p64::<0>(xp), vgetq_lane_p64::<0>(k)));
+            let hi = vreinterpretq_u64_p128(vmull_high_p64(xp, k));
+            // A three-way XOR in one instruction where the target has it (every Apple chip:
+            // `sha3` is in the aarch64-apple-darwin baseline).
+            #[cfg(target_feature = "sha3")]
+            let sum = veor3q_u64(lo, hi, next);
+            #[cfg(not(target_feature = "sha3"))]
+            let sum = veorq_u64(veorq_u64(lo, hi), next);
+            sum
         }
     }
 
@@ -404,17 +409,30 @@ mod hw {
         std::arch::is_aarch64_feature_detected!("crc")
     }
 
+    /// crc32fast on the raw (inverted) register.
+    #[inline]
+    fn crc32fast_raw(state: u32, data: &[u8]) -> u32 {
+        let mut h = crc32fast::Hasher::new_with_initial(!state);
+        h.update(data);
+        !h.finalize()
+    }
+
     /// Whether `pmull` (part of the `aes` extension) is available, detected once.
+    #[inline]
     pub(super) fn pmull_available() -> bool {
         static PMULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *PMULL.get_or_init(|| std::arch::is_aarch64_feature_detected!("aes"))
     }
 
+    #[inline]
     pub fn update_raw(state: u32, data: &[u8]) -> u32 {
         // SAFETY: caller checked `available()`; `crc32_pmull` additionally needs `aes`.
         unsafe {
             if data.len() >= PMULL_MIN && pmull_available() {
                 crc32_pmull(state, data)
+            } else if data.len() >= 32 && data.len() < PMULL_MIN && pmull_available() {
+                // crc32fast's own pmull fold beats one `crc32x` stream on short inputs.
+                crc32fast_raw(state, data)
             } else if data.len() >= 64 * 1024 {
                 crc32_3way(state, data)
             } else {
@@ -434,6 +452,9 @@ mod hw {
             ];
             if data.len() >= 128 && pmull_available() {
                 out.push(("pmull", crc32_pmull(state, data)));
+            }
+            if pmull_available() {
+                out.push(("crc32fast", crc32fast_raw(state, data)));
             }
             out
         }
@@ -789,6 +810,7 @@ static KERNEL: OnceLock<CrcKernel> = OnceLock::new();
 
 /// The CRC kernel selected for this process (detected once; the table kernel when
 /// [`crate::cpu::SIMD_ENV`] turns the CPU-specific paths off).
+#[inline]
 pub fn kernel() -> CrcKernel {
     *KERNEL.get_or_init(|| {
         if crate::cpu::simd_enabled() && hw::available() {
@@ -1025,7 +1047,7 @@ mod tests {
         {
             expected.extend(["crc32x", "crc32x 3-way"]);
             if std::arch::is_aarch64_feature_detected!("aes") {
-                expected.push("pmull");
+                expected.extend(["pmull", "crc32fast"]);
             }
         }
         #[cfg(target_arch = "x86_64")]
