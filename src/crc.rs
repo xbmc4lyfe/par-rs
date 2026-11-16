@@ -409,6 +409,14 @@ mod hw {
         std::arch::is_aarch64_feature_detected!("crc")
     }
 
+    /// crc32fast on the raw (inverted) register.
+    #[inline]
+    fn crc32fast_raw(state: u32, data: &[u8]) -> u32 {
+        let mut h = crc32fast::Hasher::new_with_initial(!state);
+        h.update(data);
+        !h.finalize()
+    }
+
     /// Whether `pmull` (part of the `aes` extension) is available, detected once.
     #[inline]
     pub(super) fn pmull_available() -> bool {
@@ -422,11 +430,9 @@ mod hw {
         unsafe {
             if data.len() >= PMULL_MIN && pmull_available() {
                 crc32_pmull(state, data)
-            } else if data.len() >= 32 {
+            } else if data.len() >= 32 && data.len() < PMULL_MIN && pmull_available() {
                 // crc32fast's own pmull fold beats one `crc32x` stream on short inputs.
-                let mut h = crc32fast::Hasher::new_with_initial(!state);
-                h.update(data);
-                !h.finalize()
+                crc32fast_raw(state, data)
             } else if data.len() >= 64 * 1024 {
                 crc32_3way(state, data)
             } else {
@@ -446,6 +452,9 @@ mod hw {
             ];
             if data.len() >= 128 && pmull_available() {
                 out.push(("pmull", crc32_pmull(state, data)));
+            }
+            if pmull_available() {
+                out.push(("crc32fast", crc32fast_raw(state, data)));
             }
             out
         }
@@ -1038,7 +1047,7 @@ mod tests {
         {
             expected.extend(["crc32x", "crc32x 3-way"]);
             if std::arch::is_aarch64_feature_detected!("aes") {
-                expected.push("pmull");
+                expected.extend(["pmull", "crc32fast"]);
             }
         }
         #[cfg(target_arch = "x86_64")]
