@@ -25,7 +25,7 @@ mmap = ["dep:memmap2"]
 [dependencies]
 md-5 = { version = "0.10", default-features = false }
 memchr = { version = "2.7", default-features = false, features = ["std"] }
-crc32fast = "1.4"
+crc32fast = "1.5.5"
 thiserror = "2"
 rayon = { version = "1.10", optional = true }
 memmap2 = { version = "0.9", optional = true }
