@@ -3444,8 +3444,9 @@ impl StreamingParSession {
     /// Change the syndrome slot cap of a running session, so a caller can grow
     /// syndrome memory as damage appears instead of reserving it up front.
     ///
-    /// Each slot costs one slice of resident syndrome plus one slice of
-    /// reconstructed output during a repair; the caller budgets that memory.
+    /// Each slot costs one slice of resident syndrome; a repair adds one slice
+    /// of read-back buffer (rebuilt slices are written to their targets and
+    /// refolded from there). The caller budgets that memory.
     /// The cap is clamped to at least the slots already allocated (their
     /// syndromes are kept) and at most what the slice metadata budget
     /// (`max_working_bytes`) and the 16-bit exponent space allow.
@@ -4248,14 +4249,13 @@ impl StreamingParSession {
             let off = (g - f.first_slice) as u64 * ss as u64;
             out_map.push((fi, off, (f.length - off).min(ss as u64)));
         }
-        let mut recon: Vec<Vec<u8>> = rows.iter().map(|_| vec![0; ss]).collect();
+        // Rebuilt slices go straight to their targets; the refold below reads them back one
+        // at a time, so a repair holds one slice of output instead of one per damaged slice.
         let mut sink = |output: usize, offset: u64, data: &[u8]| -> io::Result<()> {
             if self.is_cancelled() {
                 return Err(io::Error::other("live session cancelled"));
             }
             let (fi, block_off, block_len) = out_map[output];
-            let buf = &mut recon[output];
-            buf[offset as usize..offset as usize + data.len()].copy_from_slice(data);
             if offset < block_len {
                 let n = ((block_len - offset) as usize).min(data.len());
                 let _write = self.inner.control.phase(RepairPhase::Write);
@@ -4320,9 +4320,14 @@ impl StreamingParSession {
                 .expect("file");
             let f = &self.inner.files[fi];
             let b = g - f.first_slice;
-            let (_, _, block_len) = out_map[ri];
-            let mut data = std::mem::take(&mut recon[ri]);
-            data.truncate(block_len as usize);
+            let (_, block_off, block_len) = out_map[ri];
+            // Read the rebuilt slice back from the target this repair just wrote (under the
+            // caller's lease when admitted), one slice at a time.
+            let mut data = vec![0u8; block_len as usize];
+            read_exact_at(targets[&fi].file(), block_off, &mut data).map_err(io_ctx(format!(
+                "re-reading repaired {}",
+                f.target_path.display()
+            )))?;
             {
                 let mut t = self
                     .inner
