@@ -57,9 +57,9 @@ jobs:
 
   sde:
     name: CPU-specific kernels under Intel SDE
-    # GitHub's x86 runners have AVX2 but not AVX-512, GFNI or VPCLMULQDQ. Intel's Software
-    # Development Emulator runs the kernel tests on emulated CPUs that do, so every runtime
-    # dispatch path is checked against the portable code, as Rust's stdarch CI does.
+    # GitHub's x86 runners vary and usually lack AVX-512, GFNI or VPCLMULQDQ. Intel's Software
+    # Development Emulator runs the kernel tests on emulated CPUs with known features, so every
+    # runtime dispatch path is checked against the portable code, as Rust's stdarch CI does.
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -87,9 +87,11 @@ jobs:
           echo "$RUNNER_TEMP/$SDE" >> "$GITHUB_PATH"
       - name: Build the library tests
         run: |
+          set -o pipefail
           bin=$(cargo test --locked --release --lib --no-run --message-format=json \
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test) | .executable' \
             | tail -n 1)
+          test -x "$bin"
           echo "TEST_BIN=$bin" >> "$GITHUB_ENV"
       - name: Run the kernel tests on the emulated CPU
         run: sde64 -${{ matrix.cpu }} -- "$TEST_BIN" gf16 md5simd crc cpu
