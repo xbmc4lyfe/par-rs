@@ -2461,10 +2461,16 @@ impl StreamingParSession {
 
     /// Run the volume selector if damage exceeds what is loaded or already in flight.
     fn schedule_unpause(t: &mut Tracker) -> Option<UnpauseAction> {
+        Self::schedule_unpause_beyond(t, 0)
+    }
+
+    /// The volume selector, counting `on_disk` further usable blocks (turned
+    /// away by the slot cap, absorbed again when it rises) as already here.
+    fn schedule_unpause_beyond(t: &mut Tracker, on_disk: i64) -> Option<UnpauseAction> {
         let damaged = t.counts[3] as i64;
         let ready = t.ready_exponents.len() as i64;
         let in_flight: i64 = t.unpaused_in_flight.values().map(|&b| i64::from(b)).sum();
-        let needed = damaged - ready - in_flight;
+        let needed = damaged - ready - in_flight - on_disk;
         if needed <= 0 {
             return None;
         }
@@ -3198,6 +3204,25 @@ impl StreamingParSession {
         let result = self.absorb_recovery_volume(path, queued_id);
         self.inner.control.ensure_running()?;
         result
+    }
+
+    /// Re-run the volume selector without new damage: when a volume that was
+    /// in flight arrives with fewer usable blocks than it promised, the
+    /// remaining shortfall would otherwise wait for the next damaged slice.
+    /// Recovery slices already on disk but turned away by the slot cap count
+    /// as here: fetching more cannot help until the cap rises. Returns an
+    /// unpause instruction when more recovery blocks must be fetched.
+    pub fn request_unpause(&self) -> Option<UnpauseAction> {
+        if self.is_cancelled() {
+            return None;
+        }
+        let on_disk = i64::try_from(self.turned_away_recovery_slices()).unwrap_or(i64::MAX);
+        let mut t = self
+            .inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::schedule_unpause_beyond(&mut t, on_disk)
     }
 
     /// Recovery slices of arrived volumes that were turned away because the
@@ -4333,6 +4358,42 @@ mod live_tests {
         // Repeated failure on the same slice: no new action.
         let (ev, action3) = s.on_article_failed_permanently(&f0, 5000, 10).unwrap();
         assert!(ev.is_empty() && action3.is_none());
+        // Everything is covered by volumes in flight: nothing more to fetch.
+        assert!(s.request_unpause().is_none());
+        // A volume in flight came back short (here: its promise is dropped):
+        // the selector runs again without waiting for new damage.
+        let promised = s
+            .inner
+            .tracker
+            .lock()
+            .unwrap()
+            .unpaused_in_flight
+            .remove(&action2.volume_ids_to_unpause[0]);
+        assert_eq!(promised, Some(1));
+        assert_eq!(s.status().needed_recovery_blocks, 1);
+        // Blocks turned away by a full slot cap count as here.
+        s.inner
+            .cap_rejected
+            .lock()
+            .unwrap()
+            .push((Default::default(), 1));
+        assert!(s.request_unpause().is_none());
+        s.inner.cap_rejected.lock().unwrap().clear();
+        let again = s.request_unpause().unwrap();
+        assert_eq!(again.volume_ids_to_unpause.len(), 1);
+        assert_eq!(s.status().needed_recovery_blocks, 0);
+        s.inner
+            .tracker
+            .lock()
+            .unwrap()
+            .unpaused_in_flight
+            .remove(&again.volume_ids_to_unpause[0]);
+        s.inner
+            .tracker
+            .lock()
+            .unwrap()
+            .unpaused_in_flight
+            .insert(action2.volume_ids_to_unpause[0], 1);
         // Unpaused volumes arrive: in-flight drops, ready rises.
         for id in action
             .volume_ids_to_unpause
