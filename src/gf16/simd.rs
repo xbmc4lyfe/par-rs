@@ -12,6 +12,10 @@
 //! word layout and split planes; the Reed-Solomon engine keeps its accumulation buffers split
 //! and converts once per chunk, which is `O(1)` per byte versus `O(outputs)` multiplies.
 //!
+//! With GFNI (Intel Ice Lake and Alder Lake on, AMD Zen 4 on) the product is computed without
+//! tables: multiplying by a constant is a 16x16 bit matrix, applied to the planes as four 8x8
+//! `gf2p8affineqb` transforms, half the instructions of the shuffles.
+//!
 //! Natural-layout convenience entry points ([`Kernel::mul_acc`], [`Kernel::mul_acc_multi`])
 //! transform tiles through small stack buffers.
 //!
@@ -36,6 +40,10 @@ pub enum Isa {
     Avx2,
     /// x86 AVX-512BW (`vpshufb`, 512-bit).
     Avx512bw,
+    /// x86 AVX2 with GFNI (`vgf2p8affineqb`, 256-bit): Alder Lake and later Intel client CPUs.
+    Avx2Gfni,
+    /// x86 AVX-512BW with GFNI (`vgf2p8affineqb`, 512-bit): Ice Lake, Sapphire Rapids, Zen 4.
+    Avx512Gfni,
 }
 
 impl Isa {
@@ -44,7 +52,14 @@ impl Isa {
     pub fn candidates() -> &'static [Isa] {
         #[cfg(target_arch = "x86_64")]
         {
-            &[Isa::Avx512bw, Isa::Avx2, Isa::Ssse3, Isa::Scalar]
+            &[
+                Isa::Avx512Gfni,
+                Isa::Avx512bw,
+                Isa::Avx2Gfni,
+                Isa::Avx2,
+                Isa::Ssse3,
+                Isa::Scalar,
+            ]
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -72,6 +87,17 @@ impl Isa {
                 std::arch::is_x86_feature_detected!("avx512f")
                     && std::arch::is_x86_feature_detected!("avx512bw")
             }
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx2Gfni => {
+                std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("gfni")
+            }
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx512Gfni => {
+                std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx512bw")
+                    && std::arch::is_x86_feature_detected!("gfni")
+            }
             #[allow(unreachable_patterns)]
             _ => false,
         }
@@ -83,8 +109,8 @@ impl Isa {
         match self {
             Isa::Scalar => 1,
             Isa::Neon | Isa::Ssse3 => 16,
-            Isa::Avx2 => 32,
-            Isa::Avx512bw => 64,
+            Isa::Avx2 | Isa::Avx2Gfni => 32,
+            Isa::Avx512bw | Isa::Avx512Gfni => 64,
         }
     }
 }
@@ -97,6 +123,8 @@ impl std::fmt::Display for Isa {
             Isa::Ssse3 => "ssse3",
             Isa::Avx2 => "avx2",
             Isa::Avx512bw => "avx512bw",
+            Isa::Avx2Gfni => "avx2+gfni",
+            Isa::Avx512Gfni => "avx512+gfni",
         })
     }
 }
@@ -396,6 +424,18 @@ impl Kernel {
                 // SAFETY: feature checked at construction.
                 unsafe { arch::avx512_group(dsts, src, &tables[..coeffs.len()]) }
             }
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx2Gfni => {
+                let tables = shuffle_tables(coeffs);
+                // SAFETY: feature checked at construction.
+                unsafe { arch::avx2_gfni_group(dsts, src, &tables[..coeffs.len()]) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx512Gfni => {
+                let tables = shuffle_tables(coeffs);
+                // SAFETY: feature checked at construction.
+                unsafe { arch::avx512_gfni_group(dsts, src, &tables[..coeffs.len()]) }
+            }
             #[allow(unreachable_patterns)]
             _ => unreachable!("unsupported ISA constructed"),
         }
@@ -497,7 +537,9 @@ impl Kernel {
             #[cfg(target_arch = "x86_64")]
             Isa::Ssse3 => unsafe { arch::ssse3_deinterleave(src, lo, hi) },
             #[cfg(target_arch = "x86_64")]
-            Isa::Avx2 | Isa::Avx512bw => unsafe { arch::avx2_deinterleave(src, lo, hi) },
+            Isa::Avx2 | Isa::Avx512bw | Isa::Avx2Gfni | Isa::Avx512Gfni => unsafe {
+                arch::avx2_deinterleave(src, lo, hi)
+            },
             #[allow(unreachable_patterns)]
             _ => unreachable!("unsupported ISA constructed"),
         }
@@ -517,7 +559,9 @@ impl Kernel {
             #[cfg(target_arch = "x86_64")]
             Isa::Ssse3 => unsafe { arch::sse2_interleave(lo, hi, dst) },
             #[cfg(target_arch = "x86_64")]
-            Isa::Avx2 | Isa::Avx512bw => unsafe { arch::avx2_interleave(lo, hi, dst) },
+            Isa::Avx2 | Isa::Avx512bw | Isa::Avx2Gfni | Isa::Avx512Gfni => unsafe {
+                arch::avx2_interleave(lo, hi, dst)
+            },
             #[allow(unreachable_patterns)]
             _ => unreachable!("unsupported ISA constructed"),
         }
@@ -568,6 +612,120 @@ fn scalar_tail(dsts: &mut [PlaneMut], src: Plane, tables: &[ShuffleTables], from
             &src.hi[from..n],
             &mt,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// GFNI: multiplication by a constant as four 8x8 bit-matrix affine transforms
+// ---------------------------------------------------------------------------------------------
+
+/// Multiplication by `coeff` is linear over GF(2): a 16x16 bit matrix. In the split layout it
+/// is four 8x8 blocks, in the operand format of `gf2p8affineqb` (result bit `i` of a byte is
+/// the parity of `byte[7 - i]` of the matrix AND the input byte):
+/// `[lo<-lo, lo<-hi, hi<-lo, hi<-hi]`, so that
+/// `product.lo = A[0](src.lo) ^ A[1](src.hi)` and `product.hi = A[2](src.lo) ^ A[3](src.hi)`.
+#[allow(dead_code)]
+pub(crate) fn gfni_matrices(coeff: u16) -> [u64; 4] {
+    // Column `j`: the product of `coeff` with the word that has only bit `j` set.
+    let cols: [u16; 16] = std::array::from_fn(|j| crate::gf16::mul(coeff, 1 << j));
+    let block = |out: usize, inp: usize| -> u64 {
+        let mut m = 0u64;
+        for i in 0..8 {
+            let mut row = 0u8;
+            for j in 0..8 {
+                if cols[inp + j] >> (out + i) & 1 == 1 {
+                    row |= 1 << j;
+                }
+            }
+            m |= u64::from(row) << (8 * (7 - i));
+        }
+        m
+    };
+    [block(0, 0), block(0, 8), block(8, 0), block(8, 8)]
+}
+
+/// One register width with `gf2p8affineqb`.
+#[allow(dead_code)]
+trait Gfni: Copy {
+    const WIDTH: usize;
+    /// Destinations per pass: four matrix registers each stay resident.
+    const UNROLL: usize;
+    type V: Copy;
+    unsafe fn load(p: *const u8) -> Self::V;
+    unsafe fn store(p: *mut u8, v: Self::V);
+    unsafe fn splat(m: u64) -> Self::V;
+    unsafe fn affine(x: Self::V, m: Self::V) -> Self::V;
+    /// `a ^ b ^ c`.
+    unsafe fn xor3(a: Self::V, b: Self::V, c: Self::V) -> Self::V;
+}
+
+/// `dst ^= coeff * src` for `N` destinations with the affine kernel `G`.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn gfni_group<G: Gfni, const N: usize>(
+    dsts: &mut [PlaneMut],
+    src: Plane,
+    tables: &[ShuffleTables],
+) {
+    debug_assert!(dsts.len() == N && tables.len() == N);
+    let n = src.lo.len();
+    let vec_end = n - n % G::WIDTH;
+    let mut m: [[G::V; 4]; N] = [[unsafe { G::splat(0) }; 4]; N];
+    for (k, t) in tables.iter().enumerate() {
+        let mats = gfni_matrices(t.coeff());
+        for (slot, &mat) in m[k].iter_mut().zip(&mats) {
+            *slot = unsafe { G::splat(mat) };
+        }
+    }
+    let mut dlo = [std::ptr::null_mut::<u8>(); N];
+    let mut dhi = [std::ptr::null_mut::<u8>(); N];
+    for k in 0..N {
+        dlo[k] = dsts[k].lo.as_mut_ptr();
+        dhi[k] = dsts[k].hi.as_mut_ptr();
+    }
+    let slo = src.lo.as_ptr();
+    let shi = src.hi.as_ptr();
+    let mut i = 0usize;
+    while i < vec_end {
+        // SAFETY: `i + G::WIDTH <= vec_end <= n` and all planes have `n` bytes.
+        unsafe {
+            let lo = G::load(slo.add(i));
+            let hi = G::load(shi.add(i));
+            for k in 0..N {
+                let pl = dlo[k].add(i);
+                let ph = dhi[k].add(i);
+                let rl = G::xor3(G::load(pl), G::affine(lo, m[k][0]), G::affine(hi, m[k][1]));
+                let rh = G::xor3(G::load(ph), G::affine(lo, m[k][2]), G::affine(hi, m[k][3]));
+                G::store(pl, rl);
+                G::store(ph, rh);
+            }
+        }
+        i += G::WIDTH;
+    }
+    scalar_tail(dsts, src, tables, vec_end);
+}
+
+/// [`gfni_group`] over any number of destinations, `G::UNROLL` per pass.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn gfni_group_dyn<G: Gfni>(dsts: &mut [PlaneMut], src: Plane, tables: &[ShuffleTables]) {
+    let mut dsts = dsts;
+    let mut tables = tables;
+    while !dsts.is_empty() {
+        let take = dsts.len().min(G::UNROLL).max(1);
+        let (d, rest) = dsts.split_at_mut(take);
+        let (t, trest) = tables.split_at(take);
+        // SAFETY: forwarded from a `#[target_feature]` wrapper with the right features.
+        unsafe {
+            match take {
+                1 => gfni_group::<G, 1>(d, src, t),
+                2 => gfni_group::<G, 2>(d, src, t),
+                3 => gfni_group::<G, 3>(d, src, t),
+                _ => gfni_group::<G, 4>(d, src, t),
+            }
+        }
+        dsts = rest;
+        tables = trest;
     }
 }
 
@@ -884,6 +1042,85 @@ mod arch {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct Avx2Gfni;
+
+    impl Gfni for Avx2Gfni {
+        const WIDTH: usize = 32;
+        // 16 registers: 8 matrices for two destinations, the two source vectors and temporaries.
+        const UNROLL: usize = 2;
+        type V = __m256i;
+        #[inline(always)]
+        unsafe fn load(p: *const u8) -> __m256i {
+            unsafe { _mm256_loadu_si256(p as *const __m256i) }
+        }
+        #[inline(always)]
+        unsafe fn store(p: *mut u8, v: __m256i) {
+            unsafe { _mm256_storeu_si256(p as *mut __m256i, v) }
+        }
+        #[inline(always)]
+        unsafe fn splat(m: u64) -> __m256i {
+            unsafe { _mm256_set1_epi64x(m as i64) }
+        }
+        #[inline(always)]
+        unsafe fn affine(x: __m256i, m: __m256i) -> __m256i {
+            unsafe { _mm256_gf2p8affine_epi64_epi8::<0>(x, m) }
+        }
+        #[inline(always)]
+        unsafe fn xor3(a: __m256i, b: __m256i, c: __m256i) -> __m256i {
+            unsafe { _mm256_xor_si256(a, _mm256_xor_si256(b, c)) }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Avx512Gfni;
+
+    impl Gfni for Avx512Gfni {
+        const WIDTH: usize = 64;
+        // 32 registers: 16 matrices for four destinations, the two source vectors and temporaries.
+        const UNROLL: usize = 4;
+        type V = __m512i;
+        #[inline(always)]
+        unsafe fn load(p: *const u8) -> __m512i {
+            unsafe { _mm512_loadu_si512(p as *const __m512i) }
+        }
+        #[inline(always)]
+        unsafe fn store(p: *mut u8, v: __m512i) {
+            unsafe { _mm512_storeu_si512(p as *mut __m512i, v) }
+        }
+        #[inline(always)]
+        unsafe fn splat(m: u64) -> __m512i {
+            unsafe { _mm512_set1_epi64(m as i64) }
+        }
+        #[inline(always)]
+        unsafe fn affine(x: __m512i, m: __m512i) -> __m512i {
+            unsafe { _mm512_gf2p8affine_epi64_epi8::<0>(x, m) }
+        }
+        #[inline(always)]
+        unsafe fn xor3(a: __m512i, b: __m512i, c: __m512i) -> __m512i {
+            // Truth table 0x96: a ^ b ^ c.
+            unsafe { _mm512_ternarylogic_epi64::<0x96>(a, b, c) }
+        }
+    }
+
+    #[target_feature(enable = "avx2,gfni")]
+    pub(super) unsafe fn avx2_gfni_group(
+        dsts: &mut [PlaneMut],
+        src: Plane,
+        tables: &[ShuffleTables],
+    ) {
+        unsafe { gfni_group_dyn::<Avx2Gfni>(dsts, src, tables) }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw,gfni")]
+    pub(super) unsafe fn avx512_gfni_group(
+        dsts: &mut [PlaneMut],
+        src: Plane,
+        tables: &[ShuffleTables],
+    ) {
+        unsafe { gfni_group_dyn::<Avx512Gfni>(dsts, src, tables) }
+    }
+
     #[target_feature(enable = "ssse3")]
     pub(super) unsafe fn ssse3_group(dsts: &mut [PlaneMut], src: Plane, tables: &[ShuffleTables]) {
         unsafe { simd_group_dyn::<Sse>(dsts, src, tables) }
@@ -1048,6 +1285,36 @@ mod tests {
             }
         }
         v
+    }
+
+    /// `gf2p8affineqb` on one byte, as Intel's pseudocode defines it.
+    fn affine_byte(m: u64, x: u8) -> u8 {
+        let mut r = 0u8;
+        for i in 0..8 {
+            let row = (m >> (8 * (7 - i))) as u8;
+            r |= (((row & x).count_ones() & 1) as u8) << i;
+        }
+        r
+    }
+
+    #[test]
+    fn gfni_matrices_multiply_like_the_tables() {
+        // Checked in software on every target, so the matrix layout is proven even where no
+        // GFNI hardware runs the tests.
+        for coeff in [0u16, 1, 2, 3, 0x8000, 0x1234, 0xFFFF, 0x100B, 0xBEEF] {
+            let m = gfni_matrices(coeff);
+            for w in 0..=u16::MAX {
+                let (lo, hi) = (w as u8, (w >> 8) as u8);
+                let plo = affine_byte(m[0], lo) ^ affine_byte(m[1], hi);
+                let phi = affine_byte(m[2], lo) ^ affine_byte(m[3], hi);
+                let want = crate::gf16::mul(coeff, w);
+                assert_eq!(
+                    u16::from_le_bytes([plo, phi]),
+                    want,
+                    "coeff {coeff:#x} w {w:#x}"
+                );
+            }
+        }
     }
 
     #[test]
