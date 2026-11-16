@@ -4,7 +4,8 @@
 //! MD5 is a serial dependency chain (~5 cycles per step on one core, about 1 GB/s), but PAR2
 //! has to hash every slice separately: the per-slice IFSC digests are independent messages, so
 //! they can share one vector instruction stream. Each 128-bit vector carries four messages and
-//! [`GROUPS`] vectors are interleaved so the chain latency of one group is hidden by the others.
+//! [`GROUPS`] vectors are interleaved so the chain latency of one group is hidden by the others
+//! (eight on `AArch64`, whose 32 vector registers hold them; four on `x86_64`, which has 16).
 //! Equal-length messages (every PAR2 slice is zero padded to `slice_size`) run in perfect
 //! lockstep; mixed lengths are sorted and lanes idle once their message is finished.
 //!
@@ -13,6 +14,14 @@
 //! elsewhere.
 
 /// Interleaved 4-lane groups per kernel invocation.
+///
+/// On an Apple M4 one core hashes 4.7 GB/s with four groups, 5.9 GB/s with six and 6.1 GB/s
+/// with eight (`examples/cpu_paths.rs`): four groups leave the NEON pipes waiting on the
+/// MD5 dependency chain.
+#[cfg(target_arch = "aarch64")]
+pub const GROUPS: usize = 8;
+/// Interleaved 4-lane groups per kernel invocation.
+#[cfg(not(target_arch = "aarch64"))]
 pub const GROUPS: usize = 4;
 /// Messages hashed per kernel pass; callers batching work should use multiples of this.
 pub const LANES: usize = 4 * GROUPS;
@@ -455,13 +464,37 @@ fn block_words(msg: &[u8], t: usize, nblocks: usize, out: &mut [u32; 16]) {
     }
 }
 
+/// Smallest instantiated group count whose lanes hold `messages` (at most [`GROUPS`]).
+fn groups_for(messages: usize) -> usize {
+    match messages.div_ceil(4) {
+        0 | 1 => 1,
+        2 => 2,
+        3 | 4 => 4,
+        5 | 6 if GROUPS > 4 => 6,
+        _ => GROUPS,
+    }
+}
+
 fn run<L: Lanes, const G: usize>(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
-    let lanes = 4 * G;
     // Longest first so lockstep batches waste as little lane time as possible.
     let mut order: Vec<usize> = (0..msgs.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(msgs[i].len()));
+    for batch in order.chunks(4 * G) {
+        match groups_for(batch.len()) {
+            1 => run_batch::<L, 1>(msgs, batch, out),
+            2 => run_batch::<L, 2>(msgs, batch, out),
+            4 => run_batch::<L, 4>(msgs, batch, out),
+            6 => run_batch::<L, 6>(msgs, batch, out),
+            _ => run_batch::<L, G>(msgs, batch, out),
+        }
+    }
+}
+
+/// Hash the messages `batch` indexes (at most `4 * G`) in lockstep.
+fn run_batch<L: Lanes, const G: usize>(msgs: &[&[u8]], batch: &[usize], out: &mut [[u8; 16]]) {
+    let lanes = 4 * G;
     let mut words = [[0u32; 16]; 4];
-    for batch in order.chunks(lanes) {
+    {
         let mut st = [[L::splat(0); 4]; G];
         for group in &mut st {
             for (j, s) in group.iter_mut().enumerate() {
@@ -515,10 +548,14 @@ pub(crate) fn compress_blocks(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
 }
 
 fn stream_dispatch<L: Lanes>(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
-    match states.len() {
-        0 => {}
-        1..=4 => stream_blocks::<L, 1>(states, blocks),
-        5..=8 => stream_blocks::<L, 2>(states, blocks),
+    if states.is_empty() {
+        return;
+    }
+    match groups_for(states.len()) {
+        1 => stream_blocks::<L, 1>(states, blocks),
+        2 => stream_blocks::<L, 2>(states, blocks),
+        4 => stream_blocks::<L, 4>(states, blocks),
+        6 => stream_blocks::<L, 6>(states, blocks),
         _ => stream_blocks::<L, GROUPS>(states, blocks),
     }
 }
