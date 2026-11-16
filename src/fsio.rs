@@ -14,13 +14,29 @@ pub(crate) enum CopyKind {
     Copy,
 }
 
-/// Copy `src` to the new file `dst` (which must not exist), as a copy-on-write clone where
-/// the file system supports one and as a byte copy otherwise. Permissions are copied.
+/// Copy `src` to the new file `dst`, as a copy-on-write clone where the file system supports
+/// one and as a byte copy otherwise. Permissions are copied. Fails with `AlreadyExists`
+/// (touching nothing) when `dst` exists, even if it appeared after the caller checked.
 pub(crate) fn clone_or_copy(src: &Path, dst: &Path) -> io::Result<CopyKind> {
-    if try_clone(src, dst).is_ok() {
-        return Ok(CopyKind::Clone);
+    match try_clone(src, dst) {
+        Ok(()) => return Ok(CopyKind::Clone),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
+        Err(_) => {}
     }
-    std::fs::copy(src, dst)?;
+    // Claim the name first so a file created meanwhile is never overwritten.
+    let out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    let copied = File::open(src)
+        .and_then(|mut input| io::copy(&mut input, &mut &out))
+        .and_then(|_| src.metadata())
+        .and_then(|m| out.set_permissions(m.permissions()));
+    if let Err(e) = copied {
+        drop(out);
+        let _ = std::fs::remove_file(dst);
+        return Err(e);
+    }
     Ok(CopyKind::Copy)
 }
 
@@ -41,15 +57,13 @@ fn try_clone(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn try_clone(src: &Path, dst: &Path) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    /// `_IOW(0x94, 9, int)`.
-    const FICLONE: libc::c_ulong = 0x4004_9409;
     let s = File::open(src)?;
     let d = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(dst)?;
     // SAFETY: both descriptors are open for the duration of the call.
-    let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE as _, s.as_raw_fd()) };
+    let rc = unsafe { libc::ioctl(d.as_raw_fd(), libc::FICLONE as _, s.as_raw_fd()) };
     let result = if rc == 0 {
         s.metadata()
             .and_then(|m| std::fs::set_permissions(dst, m.permissions()))
@@ -126,14 +140,11 @@ mod tests {
         // The clone is independent of the original.
         std::fs::write(&src, b"changed").unwrap();
         assert_eq!(std::fs::read(d.join("b.bin")).unwrap(), data);
-        // A failed clone (target exists) falls back to a copy, which overwrites like
-        // `std::fs::copy`; callers only pass names that do not exist.
+        // An existing target is never overwritten.
         std::fs::write(d.join("c.bin"), b"old").unwrap();
-        assert_eq!(
-            clone_or_copy(&src, &d.join("c.bin")).unwrap(),
-            CopyKind::Copy
-        );
-        assert_eq!(std::fs::read(d.join("c.bin")).unwrap(), b"changed");
+        let err = clone_or_copy(&src, &d.join("c.bin")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(d.join("c.bin")).unwrap(), b"old");
         assert!(clone_or_copy(&d.join("missing"), &d.join("x")).is_err());
         std::fs::remove_dir_all(&d).unwrap();
     }

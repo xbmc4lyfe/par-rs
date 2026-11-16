@@ -1850,10 +1850,16 @@ impl Par2Repairer {
                 }
             };
             if !candidate.exists() {
-                if let Ok(kind) = crate::fsio::clone_or_copy(path, &candidate) {
-                    return Ok((candidate, Some(kind)));
+                match crate::fsio::clone_or_copy(path, &candidate) {
+                    Ok(kind) => return Ok((candidate, Some(kind))),
+                    // Taken since the check: try the next name.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        n += 1;
+                        continue;
+                    }
+                    // `clone_or_copy` removed its partial copy.
+                    Err(_) => {}
                 }
-                let _ = std::fs::remove_file(&candidate);
                 std::fs::rename(path, &candidate).map_err(io_ctx(format!(
                     "renaming {} to {}",
                     path.display(),
