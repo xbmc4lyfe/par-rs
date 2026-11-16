@@ -1012,6 +1012,48 @@ mod tests {
         }
     }
 
+    /// Every hardware kernel the CPU reports actually runs, from every alignment and from a
+    /// register other than the initial one.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn every_hardware_kernel_runs_from_any_alignment_and_state() {
+        if !hw::available() {
+            return;
+        }
+        let mut expected: Vec<&str> = Vec::new();
+        #[cfg(target_arch = "aarch64")]
+        {
+            expected.extend(["crc32x", "crc32x 3-way"]);
+            if std::arch::is_aarch64_feature_detected!("aes") {
+                expected.push("pmull");
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::is_x86_feature_detected as has;
+            expected.push("pclmul");
+            if has!("vpclmulqdq") && has!("avx2") {
+                expected.push("vpclmul256");
+            }
+            if has!("vpclmulqdq") && has!("avx512f") {
+                expected.push("vpclmul512");
+            }
+        }
+        let data = pseudo_random(5000, 99);
+        for off in 0..16 {
+            let slice = &data[off..];
+            for state in [INIT, 0, 0x1234_5678] {
+                let want = update_slice8_raw(state, slice);
+                let got = hw::each_kernel(state, slice);
+                let names: Vec<&str> = got.iter().map(|(n, _)| *n).collect();
+                assert_eq!(names, expected, "kernels run");
+                for (name, crc) in got {
+                    assert_eq!(crc, want, "{name} offset {off} state {state:#x}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn streaming_matches_oneshot() {
         let data = pseudo_random(100_000, 7);
