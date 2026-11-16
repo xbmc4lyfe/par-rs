@@ -13,6 +13,7 @@
 //! |---|---|
 //! | [`gf2`] | GF(2) polynomial algebra over the CRC-32 polynomial: combine / zero-pad / un-pad / un-combine, yEnc and IFSC folding, `O(1)` rolling CRC, LCM grids |
 //! | [`crc`] | CRC-32 kernels (hardware / slice-by-8), streaming hasher, register-level GF(2) helpers |
+//! | [`cpu`] | `PAR_RS_SIMD=off` switch that makes every runtime dispatch use its portable fallback |
 //! | [`hasher`], [`md5simd`], [`parhash`] | fused CRC-32 + MD5 + 16k-MD5 hashing, 16-lane SIMD MD5, all-core slice/file hashing pool |
 //! | [`gf16`], [`gf16::simd`] | GF(2^16) arithmetic, PAR2 input constants, Vandermonde solving, NEON / SSSE3 / AVX2 / AVX-512 kernels |
 //! | [`packet`] | PAR2 packet encoders and a tolerant, resynchronizing parser with lazy decoding |
@@ -78,6 +79,7 @@
 // carry a module-level allow; they are fuzz- and differential-tested instead.
 pub mod bridge;
 mod bytes;
+pub mod cpu;
 #[allow(
     clippy::indexing_slicing,
     clippy::unwrap_used,

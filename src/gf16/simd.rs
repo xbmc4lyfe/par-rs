@@ -202,9 +202,13 @@ impl Default for Kernel {
 }
 
 impl Kernel {
-    /// Pick the best supported and self-verified instruction set.
+    /// Pick the best supported and self-verified instruction set (the scalar kernel when
+    /// [`crate::cpu::SIMD_ENV`] turns the CPU-specific paths off).
     #[must_use]
     pub fn detect() -> Self {
+        if !crate::cpu::simd_enabled() {
+            return Self::scalar();
+        }
         for &isa in Isa::candidates() {
             if let Some(k) = Self::with_isa(isa) {
                 return k;
@@ -1055,7 +1059,9 @@ mod tests {
         let d = Kernel::default();
         assert_eq!(d.isa(), k.isa());
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(k.isa(), Isa::Neon);
+        if crate::cpu::simd_enabled() {
+            assert_eq!(k.isa(), Isa::Neon);
+        }
     }
 
     #[test]

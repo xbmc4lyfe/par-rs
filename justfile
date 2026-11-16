@@ -30,9 +30,10 @@ fmt-check:
 prose:
     vale --no-global *.md docs src tests examples bench scripts .github justfile .vale/README.md
 
-# Run Rust tests, Clippy, and prose coverage tests.
+# Run Rust tests (again with the CPU-specific paths off), Clippy, and prose coverage tests.
 test:
     cargo test --locked --all-features
+    PAR_RS_SIMD=off cargo test --locked --all-features --lib --tests
     cargo clippy --locked --all-targets --all-features -- -D warnings
     python3 -B -m unittest discover -s scripts -p 'test_*.py'
 
