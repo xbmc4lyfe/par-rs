@@ -61,7 +61,7 @@ use crate::repairer::{
     write_all_at,
 };
 use crate::scanner::{BlockRef, ChecksumEntry, entries_for_file};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -156,8 +156,75 @@ pub struct StreamingStats {
     pub bytes_folded: u64,
 }
 
+/// The bytes of one partially received slice: only what arrived, as disjoint runs keyed by
+/// slice-relative offset (touching or overlapping runs are merged), so a partial slice costs
+/// what it holds rather than a whole slice.
+#[derive(Default)]
+pub(crate) struct Pieces {
+    runs: BTreeMap<usize, Vec<u8>>,
+    held: usize,
+}
+
+impl Pieces {
+    /// Bytes held.
+    pub(crate) fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Store `data` at slice-relative `rel`; newer bytes win where they overlap. Returns how
+    /// many bytes the held total grew by.
+    pub(crate) fn insert(&mut self, rel: usize, data: &[u8]) -> usize {
+        if data.is_empty() {
+            return 0;
+        }
+        let end = rel + data.len();
+        // Runs that overlap or touch [rel, end].
+        let touching: Vec<usize> = self
+            .runs
+            .range(..=end)
+            .rev()
+            .take_while(|(k, v)| **k + v.len() >= rel)
+            .map(|(&k, _)| k)
+            .collect();
+        let start = touching.iter().copied().min().unwrap_or(rel).min(rel);
+        let stop = touching
+            .iter()
+            .map(|k| k + self.runs[k].len())
+            .max()
+            .unwrap_or(end)
+            .max(end);
+        let before = self.held;
+        let mut merged = vec![0u8; stop - start];
+        for k in touching {
+            let run = self.runs.remove(&k).unwrap_or_default();
+            self.held -= run.len();
+            merged[k - start..k - start + run.len()].copy_from_slice(&run);
+        }
+        merged[rel - start..end - start].copy_from_slice(data);
+        self.held += merged.len();
+        self.runs.insert(start, merged);
+        self.held - before
+    }
+
+    /// The whole slice of `len` bytes, missing bytes zero (callers check coverage first).
+    pub(crate) fn into_slice(mut self, len: usize) -> Vec<u8> {
+        if self.runs.len() == 1
+            && let Some(run) = self.runs.remove(&0)
+            && run.len() == len
+        {
+            return run;
+        }
+        let mut out = vec![0u8; len];
+        for (k, run) in self.runs {
+            let n = run.len().min(len.saturating_sub(k));
+            out[k..k + n].copy_from_slice(&run[..n]);
+        }
+        out
+    }
+}
+
 struct Staged {
-    buf: Vec<u8>,
+    pieces: Pieces,
     ranges: Vec<ByteRange>,
 }
 
@@ -511,12 +578,13 @@ impl Par2Repairer {
                         continue;
                     }
                     let staged = st.staged.entry(g).or_insert_with(|| Staged {
-                        buf: vec![0u8; (bend - bstart) as usize],
+                        pieces: Pieces::default(),
                         ranges: Vec::new(),
                     });
                     let rel = (s - bstart) as usize;
-                    staged.buf[rel..rel + (e - s) as usize]
-                        .copy_from_slice(&d[(s - offset) as usize..(e - offset) as usize]);
+                    staged
+                        .pieces
+                        .insert(rel, &d[(s - offset) as usize..(e - offset) as usize]);
                     staged
                         .ranges
                         .push(ByteRange::new((s - bstart) as i64, (e - s) as i64));
@@ -555,7 +623,7 @@ impl Par2Repairer {
                             (bend - bstart) as i64,
                         ) =>
                     {
-                        staged.buf
+                        staged.pieces.into_slice((bend - bstart) as usize)
                     }
                     _ => {
                         let f = File::open(&target)
@@ -1796,8 +1864,16 @@ struct ArticlePayload<'a> {
 }
 
 struct LiveStaged {
-    buf: Vec<u8>,
+    pieces: Pieces,
     ranges: Vec<ByteRange>,
+}
+
+/// Give back the staging map's spare capacity once it holds far fewer slices than it has room
+/// for, so a burst of partial slices does not keep its high-water memory.
+fn shrink_staging(staging: &mut HashMap<usize, LiveStaged>) {
+    if staging.capacity() > 2 * staging.len() + 16 {
+        staging.shrink_to(staging.len());
+    }
 }
 
 /// Mutable tracker state (one lock, held only for bookkeeping—never during hashing or I/O).
@@ -2560,7 +2636,8 @@ impl StreamingParSession {
             }
             if let Some(st) = t.staging.remove(&g) {
                 t.metadata_entries -= st.ranges.len();
-                t.staging_bytes -= st.buf.len() as u64;
+                t.staging_bytes -= st.pieces.held() as u64;
+                shrink_staging(&mut t.staging);
             }
             if Self::set_state(&mut t, g, SliceState::Damaged) {
                 events.push(SliceEvent {
@@ -2702,8 +2779,13 @@ impl StreamingParSession {
                     let hi = end.min(stop) - start;
                     let piece = ByteRange::new(lo as i64, (hi - lo) as i64);
                     let staged = t.staging.get(&g);
-                    if staged.is_none() {
-                        required = required.saturating_add(stop - start);
+                    // Staging holds only the bytes that arrive. A piece that completes its
+                    // slice leaves staging at once (the whole slice moves on to be hashed), so
+                    // only pieces that stay partial count against the cap.
+                    let mut resident = staged.map_or_else(Vec::new, |s| s.ranges.clone());
+                    resident.push(piece);
+                    if !range_covered(&normalize_ranges(&resident), 0, (stop - start) as i64) {
+                        required = required.saturating_add(hi - lo);
                     }
                     // Coverage supplied earlier through the committed-disk API
                     // need not still be resident. Do not complete it from disk.
@@ -2812,26 +2894,25 @@ impl StreamingParSession {
                 if let Some(d) = bytes
                     && (!payload.memory_only || offset > sstart || end < send)
                 {
-                    let have = t.staging.contains_key(&g);
-                    if have
-                        || t.staging_bytes + slen as u64
+                    // Charged by bytes held; RAM-only payloads were admitted above.
+                    if payload.memory_only
+                        || t.staging_bytes + (e - s)
                             <= self.inner.max_staging.load(Ordering::Acquire)
                     {
-                        if !have {
-                            t.staging_bytes += slen as u64;
-                        }
                         let st = t.staging.entry(g).or_insert_with(|| LiveStaged {
-                            buf: vec![0u8; slen],
+                            pieces: Pieces::default(),
                             ranges: Vec::new(),
                         });
                         let rel = (s - sstart) as usize;
-                        st.buf[rel..rel + (e - s) as usize]
-                            .copy_from_slice(&d[(s - offset) as usize..(e - offset) as usize]);
+                        let grown = st
+                            .pieces
+                            .insert(rel, &d[(s - offset) as usize..(e - offset) as usize]);
                         let previous = st.ranges.len();
                         st.ranges.push(ByteRange::new(rel as i64, (e - s) as i64));
                         st.ranges = normalize_ranges(&st.ranges);
                         let current = st.ranges.len();
                         t.metadata_entries = t.metadata_entries - previous + current;
+                        t.staging_bytes += grown as u64;
                     }
                 }
                 if range_covered(&covered, 0, slen as i64) {
@@ -2839,16 +2920,18 @@ impl StreamingParSession {
                     let staged = match t.staging.remove(&g) {
                         Some(st) => {
                             t.metadata_entries -= st.ranges.len();
+                            let held = st.pieces.held() as u64;
                             if range_covered(&normalize_ranges(&st.ranges), 0, slen as i64) {
-                                completed_charges.bytes += st.buf.len() as u64;
-                                Some(st.buf)
+                                completed_charges.bytes += held;
+                                Some(st.pieces.into_slice(slen))
                             } else {
-                                t.staging_bytes -= st.buf.len() as u64;
+                                t.staging_bytes -= held;
                                 None
                             }
                         }
                         None => None,
                     };
+                    shrink_staging(&mut t.staging);
                     // ParQuick: combined CRC when the articles tile the slice exactly.
                     let mut crcs = std::mem::take(&mut t.article_crcs[g]);
                     t.metadata_entries -= crcs.len();
@@ -3785,7 +3868,8 @@ impl StreamingParSession {
             }
             if let Some(st) = t.staging.remove(&g) {
                 t.metadata_entries -= st.ranges.len();
-                t.staging_bytes -= st.buf.len() as u64;
+                t.staging_bytes -= st.pieces.held() as u64;
+                shrink_staging(&mut t.staging);
             }
             Self::set_state(&mut t, g, SliceState::VerifiedGood);
             self.inner.control.ram.fetch_add(e - s, Ordering::Relaxed);
@@ -4217,7 +4301,8 @@ impl StreamingParSession {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(st) = t.staging.remove(&g) {
                     t.metadata_entries -= st.ranges.len();
-                    t.staging_bytes -= st.buf.len() as u64;
+                    t.staging_bytes -= st.pieces.held() as u64;
+                    shrink_staging(&mut t.staging);
                 }
                 Self::set_state(&mut t, g, SliceState::VerifiedGood);
             }
@@ -4996,26 +5081,27 @@ mod live_tests {
             &fx.set,
             &fx.dir,
             SessionOptions {
-                max_staging_bytes: 4096,
+                max_staging_bytes: 2048,
                 ..Default::default()
             },
         )
         .unwrap();
         let (a, b) = (fid(&fx, "part00.rar"), fid(&fx, "part01.rar"));
         let (da, db) = (&fx.files[0].1, &fx.files[1].1);
-        // One partial slice fits the one-slice cap; a second is refused.
+        // Staging is charged by the bytes held: one half-slice article fills the 2048-byte
+        // cap; a second is refused.
         s.on_article_finished_memory_only(&a, 0, &da[..2048], crc32(&da[..2048]))
             .unwrap();
-        assert_eq!(s.staging_bytes(), 4096);
+        assert_eq!(s.staging_bytes(), 2048);
         assert!(matches!(
             s.on_article_finished_memory_only(&b, 0, &db[..2048], crc32(&db[..2048])),
             Err(RepairError::StreamingMemoryLimit { .. })
         ));
-        assert_eq!(s.set_max_staging_bytes(8192), 8192);
-        assert_eq!(s.max_staging_bytes(), 8192);
+        assert_eq!(s.set_max_staging_bytes(4096), 4096);
+        assert_eq!(s.max_staging_bytes(), 4096);
         s.on_article_finished_memory_only(&b, 0, &db[..2048], crc32(&db[..2048]))
             .unwrap();
-        assert_eq!(s.staging_bytes(), 8192);
+        assert_eq!(s.staging_bytes(), 4096);
         // Completing both slices releases their staging.
         s.on_article_finished_memory_only(&a, 2048, &da[2048..4096], crc32(&da[2048..4096]))
             .unwrap();
