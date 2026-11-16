@@ -43,17 +43,23 @@ pub struct GfKernelReport {
     /// source data multiplied into one recovery or repaired slice per second. A repair of `m`
     /// slices from `n` inputs of `s` bytes does about `n * m * s` bytes of this work, so
     /// `n * m * s / (mb_per_sec_per_thread * 1e6 * threads)` estimates its compute time. The
-    /// buffers stay in the L2 cache, so reads from disk and main memory come on top.
+    /// buffers stay in the L2 cache, so reads from disk and main memory come on top, and it is
+    /// the best of several short windows (a peak, not an average).
     pub mb_per_sec_per_thread: f64,
 }
 
-/// Source buffer of the benchmark: 64 Ki 16-bit words, which stays in the L2 cache with the
-/// four destinations.
-const BENCH_BYTES: usize = 128 << 10;
+/// Source buffer of the benchmark: 16 Ki 16-bit words. With the four destinations that is
+/// 160 KiB, which stays in the L2 cache of every supported CPU (256 KiB and up).
+const BENCH_BYTES: usize = 32 << 10;
+
+/// Length of one timed window; the best window is reported.
+const BENCH_WINDOW: Duration = Duration::from_millis(10);
 
 /// Pick-and-measure call for resource sizing: reports [`gf_kernel`], the supported kernels,
-/// and the single-thread throughput of the kernel in use, measured for about `budget` (at
-/// least one pass; 50 to 200 ms gives a stable figure).
+/// and the single-thread throughput of the kernel in use. It measures for about `budget` in
+/// 10 ms windows and reports the best one, so a window the scheduler spent on a slower
+/// (efficiency) core or interrupted does not lower the figure; at least one pass is always
+/// timed. 100 ms or more gives a repeatable figure.
 #[must_use]
 pub fn gf_kernel_benchmark(budget: Duration) -> GfKernelReport {
     let kernel = Kernel::detect();
@@ -79,22 +85,30 @@ pub fn gf_kernel_benchmark(budget: Duration) -> GfKernelReport {
     };
     // One untimed pass warms the caches and the tables.
     pass(&mut dsts);
+    let pass_bytes = (coeffs.len() * BENCH_BYTES) as f64;
     let start = Instant::now();
-    let mut passes = 0u64;
+    let mut best = 0f64;
     loop {
-        pass(&mut dsts);
-        passes += 1;
+        let window = Instant::now();
+        let mut passes = 0u64;
+        loop {
+            pass(&mut dsts);
+            passes += 1;
+            if window.elapsed() >= BENCH_WINDOW.min(budget) {
+                break;
+            }
+        }
+        let secs = window.elapsed().as_secs_f64().max(1e-9);
+        best = best.max(passes as f64 * pass_bytes / secs / 1e6);
         if start.elapsed() >= budget {
             break;
         }
     }
-    let secs = start.elapsed().as_secs_f64().max(1e-9);
     std::hint::black_box(&dsts);
-    let bytes = passes as f64 * (coeffs.len() * BENCH_BYTES) as f64;
     GfKernelReport {
         isa: kernel.isa(),
         supported,
-        mb_per_sec_per_thread: bytes / secs / 1e6,
+        mb_per_sec_per_thread: best,
     }
 }
 
