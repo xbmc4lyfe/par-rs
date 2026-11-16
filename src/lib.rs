@@ -15,7 +15,7 @@
 //! | [`crc`] | CRC-32 kernels (hardware / slice-by-8), streaming hasher, register-level GF(2) helpers |
 //! | [`cpu`] | `PAR_RS_SIMD=off` switch that makes every runtime dispatch use its portable fallback; GF(2^16) kernel in use and its single-thread benchmark |
 //! | [`hasher`], [`md5simd`], [`parhash`] | fused CRC-32 + MD5 + 16k-MD5 hashing, multi-lane SIMD MD5 (16 or 32 lanes), all-core slice/file hashing pool |
-//! | [`gf16`], [`gf16::simd`] | GF(2^16) arithmetic, PAR2 input constants, Vandermonde solving, NEON / SSSE3 / AVX2 / AVX-512 kernels |
+//! | [`gf16`], [`gf16::simd`] | GF(2^16) arithmetic, PAR2 input constants, Vandermonde solving, NEON / SSSE3 / AVX2 / AVX-512 / GFNI kernels |
 //! | [`packet`] | PAR2 packet encoders and a tolerant, resynchronizing parser with lazy decoding |
 //! | [`inspect`] | zero-copy deep introspection of all 12 PAR2 v2.0 packet types, PAR1 / PAR3 headers, creator fingerprinting, `.volNNN+MM.par2` analysis |
 //! | [`par2`] | indexer-facing `Inventory` / `Par2File` summary of a par2 buffer |
