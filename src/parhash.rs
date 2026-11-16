@@ -8,7 +8,7 @@
 
 use crate::crc::Crc32;
 use crate::hasher::{FileHasher, FileHashes, READ_CHUNK};
-use crate::md5simd::{INIT as MD5_INIT, LANES, compress_blocks};
+use crate::md5simd::{INIT as MD5_INIT, batch_lanes, compress_blocks};
 use crate::packet::read_exact_at;
 use md5::{Digest, Md5};
 use std::fs::File;
@@ -45,13 +45,14 @@ pub(crate) fn thread_count(requested: usize) -> usize {
 
 /// Group consecutive ranges from one file into full SIMD lanes.
 fn plan_jobs(ranges: &[HashRange]) -> Vec<std::ops::Range<usize>> {
+    let lanes = batch_lanes();
     let mut jobs = Vec::new();
     let mut start = 0;
     while start < ranges.len() {
         let file = ranges[start].file;
         let count = ranges[start..]
             .iter()
-            .take(LANES)
+            .take(lanes)
             .take_while(|r| r.file == file)
             .count();
         jobs.push(start..start + count);

@@ -13,8 +13,10 @@
 //! against it in the tests). Kernels:
 //!
 //! - `AArch64`: NEON, [`GROUPS`] interleaved 4-lane vectors (eight fit the 32 vector registers);
-//! - `x86_64`: AVX2 when the CPU has it (detected at runtime), two interleaved 8-lane vectors;
-//!   otherwise SSE2, four interleaved 4-lane vectors (both fill the 16 vector registers);
+//! - `x86_64`: AVX-512 when the CPU has it (detected at runtime), two interleaved 16-lane
+//!   vectors with `vprold` rotates and `vpternlogd` for the round functions; else AVX2, two
+//!   interleaved 8-lane vectors; else SSE2, four interleaved 4-lane vectors (both fill the 16
+//!   vector registers);
 //! - elsewhere: a portable lane array.
 
 /// Interleaved 4-lane groups per kernel invocation (NEON, SSE2 and portable kernels).
@@ -27,11 +29,16 @@ pub const GROUPS: usize = 8;
 /// Interleaved 4-lane groups per kernel invocation (NEON, SSE2 and portable kernels).
 #[cfg(not(target_arch = "aarch64"))]
 pub const GROUPS: usize = 4;
-/// Messages hashed per kernel pass; callers batching work should use multiples of this.
+/// Messages hashed per kernel pass at most (the AVX-512 kernel takes 32 on `x86_64`); the
+/// kernel this CPU runs may take fewer, see [`batch_lanes`].
+#[cfg(target_arch = "x86_64")]
+pub const LANES: usize = 32;
+/// Messages hashed per kernel pass at most; callers batching work should use multiples of this.
+#[cfg(not(target_arch = "x86_64"))]
 pub const LANES: usize = 4 * GROUPS;
 
 /// Widest vector in 32-bit lanes.
-const MAX_W: usize = 8;
+const MAX_W: usize = 16;
 
 /// A vector of `W` 32-bit lanes.
 trait Lanes: Copy {
@@ -478,6 +485,133 @@ mod avx2 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    //! Sixteen 32-bit lanes. These methods use AVX-512F intrinsics and are only ever inlined
+    //! into the `#[target_feature(enable = "avx512f")]` entry points below `run`.
+    use super::Lanes;
+    use std::arch::x86_64::*;
+
+    #[derive(Clone, Copy)]
+    pub struct V(pub __m512i);
+
+    impl Lanes for V {
+        const W: usize = 16;
+        #[inline(always)]
+        fn splat(x: u32) -> Self {
+            // SAFETY: only reached from `avx512f` target-feature functions.
+            V(unsafe { _mm512_set1_epi32(x as i32) })
+        }
+        #[inline(always)]
+        fn from_words(w: &[u32]) -> Self {
+            let w = &w[..16];
+            // SAFETY: unaligned load of 64 bytes from a 64-byte slice; AVX-512F per the module docs.
+            V(unsafe { _mm512_loadu_si512(w.as_ptr() as *const __m512i) })
+        }
+        #[inline(always)]
+        fn lane(self, l: usize) -> u32 {
+            let mut out = [0u32; 16];
+            // SAFETY: unaligned store of 64 bytes into a 64-byte array; AVX-512F per the module docs.
+            unsafe { _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, self.0) };
+            out[l]
+        }
+        #[inline(always)]
+        fn add(self, o: Self) -> Self {
+            // SAFETY: AVX-512F arithmetic (see the module docs).
+            V(unsafe { _mm512_add_epi32(self.0, o.0) })
+        }
+        #[inline(always)]
+        fn xor(self, o: Self) -> Self {
+            // SAFETY: AVX-512F arithmetic (see the module docs).
+            V(unsafe { _mm512_xor_si512(self.0, o.0) })
+        }
+        #[inline(always)]
+        fn or(self, o: Self) -> Self {
+            // SAFETY: AVX-512F arithmetic (see the module docs).
+            V(unsafe { _mm512_or_si512(self.0, o.0) })
+        }
+        #[inline(always)]
+        fn and(self, o: Self) -> Self {
+            // SAFETY: AVX-512F arithmetic (see the module docs).
+            V(unsafe { _mm512_and_si512(self.0, o.0) })
+        }
+        #[inline(always)]
+        fn not(self) -> Self {
+            // SAFETY: AVX-512F arithmetic (see the module docs) (truth table 0x55: not a).
+            V(unsafe { _mm512_ternarylogic_epi32::<0x55>(self.0, self.0, self.0) })
+        }
+        #[inline(always)]
+        fn rotl<const S: i32, const R: i32>(self) -> Self {
+            // SAFETY: AVX-512F rotate (see the module docs); `S` is 1..=31.
+            V(unsafe { _mm512_rol_epi32::<S>(self.0) })
+        }
+        // Round functions as one `vpternlogd` each; the immediate is the truth table indexed by
+        // `(b << 2) | (c << 1) | d`.
+        #[inline(always)]
+        fn f(b: Self, c: Self, d: Self) -> Self {
+            // SAFETY: AVX-512F (see the module docs). 0xCA: (b & c) | (!b & d).
+            V(unsafe { _mm512_ternarylogic_epi32::<0xCA>(b.0, c.0, d.0) })
+        }
+        #[inline(always)]
+        fn g(b: Self, c: Self, d: Self) -> Self {
+            // SAFETY: AVX-512F (see the module docs). 0xE4: (b & d) | (c & !d).
+            V(unsafe { _mm512_ternarylogic_epi32::<0xE4>(b.0, c.0, d.0) })
+        }
+        #[inline(always)]
+        fn h(b: Self, c: Self, d: Self) -> Self {
+            // SAFETY: AVX-512F (see the module docs). 0x96: b ^ c ^ d.
+            V(unsafe { _mm512_ternarylogic_epi32::<0x96>(b.0, c.0, d.0) })
+        }
+        #[inline(always)]
+        fn i(b: Self, c: Self, d: Self) -> Self {
+            // SAFETY: AVX-512F (see the module docs). 0x39: c ^ (b | !d).
+            V(unsafe { _mm512_ternarylogic_epi32::<0x39>(b.0, c.0, d.0) })
+        }
+        #[inline(always)]
+        fn transpose(w: &[[u32; 16]]) -> [Self; 16] {
+            let w = &w[..16];
+            // SAFETY: each of the 16 rows has 16 words; AVX-512F per the module docs.
+            unsafe {
+                let r: [__m512i; 16] =
+                    std::array::from_fn(|l| _mm512_loadu_si512(w[l].as_ptr() as *const __m512i));
+                // Pairs of rows interleaved by word, then by word pair: afterwards 128-bit
+                // lane `L` of `u[4 * q + k]` holds word `4 * L + k` of rows `4q..4q + 4`.
+                let t: [__m512i; 16] = std::array::from_fn(|i| {
+                    let (a, b) = (r[i & !1], r[i | 1]);
+                    if i % 2 == 0 {
+                        _mm512_unpacklo_epi32(a, b)
+                    } else {
+                        _mm512_unpackhi_epi32(a, b)
+                    }
+                });
+                let u: [__m512i; 16] = std::array::from_fn(|i| {
+                    let (q, k) = (i / 4, i % 4);
+                    let (a, b) = (t[4 * q + k / 2], t[4 * q + k / 2 + 2]);
+                    if k % 2 == 0 {
+                        _mm512_unpacklo_epi64(a, b)
+                    } else {
+                        _mm512_unpackhi_epi64(a, b)
+                    }
+                });
+                // Gather 128-bit lane `L` of `u[k]`, `u[4 + k]`, `u[8 + k]`, `u[12 + k]`:
+                // word `4 * L + k` of all 16 rows.
+                let mut out = [V(_mm512_setzero_si512()); 16];
+                for k in 0..4 {
+                    let x = _mm512_shuffle_i32x4::<0x88>(u[k], u[4 + k]);
+                    let y = _mm512_shuffle_i32x4::<0xDD>(u[k], u[4 + k]);
+                    let x2 = _mm512_shuffle_i32x4::<0x88>(u[8 + k], u[12 + k]);
+                    let y2 = _mm512_shuffle_i32x4::<0xDD>(u[8 + k], u[12 + k]);
+                    out[k] = V(_mm512_shuffle_i32x4::<0x88>(x, x2));
+                    out[8 + k] = V(_mm512_shuffle_i32x4::<0xDD>(x, x2));
+                    out[4 + k] = V(_mm512_shuffle_i32x4::<0x88>(y, y2));
+                    out[12 + k] = V(_mm512_shuffle_i32x4::<0xDD>(y, y2));
+                }
+                out
+            }
+        }
+    }
+}
+
 pub(crate) const INIT: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
 
 /// One MD5 compression of `G` interleaved lane groups.
@@ -686,6 +820,13 @@ fn run_batch<L: Lanes, const G: usize>(msgs: &[&[u8]], batch: &[usize], out: &mu
     }
 }
 
+/// Messages the kernel this CPU runs hashes per pass (at most [`LANES`]): 32 for NEON and
+/// AVX-512, 16 for AVX2 and SSE2. Callers batching work should use multiples of this.
+#[must_use]
+pub fn batch_lanes() -> usize {
+    Kernel::best().lanes()
+}
+
 /// Compress complete blocks into independently resumable message states.
 /// The caller supplies the MD5 padding in the final blocks.
 pub(crate) fn compress_blocks(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
@@ -764,6 +905,9 @@ pub(crate) enum Kernel {
     /// `x86_64` AVX2 (runtime detected).
     #[cfg(target_arch = "x86_64")]
     Avx2,
+    /// `x86_64` AVX-512F (runtime detected).
+    #[cfg(target_arch = "x86_64")]
+    Avx512,
 }
 
 impl Kernel {
@@ -773,10 +917,16 @@ impl Kernel {
         #[cfg(target_arch = "aarch64")]
         let out = vec![Kernel::Neon, Kernel::Portable];
         #[cfg(target_arch = "x86_64")]
-        let out = if std::arch::is_x86_feature_detected!("avx2") {
-            vec![Kernel::Avx2, Kernel::Sse2, Kernel::Portable]
-        } else {
-            vec![Kernel::Sse2, Kernel::Portable]
+        let out = {
+            let mut v = Vec::new();
+            if std::arch::is_x86_feature_detected!("avx512f") {
+                v.push(Kernel::Avx512);
+            }
+            if std::arch::is_x86_feature_detected!("avx2") {
+                v.push(Kernel::Avx2);
+            }
+            v.extend([Kernel::Sse2, Kernel::Portable]);
+            v
         };
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let out = vec![Kernel::Portable];
@@ -792,13 +942,26 @@ impl Kernel {
         #[cfg(target_arch = "aarch64")]
         return Kernel::Neon;
         #[cfg(target_arch = "x86_64")]
-        return if std::arch::is_x86_feature_detected!("avx2") {
+        return if std::arch::is_x86_feature_detected!("avx512f") {
+            Kernel::Avx512
+        } else if std::arch::is_x86_feature_detected!("avx2") {
             Kernel::Avx2
         } else {
             Kernel::Sse2
         };
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         return Kernel::Portable;
+    }
+
+    /// Messages this kernel hashes per pass (its lanes times its interleaved groups).
+    pub(crate) fn lanes(self) -> usize {
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Avx512 => 16 * AVX512_GROUPS,
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Avx2 => 8 * AVX2_GROUPS,
+            _ => 4 * GROUPS,
+        }
     }
 
     /// [`md5_many_into`] with this kernel (more than one message).
@@ -814,6 +977,12 @@ impl Kernel {
                 assert!(std::arch::is_x86_feature_detected!("avx2"));
                 // SAFETY: checked just above (a cached atomic load).
                 unsafe { run_avx2(msgs, out) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Avx512 => {
+                assert!(std::arch::is_x86_feature_detected!("avx512f"));
+                // SAFETY: checked just above (a cached atomic load).
+                unsafe { run_avx512(msgs, out) }
             }
         }
     }
@@ -832,11 +1001,17 @@ impl Kernel {
                 // SAFETY: checked just above (a cached atomic load).
                 unsafe { stream_avx2(states, blocks) }
             }
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Avx512 => {
+                assert!(std::arch::is_x86_feature_detected!("avx512f"));
+                // SAFETY: checked just above (a cached atomic load).
+                unsafe { stream_avx512(states, blocks) }
+            }
         }
     }
 }
 
-/// Two interleaved 8-lane vectors: 16 lanes, the same [`LANES`] as SSE2.
+/// Two interleaved 8-lane vectors: 16 lanes, as SSE2.
 #[cfg(target_arch = "x86_64")]
 const AVX2_GROUPS: usize = 2;
 
@@ -850,6 +1025,23 @@ fn run_avx2(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
 #[target_feature(enable = "avx2")]
 fn stream_avx2(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
     stream_dispatch::<avx2::V, AVX2_GROUPS>(states, blocks);
+}
+
+/// Two interleaved 16-lane vectors: 32 lanes ([`LANES`]). The 32 registers hold both groups'
+/// state with room to spare.
+#[cfg(target_arch = "x86_64")]
+const AVX512_GROUPS: usize = 2;
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+fn run_avx512(msgs: &[&[u8]], out: &mut [[u8; 16]]) {
+    run::<avx512::V, AVX512_GROUPS>(msgs, out);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+fn stream_avx512(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
+    stream_dispatch::<avx512::V, AVX512_GROUPS>(states, blocks);
 }
 
 /// MD5 of every message, in input order.
@@ -930,6 +1122,10 @@ mod tests {
             .collect();
         let expect: Vec<[u8; 16]> = bufs.iter().map(|b| md5(b)).collect();
         let kernels = Kernel::available();
+        assert!(batch_lanes() <= LANES && batch_lanes() == Kernel::best().lanes());
+        for k in &kernels {
+            assert!(k.lanes() <= LANES, "{k:?}");
+        }
         if crate::cpu::simd_enabled() {
             assert_eq!(kernels[0], Kernel::best());
         } else {
