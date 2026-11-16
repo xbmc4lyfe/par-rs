@@ -208,11 +208,8 @@ impl Pieces {
 
     /// The whole slice of `len` bytes, missing bytes zero (callers check coverage first).
     pub(crate) fn into_slice(mut self, len: usize) -> Vec<u8> {
-        if self.runs.len() == 1
-            && let Some(run) = self.runs.remove(&0)
-            && run.len() == len
-        {
-            return run;
+        if self.runs.len() == 1 && self.runs.get(&0).is_some_and(|run| run.len() == len) {
+            return self.runs.remove(&0).unwrap_or_default();
         }
         let mut out = vec![0u8; len];
         for (k, run) in self.runs {
@@ -902,6 +899,39 @@ impl Par2Repairer {
     pub fn blocks_needed_now(&self) -> u64 {
         self.streaming_status()
             .map_or_else(|| self.blocks_needed(), |s| s.blocks_needed_now)
+    }
+}
+
+#[cfg(test)]
+mod pieces_tests {
+    use super::Pieces;
+
+    #[test]
+    fn merges_overlap_adjacency_and_bridges_with_newer_bytes_winning() {
+        let mut p = Pieces::default();
+        assert_eq!(p.insert(10, &[1; 5]), 5); // [10,15)
+        assert_eq!(p.insert(20, &[2; 5]), 5); // [20,25)
+        assert_eq!(p.insert(15, &[3; 2]), 2); // touches left run: [10,17)
+        assert_eq!(p.insert(8, &[4; 4]), 2); // overlaps left edge: [8,17), 10..12 overwritten
+        assert_eq!(p.insert(16, &[5; 5]), 3); // bridges into [20,25): [8,25)
+        assert_eq!(p.insert(9, &[6; 2]), 0); // inside: nothing new
+        assert_eq!(p.held(), 17);
+        let out = p.into_slice(30);
+        let mut want = vec![0u8; 30];
+        want[8..12].fill(4);
+        want[9..11].fill(6);
+        want[12..15].fill(1);
+        want[15..16].fill(3);
+        want[16..21].fill(5);
+        want[21..25].fill(2);
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn into_slice_keeps_a_short_run() {
+        let mut p = Pieces::default();
+        p.insert(0, &[7; 3]);
+        assert_eq!(p.into_slice(5), vec![7, 7, 7, 0, 0]);
     }
 }
 
