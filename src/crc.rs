@@ -3,7 +3,8 @@
 //! This module provides:
 //!
 //! * A streaming [`Crc32`] hasher with hardware acceleration (`pclmulqdq` folding on
-//!   `x86_64`, the `crc32x` instructions on `AArch64`) and a slice-by-8 table fallback.
+//!   `x86_64`; `pmull` folding on `AArch64`, or the `crc32x` instructions where the CPU has
+//!   no `pmull`) and a slice-by-8 table fallback.
 //! * GF(2) polynomial arithmetic on CRC registers: [`crc32_combine`], [`crc32_zeros`],
 //!   [`crc32_of_zeros`] and [`crc32_shift_raw`], implemented via `x^n mod P(x)` exponentiation
 //!   in `O(log n)` so that CRCs of concatenations and zero-extensions can be computed
@@ -227,6 +228,52 @@ pub fn combine_block_crcs(crcs: &[u32], block_len: u64) -> u32 {
 // Hardware kernels
 // ---------------------------------------------------------------------------------------------
 
+// Folding constants for reflected CRC-32 carry-less multiply folding (`pclmulqdq` on `x86_64`,
+// `pmull` on `AArch64`; Intel white paper "Fast CRC Computation for Generic Polynomials Using
+// PCLMULQDQ Instruction"). Each constant is `bitreverse(x^N mod P(x)) << 1`.
+
+/// Carry-less 32x32 multiply reduced modulo the non-reflected polynomial `0x104C11DB7`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const fn gf2_mulmod(a: u32, b: u32) -> u32 {
+    let mut r: u64 = 0;
+    let mut i = 0;
+    while i < 32 {
+        if (b >> i) & 1 == 1 {
+            r ^= (a as u64) << i;
+        }
+        i += 1;
+    }
+    let mut bit = 63;
+    while bit >= 32 {
+        if (r >> bit) & 1 == 1 {
+            r ^= 0x1_04C1_1DB7u64 << (bit - 32);
+        }
+        bit -= 1;
+    }
+    r as u32
+}
+
+/// `x^n mod P(x)` in non-reflected representation (bit 0 is `x^0`).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const fn xpow_mod(n: u32) -> u32 {
+    let mut result: u32 = 1;
+    let mut base: u32 = 2;
+    let mut e = n;
+    while e > 0 {
+        if e & 1 == 1 {
+            result = gf2_mulmod(result, base);
+        }
+        base = gf2_mulmod(base, base);
+        e >>= 1;
+    }
+    result
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const fn fold_constant(n: u32) -> u64 {
+    (xpow_mod(n).reverse_bits() as u64) << 1
+}
+
 #[cfg(target_arch = "aarch64")]
 mod hw {
     /// Combine three raw registers computed over consecutive segments `A ‖ B ‖ C`, where
@@ -280,66 +327,122 @@ mod hw {
         unsafe { crc32_stream(joined, tail) }
     }
 
+    /// Fold constants for eight 128-bit accumulators (1024 bits apart) and for one.
+    const K_FOLD8: [u64; 2] = [
+        super::fold_constant(8 * 128 + 32),
+        super::fold_constant(8 * 128 - 32),
+    ];
+    const K_FOLD1: [u64; 2] = [
+        super::fold_constant(128 + 32),
+        super::fold_constant(128 - 32),
+    ];
+
+    /// Shortest input [`crc32_pmull`] handles. On an Apple M4 it beats one `crc32x` stream from
+    /// here up (40 vs 20 GB/s at 128 bytes, 57 vs 11 GB/s at 1 KiB) and the three-stream
+    /// kernel at every size (about 60 vs 31 GB/s); see `examples/cpu_paths.rs`.
+    pub(super) const PMULL_MIN: usize = 128;
+
+    /// `x` folded forward by the distance `k` encodes, plus `next`.
+    #[inline(always)]
+    unsafe fn fold(
+        x: core::arch::aarch64::uint64x2_t,
+        k: core::arch::aarch64::poly64x2_t,
+        next: core::arch::aarch64::uint64x2_t,
+    ) -> core::arch::aarch64::uint64x2_t {
+        use core::arch::aarch64::*;
+        // SAFETY: the caller enables `aes` (which provides `pmull`).
+        unsafe {
+            let xp = vreinterpretq_p64_u64(x);
+            let lo = vmull_p64(vgetq_lane_p64::<0>(xp), vgetq_lane_p64::<0>(k));
+            let hi = vmull_high_p64(xp, k);
+            veorq_u64(
+                veorq_u64(vreinterpretq_u64_p128(lo), vreinterpretq_u64_p128(hi)),
+                next,
+            )
+        }
+    }
+
+    /// Carry-less multiply folding over eight 128-bit accumulators (128 bytes per round),
+    /// reduced to the register with two `crc32x` instructions. `data.len() >= 128`.
+    #[target_feature(enable = "crc,aes")]
+    unsafe fn crc32_pmull(state: u32, data: &[u8]) -> u32 {
+        use core::arch::aarch64::*;
+        debug_assert!(data.len() >= 128);
+        let (blocks, tail) = data.as_chunks::<16>();
+        // SAFETY: every load reads one complete 16-byte block of `data`; the caller enables
+        // `crc` and `aes`.
+        unsafe {
+            let load = |b: &[u8; 16]| vreinterpretq_u64_u8(vld1q_u8(b.as_ptr()));
+            let (head, rest) = blocks.split_at(8);
+            let mut acc: [uint64x2_t; 8] = core::array::from_fn(|i| load(&head[i]));
+            acc[0] = veorq_u64(
+                acc[0],
+                vsetq_lane_u64::<0>(u64::from(state), vdupq_n_u64(0)),
+            );
+            let k8 = vreinterpretq_p64_u64(vld1q_u64(K_FOLD8.as_ptr()));
+            let (rounds, rest) = rest.as_chunks::<8>();
+            for round in rounds {
+                for (a, b) in acc.iter_mut().zip(round) {
+                    *a = fold(*a, k8, load(b));
+                }
+            }
+            let k1 = vreinterpretq_p64_u64(vld1q_u64(K_FOLD1.as_ptr()));
+            let mut x = acc[0];
+            for &a in &acc[1..] {
+                x = fold(x, k1, a);
+            }
+            for b in rest {
+                x = fold(x, k1, load(b));
+            }
+            let crc = __crc32d(0, vgetq_lane_u64::<0>(x));
+            let crc = __crc32d(crc, vgetq_lane_u64::<1>(x));
+            crc32_stream(crc, tail)
+        }
+    }
+
     pub fn available() -> bool {
         std::arch::is_aarch64_feature_detected!("crc")
     }
 
+    /// Whether `pmull` (part of the `aes` extension) is available, detected once.
+    pub(super) fn pmull_available() -> bool {
+        static PMULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PMULL.get_or_init(|| std::arch::is_aarch64_feature_detected!("aes"))
+    }
+
     pub fn update_raw(state: u32, data: &[u8]) -> u32 {
-        // SAFETY: caller checked `available()`.
+        // SAFETY: caller checked `available()`; `crc32_pmull` additionally needs `aes`.
         unsafe {
-            if data.len() >= 64 * 1024 {
+            if data.len() >= PMULL_MIN && pmull_available() {
+                crc32_pmull(state, data)
+            } else if data.len() >= 64 * 1024 {
                 crc32_3way(state, data)
             } else {
                 crc32_stream(state, data)
             }
         }
     }
+
+    /// The three kernels, for tests that compare each against the reference.
+    #[cfg(test)]
+    pub(super) fn each_kernel(state: u32, data: &[u8]) -> Vec<(&'static str, u32)> {
+        // SAFETY: `crc` is checked by the caller through `available()`; `aes` is checked here.
+        unsafe {
+            let mut out = vec![
+                ("crc32x", crc32_stream(state, data)),
+                ("crc32x 3-way", crc32_3way(state, data)),
+            ];
+            if data.len() >= 128 && pmull_available() {
+                out.push(("pmull", crc32_pmull(state, data)));
+            }
+            out
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 mod hw {
-    // Folding constants for the reflected CRC-32 `pclmulqdq` algorithm (Intel white paper
-    // "Fast CRC Computation for Generic Polynomials Using PCLMULQDQ Instruction").
-    // Each constant is `bitreverse(x^N mod P(x)) << 1`.
-
-    /// Carry-less 32x32 multiply reduced modulo the non-reflected polynomial `0x104C11DB7`.
-    const fn gf2_mulmod(a: u32, b: u32) -> u32 {
-        let mut r: u64 = 0;
-        let mut i = 0;
-        while i < 32 {
-            if (b >> i) & 1 == 1 {
-                r ^= (a as u64) << i;
-            }
-            i += 1;
-        }
-        let mut bit = 63;
-        while bit >= 32 {
-            if (r >> bit) & 1 == 1 {
-                r ^= 0x1_04C1_1DB7u64 << (bit - 32);
-            }
-            bit -= 1;
-        }
-        r as u32
-    }
-
-    /// `x^n mod P(x)` in non-reflected representation (bit 0 is `x^0`).
-    const fn xpow_mod(n: u32) -> u32 {
-        let mut result: u32 = 1;
-        let mut base: u32 = 2;
-        let mut e = n;
-        while e > 0 {
-            if e & 1 == 1 {
-                result = gf2_mulmod(result, base);
-            }
-            base = gf2_mulmod(base, base);
-            e >>= 1;
-        }
-        result
-    }
-
-    pub(super) const fn fold_constant(n: u32) -> u64 {
-        (xpow_mod(n).reverse_bits() as u64) << 1
-    }
+    use super::fold_constant;
 
     pub(super) const K1: u64 = fold_constant(4 * 128 + 32);
     pub(super) const K2: u64 = fold_constant(4 * 128 - 32);
@@ -466,7 +569,8 @@ mod hw {
 pub enum CrcKernel {
     /// Slice-by-8 table lookup.
     Software,
-    /// `pclmulqdq` folding (`x86_64`) or `crc32x` instructions (`AArch64`).
+    /// `pclmulqdq` folding (`x86_64`), or `pmull` folding with `crc32x` instructions
+    /// (`AArch64`; `crc32x` alone when the CPU has no `pmull`).
     Hardware,
 }
 
@@ -667,7 +771,8 @@ mod tests {
     #[test]
     fn kernels_agree_with_bitwise_reference() {
         for len in [
-            0usize, 1, 7, 8, 15, 16, 63, 64, 65, 127, 128, 1000, 4096, 70_000, 200_001,
+            0usize, 1, 7, 8, 15, 16, 63, 64, 65, 127, 128, 129, 143, 144, 255, 256, 257, 271, 383,
+            384, 1000, 4096, 70_000, 200_001,
         ] {
             let data = pseudo_random(len, len as u64 + 1);
             let expect = bitwise_crc(&data);
@@ -679,6 +784,10 @@ mod tests {
             assert_eq!(crc32(&data), expect, "dispatch len={len}");
             if hw::available() {
                 assert_eq!(hw::update_raw(INIT, &data) ^ INIT, expect, "hw len={len}");
+                #[cfg(target_arch = "aarch64")]
+                for (name, got) in hw::each_kernel(INIT, &data) {
+                    assert_eq!(got ^ INIT, expect, "{name} len={len}");
+                }
             }
             // Unaligned start.
             if len > 3 {
@@ -813,7 +922,7 @@ mod tests {
         assert_eq!(hw::K3, 0x1_7519_97D0);
         assert_eq!(hw::K4, 0x0_CCAA_009E);
         assert_eq!(hw::K5, 0x1_63CD_6124);
-        assert_eq!(hw::fold_constant(32), (POLY as u64) << 1);
+        assert_eq!(fold_constant(32), (POLY as u64) << 1);
     }
 
     #[test]

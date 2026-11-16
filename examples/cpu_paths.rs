@@ -13,7 +13,11 @@ fn main() {
         .collect();
     println!("crc kernel: {:?}", par_rs::crc::kernel());
     for size in [
-        1usize << 10,
+        128usize,
+        192,
+        256,
+        512,
+        1 << 10,
         4 << 10,
         16 << 10,
         64 << 10,
