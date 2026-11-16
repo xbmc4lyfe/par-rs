@@ -13,7 +13,7 @@
 //! |---|---|
 //! | [`gf2`] | GF(2) polynomial algebra over the CRC-32 polynomial: combine / zero-pad / un-pad / un-combine, yEnc and IFSC folding, `O(1)` rolling CRC, LCM grids |
 //! | [`crc`] | CRC-32 kernels (hardware / slice-by-8), streaming hasher, register-level GF(2) helpers |
-//! | [`cpu`] | `PAR_RS_SIMD=off` switch that makes every runtime dispatch use its portable fallback |
+//! | [`cpu`] | `PAR_RS_SIMD=off` switch that makes every runtime dispatch use its portable fallback; GF(2^16) kernel in use and its single-thread benchmark |
 //! | [`hasher`], [`md5simd`], [`parhash`] | fused CRC-32 + MD5 + 16k-MD5 hashing, multi-lane SIMD MD5 (16 or 32 lanes), all-core slice/file hashing pool |
 //! | [`gf16`], [`gf16::simd`] | GF(2^16) arithmetic, PAR2 input constants, Vandermonde solving, NEON / SSSE3 / AVX2 / AVX-512 kernels |
 //! | [`packet`] | PAR2 packet encoders and a tolerant, resynchronizing parser with lazy decoding |
@@ -206,6 +206,7 @@ pub mod verify;
 pub use bridge::{
     BridgeReport, Candidate, Par2Bridge, Resolution, ResolveMethod, rar5_volume_number,
 };
+pub use cpu::{GfKernelReport, gf_kernel, gf_kernel_benchmark};
 pub use crc::{Crc32, Crc32Combiner, WindowTable};
 pub use create::{
     CreateError, CreateOptions, CreateReport, CreateStage, Par2Set, SetOptions, SourceFile,
