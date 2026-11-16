@@ -1630,6 +1630,9 @@ pub struct LiveStatus {
 
 /// PAR2 recovery exponents are 16-bit, so no set has more distinct syndromes.
 const MAX_SYNDROME_SLOTS: usize = 65535;
+/// A shared back-fill releases the payload gate after re-reading about this much.
+/// Tests use a tiny chunk so every shared back-fill crosses chunk boundaries.
+const BACKFILL_CHUNK_BYTES: u64 = if cfg!(test) { 4096 } else { 64 << 20 };
 
 /// Session options.
 #[derive(Clone, Debug)]
@@ -1935,6 +1938,8 @@ struct SessionInner {
     /// slot cap was full. Raising the cap absorbs them again.
     cap_rejected: Mutex<Vec<(PathBuf, usize)>>,
     needs_backfill: AtomicBool,
+    /// Bumped (under the exclusive payload gate) each time a slot is added.
+    slot_generation: AtomicU64,
     /// One back-fill at a time; concurrent ones would only re-read the same slices.
     backfill_lock: Mutex<()>,
     pool: Option<FoldPool>,
@@ -2200,6 +2205,7 @@ impl StreamingParSession {
             slot_limit,
             cap_rejected: Mutex::new(Vec::new()),
             needs_backfill: AtomicBool::new(false),
+            slot_generation: AtomicU64::new(0),
             backfill_lock: Mutex::new(()),
             pool,
             folds: AtomicU64::new(0),
@@ -3099,20 +3105,36 @@ impl StreamingParSession {
         target_files: Option<&HashMap<usize, &File>>,
         flush: bool,
     ) -> Result<(), RepairError> {
-        let mut skipped: Option<RepairError> = None;
         self.inner.control.ensure_running()?;
         if flush {
             self.flush();
         }
         self.inner.control.ensure_running()?;
+        if let Some(e) = self.backfill_range(target_files, flush, 0..self.inner.logs.len())? {
+            return Err(e);
+        }
+        self.inner.needs_backfill.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Folds the verified slices in `range` into every slot that misses them.
+    /// In shared (non-`flush`) mode a slice that cannot be re-read is skipped and
+    /// the first such error is returned as `Ok(Some(e))`; strict mode fails on it.
+    fn backfill_range(
+        &self,
+        target_files: Option<&HashMap<usize, &File>>,
+        flush: bool,
+        range: std::ops::Range<usize>,
+    ) -> Result<Option<RepairError>, RepairError> {
+        let mut skipped: Option<RepairError> = None;
         let verified: Vec<usize> = {
             let t = self
                 .inner
                 .tracker
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (0..t.states.len())
-                .filter(|&g| t.states[g] == SliceState::VerifiedGood)
+            range
+                .filter(|&g| g < t.states.len() && t.states[g] == SliceState::VerifiedGood)
                 .collect()
         };
         let slots: Vec<Arc<Mutex<SyndromeSlot>>> = self
@@ -3167,11 +3189,7 @@ impl StreamingParSession {
             self.inner.control.ensure_running()?;
         }
         self.inner.control.ensure_running()?;
-        if let Some(e) = skipped {
-            return Err(e);
-        }
-        self.inner.needs_backfill.store(false, Ordering::Release);
-        Ok(())
+        Ok(skipped)
     }
 
     fn read_slice_from_disk(
@@ -3414,21 +3432,53 @@ impl StreamingParSession {
         if !self.inner.needs_backfill.load(Ordering::Acquire) {
             return Ok(false);
         }
-        let _payload = self
-            .inner
-            .payload_gate
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only this function takes `backfill_lock`, so taking it before the gate
+        // cannot invert a lock order.
         let _one = self
             .inner
             .backfill_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.inner.needs_backfill.load(Ordering::Acquire) {
-            return Ok(false);
+        let total = self.inner.logs.len();
+        let chunk = usize::try_from(BACKFILL_CHUNK_BYTES / self.inner.slice_size.max(1) as u64)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let mut ran = false;
+        // Each round re-reads in chunks and releases the payload gate between
+        // them, so a volume arrival, cap growth or repair waits for one chunk,
+        // not the whole pass. Slots are only added under the write gate, which
+        // bumps `slot_generation`: a round that saw it change goes again, and
+        // `folded_mask` keeps already folded slices from folding twice.
+        while self.inner.needs_backfill.load(Ordering::Acquire) {
+            ran = true;
+            let generation = self.inner.slot_generation.load(Ordering::Acquire);
+            let mut skipped: Option<RepairError> = None;
+            let mut start: usize = 0;
+            loop {
+                let end = start.saturating_add(chunk).min(total);
+                let _payload = self
+                    .inner
+                    .payload_gate
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.inner.control.ensure_running()?;
+                if let Some(e) = self.backfill_range(None, false, start..end)? {
+                    skipped.get_or_insert(e);
+                }
+                if end >= total {
+                    if let Some(e) = skipped {
+                        return Err(e);
+                    }
+                    // Still under the gate: no slot can appear before this store.
+                    if self.inner.slot_generation.load(Ordering::Acquire) == generation {
+                        self.inner.needs_backfill.store(false, Ordering::Release);
+                    }
+                    break;
+                }
+                start = end;
+            }
         }
-        self.backfill_slots(None, false)?;
-        Ok(true)
+        Ok(ran)
     }
 
     /// Whether slots allocated since the last back-fill still miss verified slices.
@@ -3553,6 +3603,7 @@ impl StreamingParSession {
                     recovery_added: false,
                 }));
                 list.push(Arc::clone(&s));
+                self.inner.slot_generation.fetch_add(1, Ordering::AcqRel);
                 self.inner.needs_backfill.store(true, Ordering::Release);
                 s
             };
