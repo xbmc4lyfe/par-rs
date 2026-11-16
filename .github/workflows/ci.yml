@@ -95,3 +95,7 @@ jobs:
           echo "TEST_BIN=$bin" >> "$GITHUB_ENV"
       - name: Run the kernel tests on the emulated CPU
         run: sde64 -${{ matrix.cpu }} -- "$TEST_BIN" gf16 md5simd crc cpu
+      - name: Report the kernel the emulated CPU selects
+        run: |
+          cargo build --locked --release --example gf_kernel
+          sde64 -${{ matrix.cpu }} -- target/release/examples/gf_kernel 20
