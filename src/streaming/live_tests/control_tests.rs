@@ -520,7 +520,7 @@ fn live_ram_only_pressure_never_reads_an_uncommitted_source() {
         &fx.set,
         &fx.dir,
         SessionOptions {
-            max_staging_bytes: 4096,
+            max_staging_bytes: 2048,
             preallocated_syndrome_slots: 1,
             ..SessionOptions::default()
         },
@@ -1626,4 +1626,71 @@ fn live_target_files_clone_failure_and_one_transient_descriptor() {
     assert_eq!(session.repair_phase_stats().target_bytes_written, 0);
     drop(fillers);
     std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn live_staging_charges_only_the_bytes_held() {
+    // One quarter-slice article into a 16 KiB slice charges 4 KiB, not the whole slice.
+    let fx = fixture("staging-held", &[16384], 16384, 0, VolumeScheme::Single);
+    let id = fid(&fx, &fx.files[0].0);
+    let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    let data = &fx.files[0].1;
+    let piece = |o: usize, e: usize| (o as u64, &data[o..e], crc32(&data[o..e]));
+    let (o, d, c) = piece(0, 4096);
+    s.on_article_finished_memory_only(&id, o, d, c).unwrap();
+    assert_eq!(s.staging_bytes(), 4096);
+    // A disjoint piece adds its own length; a duplicate adds nothing.
+    let (o, d, c) = piece(8192, 12288);
+    s.on_article_finished_memory_only(&id, o, d, c).unwrap();
+    assert_eq!(s.staging_bytes(), 8192);
+    let (o, d, c) = piece(0, 4096);
+    s.on_article_finished_memory_only(&id, o, d, c).unwrap();
+    assert_eq!(s.staging_bytes(), 8192);
+    // Filling the gaps completes, verifies and releases the slice.
+    let (o, d, c) = piece(4096, 8192);
+    s.on_article_finished_memory_only(&id, o, d, c).unwrap();
+    assert_eq!(s.staging_bytes(), 12288);
+    let (o, d, c) = piece(12288, 16384);
+    s.on_article_finished_memory_only(&id, o, d, c).unwrap();
+    assert_eq!(s.staging_bytes(), 0);
+    assert_eq!(s.status().verified, 1);
+    std::fs::remove_dir_all(&fx.dir).unwrap();
+}
+
+#[test]
+fn live_zero_preallocated_slots_still_repair() {
+    // No syndrome slot exists before damage; slots are created when recovery is admitted and
+    // back-filled from the verified slices.
+    let fx = fixture("zero-slots", &[1024; 8], 1024, 2, VolumeScheme::Uniform(1));
+    let target = fid(&fx, &fx.files[3].0);
+    let s = StreamingParSession::new(
+        &fx.set,
+        &fx.dir,
+        SessionOptions {
+            preallocated_syndrome_slots: 0,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    for (i, (name, data)) in fx.files.iter().enumerate() {
+        if i == 3 {
+            continue;
+        }
+        write_at(&fx.dir.join(name), 0, data);
+        s.on_article_finished(&fid(&fx, name), 0, 1024, crc32(data), Some(data))
+            .unwrap();
+    }
+    s.on_article_failed_permanently(&target, 0, 1024).unwrap();
+    for vol in &fx.vols {
+        s.on_recovery_volume_arrived(vol, None).unwrap();
+    }
+    s.flush();
+    assert!(s.status().early_cutover_possible);
+    let rep = s.repair_available_targets_now(&[target]).unwrap();
+    assert_eq!(rep.repaired_slices.len(), 1);
+    assert_eq!(
+        std::fs::read(fx.dir.join(&fx.files[3].0)).unwrap(),
+        fx.files[3].1
+    );
+    std::fs::remove_dir_all(&fx.dir).unwrap();
 }
