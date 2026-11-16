@@ -29,8 +29,8 @@ pub const GROUPS: usize = 8;
 /// Interleaved 4-lane groups per kernel invocation (NEON, SSE2 and portable kernels).
 #[cfg(not(target_arch = "aarch64"))]
 pub const GROUPS: usize = 4;
-/// Messages hashed per kernel pass at most (the AVX-512 kernel takes 32 on `x86_64`); callers
-/// batching work should use multiples of this.
+/// Messages hashed per kernel pass at most (the AVX-512 kernel takes 32 on `x86_64`); the
+/// kernel this CPU runs may take fewer, see [`batch_lanes`].
 #[cfg(target_arch = "x86_64")]
 pub const LANES: usize = 32;
 /// Messages hashed per kernel pass at most; callers batching work should use multiples of this.
@@ -820,6 +820,13 @@ fn run_batch<L: Lanes, const G: usize>(msgs: &[&[u8]], batch: &[usize], out: &mu
     }
 }
 
+/// Messages the kernel this CPU runs hashes per pass (at most [`LANES`]): 32 for NEON and
+/// AVX-512, 16 for AVX2 and SSE2. Callers batching work should use multiples of this.
+#[must_use]
+pub fn batch_lanes() -> usize {
+    Kernel::best().lanes()
+}
+
 /// Compress complete blocks into independently resumable message states.
 /// The caller supplies the MD5 padding in the final blocks.
 pub(crate) fn compress_blocks(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
@@ -944,6 +951,17 @@ impl Kernel {
         };
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         return Kernel::Portable;
+    }
+
+    /// Messages this kernel hashes per pass (its lanes times its interleaved groups).
+    pub(crate) fn lanes(self) -> usize {
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Avx512 => 16 * AVX512_GROUPS,
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Avx2 => 8 * AVX2_GROUPS,
+            _ => 4 * GROUPS,
+        }
     }
 
     /// [`md5_many_into`] with this kernel (more than one message).
@@ -1104,6 +1122,10 @@ mod tests {
             .collect();
         let expect: Vec<[u8; 16]> = bufs.iter().map(|b| md5(b)).collect();
         let kernels = Kernel::available();
+        assert!(batch_lanes() <= LANES && batch_lanes() == Kernel::best().lanes());
+        for k in &kernels {
+            assert!(k.lanes() <= LANES, "{k:?}");
+        }
         if crate::cpu::simd_enabled() {
             assert_eq!(kernels[0], Kernel::best());
         } else {
