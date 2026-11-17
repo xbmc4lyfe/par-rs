@@ -206,6 +206,26 @@ impl Pieces {
         self.held - before
     }
 
+    /// Byte ranges of `[0, len)` that no run covers, as `(start, end)`.
+    pub(crate) fn gaps(&self, len: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        for (&k, run) in &self.runs {
+            if k > pos {
+                out.push((pos, k.min(len)));
+            }
+            pos = pos.max(k + run.len());
+            if pos >= len {
+                break;
+            }
+        }
+        if pos < len {
+            out.push((pos, len));
+        }
+        out.retain(|(a, b)| a < b);
+        out
+    }
+
     /// The whole slice of `len` bytes, missing bytes zero (callers check coverage first).
     pub(crate) fn into_slice(mut self, len: usize) -> Vec<u8> {
         if self.runs.len() == 1 && self.runs.get(&0).is_some_and(|run| run.len() == len) {
@@ -1893,9 +1913,15 @@ struct ArticlePayload<'a> {
     memory_only: bool,
 }
 
+/// A slice completed under the tracker lock: (slice, fully staged bytes, partly staged
+/// pieces, `ParQuick` CRC).
+type CompletedSlice = (usize, Option<Vec<u8>>, Option<Pieces>, Option<u32>);
+
 struct LiveStaged {
     pieces: Pieces,
     ranges: Vec<ByteRange>,
+    /// Some piece came through the RAM-only API and may exist nowhere else.
+    ram_only: bool,
 }
 
 /// Give back the staging map's spare capacity once it holds far fewer slices than it has room
@@ -2664,7 +2690,11 @@ impl StreamingParSession {
             if t.states[g] == SliceState::VerifiedGood {
                 continue;
             }
-            if let Some(st) = t.staging.remove(&g) {
+            // Disk-backed pieces can be reread if a replacement completes the slice; RAM-only
+            // pieces exist nowhere else, so keep them for that replacement.
+            if t.staging.get(&g).is_some_and(|st| !st.ram_only)
+                && let Some(st) = t.staging.remove(&g)
+            {
                 t.metadata_entries -= st.ranges.len();
                 t.staging_bytes -= st.pieces.held() as u64;
                 shrink_staging(&mut t.staging);
@@ -2785,7 +2815,7 @@ impl StreamingParSession {
             tracker: &self.inner.tracker,
             bytes: 0,
         };
-        let mut completed: Vec<(usize, Option<Vec<u8>>, Option<u32>)> = Vec::new();
+        let mut completed: Vec<CompletedSlice> = Vec::new();
         {
             let mut t = self
                 .inner
@@ -2920,9 +2950,14 @@ impl StreamingParSession {
                         t.metadata_entries += 1;
                     }
                 }
-                // Staging.
+                // Staging. A damaged slice completes only if a replacement for its lost
+                // range arrives; until then, staged bytes would sit there for the life of
+                // the session. Disk payloads can be reread at completion, so they are not
+                // staged for a damaged slice. RAM-only payloads still are, because they
+                // cannot be reread.
                 if let Some(d) = bytes
                     && (!payload.memory_only || offset > sstart || end < send)
+                    && (payload.memory_only || t.states[g] != SliceState::Damaged)
                 {
                     // Charged by bytes held; RAM-only payloads were admitted above.
                     if payload.memory_only
@@ -2932,7 +2967,9 @@ impl StreamingParSession {
                         let st = t.staging.entry(g).or_insert_with(|| LiveStaged {
                             pieces: Pieces::default(),
                             ranges: Vec::new(),
+                            ram_only: false,
                         });
+                        st.ram_only |= payload.memory_only;
                         let rel = (s - sstart) as usize;
                         let grown = st
                             .pieces
@@ -2946,20 +2983,20 @@ impl StreamingParSession {
                     }
                 }
                 if range_covered(&covered, 0, slen as i64) {
-                    // Complete: hand the bytes (if fully staged) to the unlocked phase.
-                    let staged = match t.staging.remove(&g) {
+                    // Complete: hand the staged bytes to the unlocked phase. Partly staged
+                    // pieces go too. They may be RAM-only bytes that never reached the
+                    // target file, so only the gaps between them are read from disk.
+                    let (staged, partial) = match t.staging.remove(&g) {
                         Some(st) => {
                             t.metadata_entries -= st.ranges.len();
-                            let held = st.pieces.held() as u64;
+                            completed_charges.bytes += st.pieces.held() as u64;
                             if range_covered(&normalize_ranges(&st.ranges), 0, slen as i64) {
-                                completed_charges.bytes += held;
-                                Some(st.pieces.into_slice(slen))
+                                (Some(st.pieces.into_slice(slen)), None)
                             } else {
-                                t.staging_bytes -= held;
-                                None
+                                (None, Some(st.pieces))
                             }
                         }
-                        None => None,
+                        None => (None, None),
                     };
                     shrink_staging(&mut t.staging);
                     // ParQuick: combined CRC when the articles tile the slice exactly.
@@ -2991,7 +3028,7 @@ impl StreamingParSession {
                             });
                         }
                     }
-                    completed.push((g, staged, quick));
+                    completed.push((g, staged, partial, quick));
                 }
             }
         }
@@ -3000,7 +3037,7 @@ impl StreamingParSession {
         }
         // Phase 2 (unlocked): obtain bytes, hash, fold.
         let mut damaged_any = false;
-        for (g, staged, quick) in completed {
+        for (g, staged, partial, quick) in completed {
             let b = g - f.first_slice;
             // A large article can supply whole slices without retaining copies of
             // all of them in staging or rereading bytes that the caller supplied.
@@ -3022,8 +3059,25 @@ impl StreamingParSession {
                     limit_bytes: 0,
                 });
             }
-            let ram_bytes = staged.as_ref().map_or(0, std::vec::Vec::len);
-            let verdict = self.verify_slice_bytes(fi, b, staged, quick)?;
+            let mut unverifiable = false;
+            // Bytes that came from RAM, not counting gaps filled from disk.
+            let mut ram_bytes = staged.as_ref().map_or(0, std::vec::Vec::len);
+            let staged = match (staged, partial) {
+                (Some(d), _) => Some(d),
+                (None, Some(pieces)) => {
+                    ram_bytes = pieces.held();
+                    let filled = self.fill_gaps_from_target(fi, b, pieces)?;
+                    // The gaps are not on disk yet, so the slice cannot be verified.
+                    unverifiable = filled.is_none();
+                    filled
+                }
+                (None, None) => None,
+            };
+            let verdict = if unverifiable {
+                None
+            } else {
+                self.verify_slice_bytes(fi, b, staged, quick)?
+            };
             let mut t = self
                 .inner
                 .tracker
@@ -3068,6 +3122,46 @@ impl StreamingParSession {
         Ok(out)
     }
 
+    /// Slice `b` of file `fi` from partly staged `pieces`, reading only the uncovered gaps
+    /// from the target file. The staged bytes win; they may never have reached disk. `None`
+    /// when the target file ends before a gap does.
+    fn fill_gaps_from_target(
+        &self,
+        fi: usize,
+        b: usize,
+        pieces: Pieces,
+    ) -> Result<Option<Vec<u8>>, RepairError> {
+        let f = &self.inner.files[fi];
+        let ss = self.inner.slice_size as u64;
+        let off = b as u64 * ss;
+        let len = (f.length - off).min(ss) as usize;
+        let gaps = pieces.gaps(len);
+        let mut buf = pieces.into_slice(len);
+        if gaps.is_empty() {
+            return Ok(Some(buf));
+        }
+        let fh = CountedFile::open(&f.target_path, &self.inner.control, IoClass::Source).map_err(
+            |e| {
+                self.inner
+                    .control
+                    .io_error(format!("opening {}", f.target_path.display()), e)
+            },
+        )?;
+        for (lo, hi) in gaps {
+            match fh.read_at(off + lo as u64, &mut buf[lo..hi]) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => {
+                    return Err(self
+                        .inner
+                        .control
+                        .io_error(format!("reading {}", f.target_path.display()), e));
+                }
+            }
+        }
+        Ok(Some(buf))
+    }
+
     /// Verify slice `b` of file `fi`: `staged` bytes if available, otherwise read from the
     /// target file. `quick` is the pre-combined article CRC (`ParQuick`). Returns the slice data
     /// (unpadded) when valid. Does not hold the tracker lock.
@@ -3102,11 +3196,17 @@ impl StreamingParSession {
                         .io_error(format!("opening {}", f.target_path.display()), e)
                 })?;
             let mut buf = vec![0u8; len];
-            fh.read_at(off, &mut buf).map_err(|e| {
-                self.inner
-                    .control
-                    .io_error(format!("reading {}", f.target_path.display()), e)
-            })?;
+            match fh.read_at(off, &mut buf) {
+                Ok(()) => {}
+                // RAM-only bytes of this slice have not reached disk yet: unverifiable.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => {
+                    return Err(self
+                        .inner
+                        .control
+                        .io_error(format!("reading {}", f.target_path.display()), e));
+                }
+            }
             buf
         };
         let ok = if data.len() == ss as usize {
@@ -4439,6 +4539,7 @@ const _: fn() = || {
 #[cfg(test)]
 mod live_tests {
     pub(super) mod control_tests;
+    mod stress_tests;
     use super::*;
     use crate::crc::crc32;
     use crate::create::{CreateOptions, SourceFile, VolumeScheme, create};
