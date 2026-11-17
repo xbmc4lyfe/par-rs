@@ -1658,6 +1658,30 @@ fn live_staging_charges_only_the_bytes_held() {
 }
 
 #[test]
+fn live_damaged_slice_does_not_stage_disk_bytes() {
+    // A lost article damages the slice first; the rest of the slice then arrives on disk.
+    // Those bytes can be reread if a replacement completes the slice, so holding them in
+    // staging would only pin memory for the rest of the session.
+    let fx = fixture("damaged-no-stage", &[4096], 4096, 1, VolumeScheme::Single);
+    let id = fid(&fx, &fx.files[0].0);
+    let path = fx.dir.join(&fx.files[0].0);
+    let data = &fx.files[0].1;
+    let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    s.on_article_failed_permanently(&id, 0, 1024).unwrap();
+    write_at(&path, 1024, &data[1024..]);
+    s.on_article_finished(&id, 1024, 3072, crc32(&data[1024..]), Some(&data[1024..]))
+        .unwrap();
+    assert_eq!(s.staging_bytes(), 0);
+    assert_eq!(s.status().damaged, 1);
+    // A replacement for the lost range still completes and verifies the slice from disk.
+    write_at(&path, 0, &data[..1024]);
+    s.on_article_finished(&id, 0, 1024, crc32(&data[..1024]), Some(&data[..1024]))
+        .unwrap();
+    assert_eq!(s.status().verified, 1);
+    std::fs::remove_dir_all(&fx.dir).unwrap();
+}
+
+#[test]
 fn live_zero_preallocated_slots_still_repair() {
     // No syndrome slot exists before damage; slots are created when recovery is admitted and
     // back-filled from the verified slices.

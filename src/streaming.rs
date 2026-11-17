@@ -2920,9 +2920,14 @@ impl StreamingParSession {
                         t.metadata_entries += 1;
                     }
                 }
-                // Staging.
+                // Staging. A damaged slice completes only if a replacement for its lost
+                // range arrives; until then, staged bytes would sit there for the life of
+                // the session. Disk payloads can be reread at completion, so they are not
+                // staged for a damaged slice. RAM-only payloads still are, because they
+                // cannot be reread.
                 if let Some(d) = bytes
                     && (!payload.memory_only || offset > sstart || end < send)
+                    && (payload.memory_only || t.states[g] != SliceState::Damaged)
                 {
                     // Charged by bytes held; RAM-only payloads were admitted above.
                     if payload.memory_only
@@ -4439,6 +4444,7 @@ const _: fn() = || {
 #[cfg(test)]
 mod live_tests {
     pub(super) mod control_tests;
+    mod stress_tests;
     use super::*;
     use crate::crc::crc32;
     use crate::create::{CreateOptions, SourceFile, VolumeScheme, create};
