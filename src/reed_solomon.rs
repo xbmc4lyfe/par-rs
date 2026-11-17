@@ -602,8 +602,6 @@ impl OutView {
     }
 }
 
-/// Word range of tile `t` (`None` past the end).
-#[inline]
 /// Tile width for `words` words split across `threads` workers: at most `max_tile`, shrunk so
 /// every worker gets the same number of tiles. Each batch ends in a barrier, so with 16 tiles
 /// on 12 workers the second round would keep only 4 busy.
@@ -614,6 +612,8 @@ fn balanced_tile(words: usize, max_tile: usize, threads: usize) -> usize {
     tile.clamp(64, max_tile.max(64))
 }
 
+/// Word range of tile `t` (`None` past the end).
+#[inline]
 fn tile_bounds(t: usize, tile: usize, words: usize) -> Option<(usize, usize)> {
     let t0 = t.checked_mul(tile)?;
     (t0 < words).then(|| (t0, (t0 + tile).min(words)))
