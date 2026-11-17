@@ -835,11 +835,12 @@ impl Engine<'_> {
         let mem = self.config.mem_limit_bytes.max(MIN_MEM_LIMIT);
         let post = u64::from(self.post_transform.is_some());
         // Outputs (+ transformed outputs) + batches in flight: one per reader, the channel
-        // (readers + 1), and the published window the workers are applying.
+        // (readers + 1), the batch the coordinator holds while it waits for window room, and
+        // the published window the workers are applying.
         let readers = self.config.reader_threads(self.config.threads());
         let window = pipeline_window(readers) as u64;
         let readers = readers as u64;
-        let denom = k * (1 + post) + (2 * readers + 1 + window) * b;
+        let denom = k * (1 + post) + (2 * readers + 2 + window) * b;
         // Small chunks keep the reader pipeline and output working set cache-friendly.
         let mut chunk = (mem / denom).min(self.slice_size).min(256 << 10);
         chunk = chunk / 4096 * 4096;
