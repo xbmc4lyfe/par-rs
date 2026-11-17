@@ -444,6 +444,223 @@ pub fn file_hashes_parallel(
         .collect()
 }
 
+/// A file's `(length, MD5)`.
+type FileMd5 = (u64, [u8; 16]);
+
+/// A whole-file MD5 chain in progress: the compressed prefix lives in `state`, the file cursor
+/// sits `len` bytes in.
+struct Chain {
+    index: usize,
+    file: File,
+    state: [u32; 4],
+    len: u64,
+}
+
+/// Work shared by the chain workers: files not yet opened, chains parked by a worker that
+/// stopped, and the finished `(length, MD5)` pairs.
+struct Chains<'a> {
+    paths: &'a [&'a Path],
+    next: AtomicUsize,
+    parked: Mutex<Vec<Chain>>,
+    out: Mutex<Vec<Option<FileMd5>>>,
+    error: Mutex<Option<io::Error>>,
+    stop: AtomicBool,
+    cancel: Option<&'a AtomicBool>,
+}
+
+impl Chains<'_> {
+    fn take(&self) -> io::Result<Option<Chain>> {
+        if let Some(c) = self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
+        {
+            return Ok(Some(c));
+        }
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        let Some(path) = self.paths.get(index) else {
+            return Ok(None);
+        };
+        Ok(Some(Chain {
+            index,
+            file: File::open(path)?,
+            state: MD5_INIT,
+            len: 0,
+        }))
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed) || self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+
+    /// Advance up to `lanes` chains side by side, one SIMD lane each, refilling a lane as soon
+    /// as its file ends. Returns (parking the chains in hand) once `yield_when` is set.
+    fn work(&self, lanes: usize, yield_when: Option<&AtomicBool>) {
+        if let Err(e) = self.work_inner(lanes, yield_when) {
+            let mut g = self
+                .error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if g.is_none() {
+                *g = Some(e);
+            }
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn work_inner(&self, lanes: usize, yield_when: Option<&AtomicBool>) -> io::Result<()> {
+        let mut held: Vec<Chain> = Vec::with_capacity(lanes);
+        // Room for a full chunk plus up to two final padding blocks.
+        let mut bufs: Vec<Vec<u8>> = (0..lanes).map(|_| vec![0u8; HASH_CHUNK + 128]).collect();
+        let mut sizes = vec![0usize; lanes];
+        let mut states: Vec<[u32; 4]> = Vec::with_capacity(lanes);
+        loop {
+            if self.stopped() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
+            if yield_when.is_some_and(|y| y.load(Ordering::Relaxed)) {
+                self.parked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .append(&mut held);
+                return Ok(());
+            }
+            while held.len() < lanes {
+                match self.take()? {
+                    Some(c) => held.push(c),
+                    None => break,
+                }
+            }
+            if held.is_empty() {
+                return Ok(());
+            }
+            // One chunk of every held file; a short read ends the file and gets its padding.
+            let mut ended = vec![false; held.len()];
+            for (k, c) in held.iter_mut().enumerate() {
+                let buf = &mut bufs[k];
+                let mut n = 0;
+                while n < HASH_CHUNK {
+                    match c.file.read(&mut buf[n..HASH_CHUNK]) {
+                        Ok(0) => break,
+                        Ok(m) => n += m,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                c.len += n as u64;
+                if n < HASH_CHUNK {
+                    ended[k] = true;
+                    let padded = (n + 9).next_multiple_of(64);
+                    buf[n] = 0x80;
+                    buf[n + 1..padded - 8].fill(0);
+                    buf[padded - 8..padded].copy_from_slice(&c.len.wrapping_mul(8).to_le_bytes());
+                    sizes[k] = padded;
+                } else {
+                    sizes[k] = n;
+                }
+            }
+            states.clear();
+            states.extend(held.iter().map(|c| c.state));
+            let messages: Vec<&[u8]> = bufs
+                .iter()
+                .zip(&sizes)
+                .take(held.len())
+                .map(|(b, &n)| &b[..n])
+                .collect();
+            compress_blocks(&mut states, &messages);
+            for (c, s) in held.iter_mut().zip(&states) {
+                c.state = *s;
+            }
+            for k in (0..held.len()).rev() {
+                if ended[k] {
+                    let c = held.swap_remove(k);
+                    let mut digest = [0u8; 16];
+                    for (bytes, word) in digest.chunks_mut(4).zip(c.state) {
+                        bytes.copy_from_slice(&word.to_le_bytes());
+                    }
+                    self.out
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)[c.index] =
+                        Some((c.len, digest));
+                }
+            }
+        }
+    }
+}
+
+/// Whole-file `(length, MD5)` of several files, with the chains advanced side by side in the
+/// multi-lane MD5 kernel until `release` is set, then one file per thread.
+///
+/// A file's MD5 is one serial chain, so hashing a file per thread keeps a core per file busy
+/// at about 1 GB/s. Lanes hash the same bytes for a fraction of the CPU (each chain moves
+/// slower, but one core advances [`batch_lanes`] of them at once), which suits creation, where
+/// the chains run beside the recovery computation and only have to finish before it does. Once
+/// the caller sets `release` (its computation is done and the cores are free), the chains still
+/// running resume from their lane state on one thread each, as fast as a chain can go. Each
+/// worker holds one `HASH_CHUNK` buffer per lane.
+///
+/// # Errors
+/// The first I/O error opening or reading a file, or `Interrupted` when `cancel` is set.
+pub fn file_md5s_beside(
+    paths: &[&Path],
+    threads: usize,
+    release: &AtomicBool,
+    cancel: Option<&AtomicBool>,
+) -> io::Result<Vec<FileMd5>> {
+    let chains = Chains {
+        paths,
+        next: AtomicUsize::new(0),
+        parked: Mutex::new(Vec::new()),
+        out: Mutex::new(vec![None; paths.len()]),
+        error: Mutex::new(None),
+        stop: AtomicBool::new(false),
+        cancel,
+    };
+    let lanes = batch_lanes().clamp(1, crate::md5simd::LANES);
+    let threads = thread_count(threads).max(1);
+    // Lane phase: as few workers as hold every file in a lane.
+    let workers = paths.len().div_ceil(lanes).clamp(1, threads);
+    std::thread::scope(|s| {
+        for _ in 1..workers {
+            s.spawn(|| chains.work(lanes, Some(release)));
+        }
+        chains.work(lanes, Some(release));
+    });
+    // Release phase: whatever is left (parked chains and unopened files), one file per thread.
+    let left = chains
+        .parked
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+        + paths
+            .len()
+            .saturating_sub(chains.next.load(Ordering::Relaxed));
+    if left > 0 && !chains.stopped() {
+        let workers = file_hash_thread_cap(threads, left);
+        std::thread::scope(|s| {
+            for _ in 1..workers {
+                s.spawn(|| chains.work(1, None));
+            }
+            chains.work(1, None);
+        });
+    }
+    if let Some(e) = chains
+        .error
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return Err(e);
+    }
+    chains
+        .out
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .into_iter()
+        .map(|h| h.ok_or_else(|| io::Error::new(io::ErrorKind::Interrupted, "cancelled")))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +848,59 @@ mod tests {
         assert_eq!(file_hash_thread_cap(1000, 2), 2);
         assert_eq!(file_hash_thread_cap(1, 0), 1);
         assert!(file_hash_thread_cap(0, 5000) <= budget);
+    }
+
+    #[test]
+    fn side_by_side_file_md5s_match_scalar_in_every_phase() {
+        let dir = tmpdir("beside");
+        // Lengths around the MD5 padding and chunk boundaries, more files than one worker's
+        // lanes, and the empty file.
+        let lens = [
+            0usize, 1, 55, 56, 63, 64, 65, 1000, 65535, 65536, 65537, 131072, 200_003,
+        ];
+        let files: Vec<(std::path::PathBuf, Vec<u8>)> = (0..40)
+            .map(|i| {
+                let len = lens[i % lens.len()] + i / lens.len();
+                let data: Vec<u8> = (0..len)
+                    .map(|j| ((j as u32 ^ (i as u32) << 20).wrapping_mul(2654435761) >> 11) as u8)
+                    .collect();
+                let p = dir.join(format!("f{i}"));
+                std::fs::write(&p, &data).unwrap();
+                (p, data)
+            })
+            .collect();
+        let paths: Vec<&Path> = files.iter().map(|(p, _)| p.as_path()).collect();
+        let expect: Vec<(u64, [u8; 16])> = files
+            .iter()
+            .map(|(_, d)| (d.len() as u64, crate::hasher::md5(d)))
+            .collect();
+        // All in lanes, all one per thread, and a release partway through.
+        for threads in [1, 3] {
+            let held = AtomicBool::new(false);
+            assert_eq!(
+                file_md5s_beside(&paths, threads, &held, None).unwrap(),
+                expect
+            );
+            let released = AtomicBool::new(true);
+            assert_eq!(
+                file_md5s_beside(&paths, threads, &released, None).unwrap(),
+                expect
+            );
+            let midway = AtomicBool::new(false);
+            let got = std::thread::scope(|s| {
+                let h = s.spawn(|| file_md5s_beside(&paths, threads, &midway, None));
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                midway.store(true, Ordering::Relaxed);
+                h.join().unwrap()
+            });
+            assert_eq!(got.unwrap(), expect);
+        }
+        let cancel = AtomicBool::new(true);
+        let held = AtomicBool::new(false);
+        assert!(file_md5s_beside(&paths, 2, &held, Some(&cancel)).is_err());
+        let missing = [dir.join("missing")];
+        let missing: Vec<&Path> = missing.iter().map(|p| p.as_path()).collect();
+        assert!(file_md5s_beside(&missing, 2, &held, None).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

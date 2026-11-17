@@ -153,6 +153,48 @@ impl Lanes for [u32; 4] {
     }
 }
 
+/// One message in plain scalar registers: a lone message runs the chain without the idle
+/// lanes and the multi-instruction vector rotates.
+impl Lanes for u32 {
+    const W: usize = 1;
+    #[inline(always)]
+    fn splat(x: u32) -> Self {
+        x
+    }
+    #[inline(always)]
+    fn from_words(w: &[u32]) -> Self {
+        w[0]
+    }
+    #[inline(always)]
+    fn lane(self, _l: usize) -> u32 {
+        self
+    }
+    #[inline(always)]
+    fn add(self, o: Self) -> Self {
+        self.wrapping_add(o)
+    }
+    #[inline(always)]
+    fn xor(self, o: Self) -> Self {
+        self ^ o
+    }
+    #[inline(always)]
+    fn or(self, o: Self) -> Self {
+        self | o
+    }
+    #[inline(always)]
+    fn and(self, o: Self) -> Self {
+        self & o
+    }
+    #[inline(always)]
+    fn not(self) -> Self {
+        !self
+    }
+    #[inline(always)]
+    fn rotl<const S: i32, const R: i32>(self) -> Self {
+        self.rotate_left(S as u32)
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use super::Lanes;
@@ -833,6 +875,10 @@ pub(crate) fn compress_blocks(states: &mut [[u32; 4]], blocks: &[&[u8]]) {
     assert_eq!(states.len(), blocks.len());
     assert!(states.len() <= LANES);
     assert!(blocks.iter().all(|b| b.len().is_multiple_of(64)));
+    if states.len() == 1 {
+        stream_blocks::<u32, 1>(states, blocks);
+        return;
+    }
     Kernel::best().stream(states, blocks);
 }
 
