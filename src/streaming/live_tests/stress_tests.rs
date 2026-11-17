@@ -1,7 +1,7 @@
 //! Randomized live-repair stress: articles of random sizes arrive out of order, some twice,
 //! some lost for good and some corrupted, while recovery volumes arrive at random points. The
 //! session runs with random staging caps, slot counts and fold threads, and is sometimes
-//! cancelled part-way. Every scenario checks the staging accounting, the final slice states,
+//! cancelled part-way. Some scenarios also cap the RAM-only bytes kept for damaged slices. Every scenario checks the staging accounting, the final slice states,
 //! and that the repaired files match the originals byte for byte.
 //!
 //! `PAR_RS_STRESS_SCENARIOS` sets the scenario count (default 48) and `PAR_RS_STRESS_SEED`
@@ -136,16 +136,20 @@ fn run_scenario(n: u64, seed: u64) {
     } else {
         SessionOptions::default().max_staging_bytes
     };
-    let opts = SessionOptions {
-        preallocated_syndrome_slots: rng.range(0, u64::from(recovery)) as usize,
-        max_staging_bytes: cap,
-        fold_threads: if rng.chance(50) { 0 } else { 2 },
-        ..SessionOptions::default()
-    };
-    let s = StreamingParSession::new(&fx.set, &fx.dir, opts).unwrap();
+    let preallocated_syndrome_slots = rng.range(0, u64::from(recovery)) as usize;
+    let fold_threads = if rng.chance(50) { 0 } else { 2 };
     let cancel_at = rng
         .chance(15)
         .then(|| rng.range(0, events.len() as u64) as usize);
+    let damaged_cap = rng.chance(30).then(|| rng.range(0, 2 * slice));
+    let opts = SessionOptions {
+        preallocated_syndrome_slots,
+        max_staging_bytes: cap,
+        fold_threads,
+        max_damaged_staging_bytes: damaged_cap.unwrap_or(u64::MAX),
+        ..SessionOptions::default()
+    };
+    let s = StreamingParSession::new(&fx.set, &fx.dir, opts).unwrap();
 
     let mut delivered = 0usize;
     let mut done_events = 0usize;
@@ -235,6 +239,19 @@ fn run_scenario(n: u64, seed: u64) {
                 }
             }
         }
+        if let Some(limit) = damaged_cap {
+            let t = s.inner.tracker.lock().unwrap();
+            let kept: u64 = t
+                .staging
+                .iter()
+                .filter(|(g, _)| t.states[**g] == SliceState::Damaged)
+                .map(|(_, st)| st.pieces.held() as u64)
+                .sum();
+            assert!(
+                kept <= limit,
+                "{ctx}: damaged staging {kept} exceeds {limit}"
+            );
+        }
         let held = s.staging_bytes();
         assert!(held <= cap, "{ctx}: staging {held} exceeds cap {cap}");
         assert!(
@@ -266,8 +283,27 @@ fn run_scenario(n: u64, seed: u64) {
         .map(|&z| (z as u64).div_ceil(slice) as usize)
         .sum();
     let st = s.status();
+    // With a damaged cap, a replaced slice whose RAM-only bytes were released before its
+    // replacement arrived reads the gap from a file that lacks them, so it stays damaged.
+    let mut damaged_count = damaged.len();
+    if damaged_cap.is_some() {
+        let mut maybe = damaged.clone();
+        for a in articles.iter().filter(|a| a.fate == Fate::Replaced) {
+            for si in a.offset / slice..=(a.offset + a.len as u64 - 1) / slice {
+                maybe.insert((a.file, si));
+            }
+        }
+        assert!(
+            (damaged.len()..=maybe.len()).contains(&st.damaged),
+            "{ctx}: damaged count {} outside {}..={}",
+            st.damaged,
+            damaged.len(),
+            maybe.len()
+        );
+        damaged_count = st.damaged;
+    }
     if std::env::var_os("PAR_RS_STRESS_DUMP").is_some()
-        && (s.staging_bytes() != 0 || st.damaged != damaged.len())
+        && (s.staging_bytes() != 0 || st.damaged != damaged_count)
     {
         eprintln!("{ctx}: slice {slice} sizes {sizes:?} mode {mode} cap {cap} status {st:?}");
         for a in &articles {
@@ -290,12 +326,11 @@ fn run_scenario(n: u64, seed: u64) {
     if mode != 0 {
         // RAM-only bytes for a damaged slice stay staged in case a replacement arrives,
         // but nothing else may be left.
-        let bound: u64 = damaged.iter().map(|_| slice).sum();
+        let bound = damaged_count as u64 * slice;
         assert!(
             s.staging_bytes() <= bound,
-            "{ctx}: staging {} beyond the {} damaged slices",
+            "{ctx}: staging {} beyond the {damaged_count} damaged slices",
             s.staging_bytes(),
-            damaged.len()
         );
     } else {
         assert_eq!(
@@ -307,18 +342,18 @@ fn run_scenario(n: u64, seed: u64) {
     assert_eq!(st.total, total, "{ctx}");
     assert_eq!(st.unarrived, 0, "{ctx}: unarrived slices");
     assert_eq!(st.partially_arrived, 0, "{ctx}: partial slices");
-    assert_eq!(st.damaged, damaged.len(), "{ctx}: damaged count");
-    assert_eq!(st.verified, total - damaged.len(), "{ctx}: verified count");
+    assert_eq!(st.damaged, damaged_count, "{ctx}: damaged count");
+    assert_eq!(st.verified, total - damaged_count, "{ctx}: verified count");
 
     for (path, off, bytes) in &deferred {
         write_at(path, *off, bytes);
     }
-    let fits = damaged.len() <= recovery as usize;
+    let fits = damaged_count <= recovery as usize;
     assert_eq!(st.early_cutover_possible, fits, "{ctx}: cutover");
     let r = s.repair_available_targets_now(&ids);
     if fits {
         let rep = r.unwrap_or_else(|e| panic!("{ctx}: repair: {e}"));
-        assert_eq!(rep.repaired_slices.len(), damaged.len(), "{ctx}");
+        assert_eq!(rep.repaired_slices.len(), damaged_count, "{ctx}");
         for (name, data) in &fx.files {
             assert!(
                 std::fs::read(fx.dir.join(name)).unwrap() == *data,
@@ -329,7 +364,7 @@ fn run_scenario(n: u64, seed: u64) {
         assert!(
             matches!(r, Err(RepairError::NotEnoughRecovery { .. })),
             "{ctx}: {} damaged with {recovery} recovery should not repair",
-            damaged.len()
+            damaged_count
         );
     }
     drop(s);
