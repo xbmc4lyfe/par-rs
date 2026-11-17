@@ -3060,9 +3060,12 @@ impl StreamingParSession {
                 });
             }
             let mut unverifiable = false;
+            // Bytes that came from RAM, not counting gaps filled from disk.
+            let mut ram_bytes = staged.as_ref().map_or(0, std::vec::Vec::len);
             let staged = match (staged, partial) {
                 (Some(d), _) => Some(d),
                 (None, Some(pieces)) => {
+                    ram_bytes = pieces.held();
                     let filled = self.fill_gaps_from_target(fi, b, pieces)?;
                     // The gaps are not on disk yet, so the slice cannot be verified.
                     unverifiable = filled.is_none();
@@ -3070,7 +3073,6 @@ impl StreamingParSession {
                 }
                 (None, None) => None,
             };
-            let ram_bytes = staged.as_ref().map_or(0, std::vec::Vec::len);
             let verdict = if unverifiable {
                 None
             } else {
@@ -3120,9 +3122,6 @@ impl StreamingParSession {
         Ok(out)
     }
 
-    /// Verify slice `b` of file `fi`: `staged` bytes if available, otherwise read from the
-    /// target file. `quick` is the pre-combined article CRC (`ParQuick`). Returns the slice data
-    /// (unpadded) when valid. Does not hold the tracker lock.
     /// Slice `b` of file `fi` from partly staged `pieces`, reading only the uncovered gaps
     /// from the target file. The staged bytes win; they may never have reached disk. `None`
     /// when the target file ends before a gap does.
@@ -3163,6 +3162,9 @@ impl StreamingParSession {
         Ok(Some(buf))
     }
 
+    /// Verify slice `b` of file `fi`: `staged` bytes if available, otherwise read from the
+    /// target file. `quick` is the pre-combined article CRC (`ParQuick`). Returns the slice data
+    /// (unpadded) when valid. Does not hold the tracker lock.
     fn verify_slice_bytes(
         &self,
         fi: usize,
