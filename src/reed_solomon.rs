@@ -27,10 +27,11 @@
 
 use crate::gf16::simd::{Kernel, MAX_MULTI, Plane, PlaneMut};
 use crate::gf16::{self, MulTables, rs_coefficient};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 
 /// Errors of the Reed-Solomon layer.
 #[derive(Debug)]
@@ -603,8 +604,8 @@ impl OutView {
 }
 
 /// Tile width for `words` words split across `threads` workers: at most `max_tile`, shrunk so
-/// every worker gets the same number of tiles. Each batch ends in a barrier, so with 16 tiles
-/// on 12 workers the second round would keep only 4 busy.
+/// every worker gets the same number of tiles, so 16 tiles on 12 workers do not leave 4 workers
+/// holding the last round of a chunk.
 fn balanced_tile(words: usize, max_tile: usize, threads: usize) -> usize {
     let threads = threads.max(1);
     let rounds = words.div_ceil(max_tile).div_ceil(threads).max(1);
@@ -684,10 +685,146 @@ fn xor_into(dst: &mut [u8], src: &[u8]) {
     }
 }
 
-/// A batch handed to the workers together with its tile counter.
-struct Job {
-    batch: Batch,
-    next_tile: AtomicUsize,
+/// Barrier-free schedule of one chunk's streaming phase: a grid of tiles by batches.
+///
+/// Batches are published in arrival order into a bounded window. A worker claims any idle tile
+/// that has unapplied batches and applies all of them to it, so each tile has one owner at a
+/// time and sees every batch exactly once. Tiles advance independently: a fast worker moves on
+/// to other tiles (and later batches) while a straggler finishes its own, instead of the whole
+/// pool waiting at the end of every batch. The accumulation is XOR, so the order in which the
+/// batches reach a tile does not change the result.
+struct Pipeline {
+    state: Mutex<PipeState>,
+    /// Workers wait here for claimable work.
+    work: Condvar,
+    /// The coordinator waits here for window room or completion.
+    room: Condvar,
+}
+
+/// Aborts the pipeline when its thread unwinds, so nobody waits forever for a dead worker's tile
+/// or a dead coordinator's batches.
+struct AbortOnUnwind<'p>(&'p Pipeline);
+
+impl Drop for AbortOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.abort();
+        }
+    }
+}
+
+/// Published batches the workers may hold at once. More than one lets a straggler's tile fall
+/// behind without stalling the rest of the pool.
+fn pipeline_window(readers: usize) -> usize {
+    readers + 1
+}
+
+struct PipeState {
+    /// Batches `[base, base + window.len())` in publication order.
+    window: VecDeque<Arc<Batch>>,
+    base: usize,
+    /// Batches applied to each tile (always a prefix of the published ones).
+    applied: Vec<usize>,
+    busy: Vec<bool>,
+    /// No more batches will be published.
+    closed: bool,
+    /// Stop as soon as possible (error, cancellation, or a worker panic).
+    abort: bool,
+}
+
+impl PipeState {
+    fn published(&self) -> usize {
+        self.base + self.window.len()
+    }
+
+    /// The least-advanced idle tile with unapplied batches.
+    fn claimable(&self) -> Option<usize> {
+        let published = self.published();
+        (0..self.applied.len())
+            .filter(|&t| !self.busy[t] && self.applied[t] < published)
+            .min_by_key(|&t| self.applied[t])
+    }
+
+    fn finished(&self) -> bool {
+        let published = self.published();
+        self.closed && self.applied.iter().all(|&a| a == published)
+    }
+
+    /// Batches applied to every tile.
+    fn complete(&self) -> usize {
+        self.applied
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(self.published())
+    }
+}
+
+impl Pipeline {
+    fn new(tiles: usize, window: usize) -> Self {
+        Self {
+            state: Mutex::new(PipeState {
+                window: VecDeque::with_capacity(window),
+                base: 0,
+                applied: vec![0; tiles],
+                busy: vec![false; tiles],
+                closed: false,
+                abort: false,
+            }),
+            work: Condvar::new(),
+            room: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PipeState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn abort(&self) {
+        self.lock().abort = true;
+        self.work.notify_all();
+        self.room.notify_all();
+    }
+
+    /// Worker loop: claim a tile, apply its pending batches, release it. Returns once every
+    /// published batch has reached every tile after `closed`, or on abort.
+    fn work(&self, mut apply: impl FnMut(usize, &Batch)) {
+        let _abort = AbortOnUnwind(self);
+        let mut todo: Vec<Arc<Batch>> = Vec::new();
+        let mut st = self.lock();
+        loop {
+            if st.abort || st.finished() {
+                drop(st);
+                self.work.notify_all();
+                self.room.notify_all();
+                return;
+            }
+            let Some(t) = st.claimable() else {
+                st = self
+                    .work
+                    .wait(st)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                continue;
+            };
+            st.busy[t] = true;
+            let from = st.applied[t] - st.base;
+            todo.extend(st.window.range(from..).cloned());
+            drop(st);
+            for batch in &todo {
+                apply(t, batch);
+            }
+            let n = todo.len();
+            todo.clear();
+            st = self.lock();
+            st.busy[t] = false;
+            st.applied[t] += n;
+            // The tile may have new batches for another worker; the coordinator may have room.
+            self.work.notify_one();
+            self.room.notify_one();
+        }
+    }
 }
 
 impl Engine<'_> {
@@ -698,9 +835,12 @@ impl Engine<'_> {
         let mem = self.config.mem_limit_bytes.max(MIN_MEM_LIMIT);
         let post = u64::from(self.post_transform.is_some());
         // Outputs (+ transformed outputs) + batches in flight: one per reader, the channel
-        // (readers + 1) and the one being processed.
-        let readers = self.config.reader_threads(self.config.threads()) as u64;
-        let denom = k * (1 + post) + (2 * readers + 2) * b;
+        // (readers + 1), the batch the coordinator holds while it waits for window room, and
+        // the published window the workers are applying.
+        let readers = self.config.reader_threads(self.config.threads());
+        let window = pipeline_window(readers) as u64;
+        let readers = readers as u64;
+        let denom = k * (1 + post) + (2 * readers + 2 + window) * b;
         // Small chunks keep the reader pipeline and output working set cache-friendly.
         let mut chunk = (mem / denom).min(self.slice_size).min(256 << 10);
         chunk = chunk / 4096 * 4096;
@@ -782,6 +922,8 @@ impl Engine<'_> {
                 let total_batches = total_inputs.div_ceil(batch_size);
                 let readers = self.config.reader_threads(threads).clamp(1, total_batches);
                 let (batch_tx, batch_rx) = mpsc::sync_channel::<io::Result<Batch>>(readers + 1);
+                let window = pipeline_window(readers);
+                let pipe = Pipeline::new(n_tiles, window);
                 let spare: Mutex<Vec<Batch>> = Mutex::new(Vec::new());
                 let next_batch = AtomicUsize::new(0);
                 let inputs = self.inputs;
@@ -833,47 +975,66 @@ impl Engine<'_> {
                         });
                     }
                     drop(batch_tx);
-                    // Workers: each receives every job on its own channel and claims tiles.
-                    let mut worker_tx: Vec<mpsc::SyncSender<Arc<Job>>> =
-                        Vec::with_capacity(workers);
-                    let mut done_rx: Vec<mpsc::Receiver<()>> = Vec::with_capacity(workers);
+                    // Workers: claim tiles of the published batches; no per-batch barrier.
+                    let pipe = &pipe;
                     for _ in 0..workers {
-                        let (tx, rx) = mpsc::sync_channel::<Arc<Job>>(2);
-                        let (done, drx) = mpsc::channel::<()>();
-                        worker_tx.push(tx);
-                        done_rx.push(drx);
                         let shared = Arc::clone(&shared);
                         let outview = &outview;
                         s.spawn(move || {
                             let mut scratch: Vec<Vec<u8>> = Vec::new();
-                            while let Ok(job) = rx.recv() {
-                                loop {
-                                    let t = job.next_tile.fetch_add(1, Ordering::Relaxed);
-                                    let Some((t0, t1)) = tile_bounds(t, tile, words) else {
-                                        break;
-                                    };
+                            pipe.work(|t, batch| {
+                                if let Some((t0, t1)) = tile_bounds(t, tile, words) {
                                     process_tile(
                                         &kernel,
                                         &shared,
-                                        &job.batch,
+                                        batch,
                                         outview,
                                         t0,
                                         t1,
                                         &mut scratch,
                                     );
                                 }
-                                drop(job);
-                                if done.send(()).is_err() {
-                                    return;
-                                }
-                            }
+                            });
                         });
                     }
-                    let mut processed = 0usize;
+                    let _abort = AbortOnUnwind(pipe);
                     let mut status: Result<(), RsError> = Ok(());
-                    // Own the receiver here so early exit disconnects blocked
-                    // producers before the scope waits to join them.
-                    for batch in batch_rx {
+                    let mut processed = 0usize;
+                    // Retire the batches every tile has applied (recycling their buffers and
+                    // reporting each one, with the lock released) until `ready` holds or the
+                    // pipeline aborts; returns the lock in that state.
+                    let mut drive = |ready: &dyn Fn(&PipeState) -> bool| loop {
+                        let mut st = pipe.lock();
+                        while st.base >= st.complete() {
+                            if st.abort || ready(&st) {
+                                return st;
+                            }
+                            st = pipe
+                                .room
+                                .wait(st)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        }
+                        let done = st.complete() - st.base;
+                        let retired: Vec<Arc<Batch>> = st.window.drain(..done).collect();
+                        st.base += done;
+                        drop(st);
+                        for batch in retired {
+                            processed += batch.items.len();
+                            if let Ok(b) = Arc::try_unwrap(batch) {
+                                spare
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(b);
+                            }
+                            progress(ci, total_chunks, processed, total_inputs);
+                        }
+                    };
+                    let pipe_err =
+                        || RsError::Io(io::Error::other("compute worker terminated unexpectedly"));
+                    // Own the receiver here so dropping it disconnects blocked producers
+                    // before the scope waits to join them.
+                    let batch_rx = batch_rx;
+                    while let Ok(batch) = batch_rx.recv() {
                         let batch = match batch {
                             Ok(b) => b,
                             Err(e) => {
@@ -881,42 +1042,36 @@ impl Engine<'_> {
                                 break;
                             }
                         };
-                        let count = batch.items.len();
-                        let job = Arc::new(Job {
-                            batch,
-                            next_tile: AtomicUsize::new(0),
-                        });
-                        for tx in &worker_tx {
-                            if tx.send(Arc::clone(&job)).is_err() {
-                                status = Err(RsError::Cancelled);
-                            }
-                        }
-                        for d in &done_rx {
-                            if d.recv().is_err() {
-                                // A worker died (panicked); stop feeding and surface an error.
-                                status = Err(RsError::Io(io::Error::other(
-                                    "compute worker terminated unexpectedly",
-                                )));
-                                break;
-                            }
-                        }
-                        if let Ok(job) = Arc::try_unwrap(job) {
-                            spare
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push(job.batch);
-                        }
-                        processed += count;
-                        progress(ci, total_chunks, processed, total_inputs);
-                        if status.is_err() {
-                            break;
-                        }
                         if is_cancelled() {
                             status = Err(RsError::Cancelled);
                             break;
                         }
+                        let mut st = drive(&|st| st.window.len() < window);
+                        if st.abort {
+                            status = Err(pipe_err());
+                            break;
+                        }
+                        st.window.push_back(Arc::new(batch));
+                        drop(st);
+                        pipe.work.notify_all();
                     }
-                    drop(worker_tx);
+                    // Batches published before the end of input (or a read error) are still
+                    // applied and reported, as they were when each batch ended in a barrier;
+                    // readers stay connected (and bounded by the channel) until then.
+                    if !matches!(status, Err(RsError::Cancelled)) {
+                        pipe.lock().closed = true;
+                        pipe.work.notify_all();
+                        if drive(&PipeState::finished).abort && status.is_ok() {
+                            status = Err(pipe_err());
+                        }
+                    }
+                    drop(batch_rx);
+                    if status.is_ok() && is_cancelled() {
+                        status = Err(RsError::Cancelled);
+                    }
+                    if status.is_err() {
+                        pipe.abort();
+                    }
                     status
                 });
                 result?;
@@ -1582,6 +1737,69 @@ mod tests {
         e0.run(&reader, &mut out, None, &mut |_, _, _, _| {})
             .unwrap();
         assert!(out.slices.iter().all(|s| s.iter().all(|&b| b == 0)));
+    }
+
+    #[test]
+    fn pipeline_applies_every_batch_to_every_tile_once() {
+        // Uneven per-tile work makes tiles drift apart within the window; each tile must still
+        // see every batch exactly once, never with two owners at a time.
+        for (tiles, window, workers, batches) in [(1, 1, 1, 5), (5, 2, 3, 40), (24, 6, 12, 63)] {
+            let pipe = Pipeline::new(tiles, window);
+            let seen: Vec<Mutex<Vec<usize>>> = (0..tiles).map(|_| Mutex::new(Vec::new())).collect();
+            let owners: Vec<AtomicUsize> = (0..tiles).map(|_| AtomicUsize::new(0)).collect();
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    let (pipe, seen, owners) = (&pipe, &seen, &owners);
+                    s.spawn(move || {
+                        pipe.work(|t, batch| {
+                            assert_eq!(owners[t].fetch_add(1, Ordering::SeqCst), 0);
+                            let seq = batch.items[0].0;
+                            if (t + seq) % 3 == 0 {
+                                std::thread::sleep(std::time::Duration::from_micros(200));
+                            }
+                            seen[t].lock().unwrap().push(seq);
+                            owners[t].fetch_sub(1, Ordering::SeqCst);
+                        });
+                    });
+                }
+                for seq in 0..batches {
+                    let mut st = pipe.lock();
+                    while st.window.len() >= window {
+                        let complete = st.complete();
+                        while st.base < complete {
+                            st.window.pop_front();
+                            st.base += 1;
+                        }
+                        if st.window.len() >= window {
+                            st = pipe.room.wait(st).unwrap();
+                        }
+                    }
+                    st.window.push_back(Arc::new(Batch {
+                        items: vec![(seq, Vec::new())],
+                        words: 0,
+                    }));
+                    drop(st);
+                    pipe.work.notify_all();
+                }
+                pipe.lock().closed = true;
+                pipe.work.notify_all();
+            });
+            assert!(pipe.lock().finished());
+            for s in &seen {
+                assert_eq!(*s.lock().unwrap(), (0..batches).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_abort_releases_waiting_workers() {
+        let pipe = Pipeline::new(4, 2);
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(|| pipe.work(|_, _| unreachable!("nothing was published")));
+            }
+            pipe.abort();
+        });
     }
 
     #[test]
