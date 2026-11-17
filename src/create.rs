@@ -19,7 +19,7 @@ use crate::packet::{
     TYPE_MAIN, TYPE_RECVSLIC, compute_file_id, compute_set_id, encode_creator_body,
     encode_file_desc_body, encode_ifsc_body, encode_main_body, encode_packet, read_exact_at,
 };
-use crate::parhash::{HashRange, file_hashes_parallel, hash_ranges_parallel, slice_ranges};
+use crate::parhash::{HashRange, file_md5s_beside, hash_ranges_parallel, slice_ranges};
 use crate::reed_solomon::{
     Engine, EngineConfig, InputKind, InputReader, InputSpec, OutputSink, RsError,
 };
@@ -27,7 +27,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How recovery slices are distributed over volume files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -713,9 +713,11 @@ pub fn create_with_volume_naming(
         }
     }
 
-    // ---- digests (all cores) concurrently with the recovery computation ----
-    // Whole-file MD5 chains run one file per thread (they cannot be split); the per-slice
-    // CRC-32 + MD5 are independent messages hashed in multi-lane jobs on every core.
+    // ---- digests concurrently with the recovery computation ----
+    // The whole-file MD5 chains cannot be split: they advance side by side in SIMD lanes (a
+    // fraction of the CPU of a core per file) while the engine runs, and one file per thread
+    // once it is done (`engine_done`). The per-slice CRC-32 + MD5 are independent messages
+    // hashed in multi-lane jobs on every core alongside them.
     progress(CreateStage::Hashing, 0, total_bytes);
     let mut ranges: Vec<HashRange> = Vec::new();
     for (k, &len) in sizes.iter().enumerate() {
@@ -726,14 +728,28 @@ pub fn create_with_volume_naming(
             len.div_ceil(opts.slice_size),
         ));
     }
-    type Digests = (Vec<crate::hasher::FileHashes>, Vec<(u32, [u8; 16])>);
+    type Digests = (Vec<(u64, [u8; 16])>, Vec<(u32, [u8; 16])>);
+    let engine_done = AtomicBool::new(false);
     let digests: Result<Digests, CreateError> = std::thread::scope(|sc| {
         let hasher = sc.spawn(|| -> Result<Digests, CreateError> {
-            let fh = file_hashes_parallel(&paths, threads, cancel).map_err(hash_err)?;
-            let sh = hash_ranges_parallel(&paths, &ranges, threads, cancel, &mut |_| {})
-                .map_err(hash_err)?;
-            Ok((fh, sh))
+            std::thread::scope(|hs| {
+                let chains = hs.spawn(|| file_md5s_beside(&paths, threads, &engine_done, cancel));
+                let sh = hash_ranges_parallel(&paths, &ranges, threads, cancel, &mut |_| {});
+                let fh = chains
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("hashing thread panicked")));
+                Ok((fh.map_err(hash_err)?, sh.map_err(hash_err)?))
+            })
         });
+        // Free the chains to one thread per file however the computation ends (an early `?`
+        // included), so the join below never waits on lane-speed chains for nothing.
+        struct Release<'a>(&'a AtomicBool);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let release = Release(&engine_done);
         let computed: Result<(), CreateError> = if with_recovery {
             let logs = input_constant_logs(input_slices as usize)
                 .map_err(|_| CreateError::TooManyInputSlices(input_slices))?;
@@ -774,6 +790,7 @@ pub fn create_with_volume_naming(
         } else {
             Ok(())
         };
+        drop(release);
         let digests = hasher
             .join()
             .unwrap_or_else(|_| Err(io::Error::other("hashing thread panicked").into()));
@@ -791,15 +808,15 @@ pub fn create_with_volume_naming(
     }
     for (i, h) in hashed.iter_mut().enumerate() {
         let k = source_of[i];
-        let fh = &file_hashes[k];
-        if fh.len != sizes[k] {
+        let (len, md5_full) = file_hashes[k];
+        if len != sizes[k] {
             return Err(io::Error::other(format!(
                 "{} changed while being hashed",
                 h.path.display()
             ))
             .into());
         }
-        h.hash_full = fh.md5_full;
+        h.hash_full = md5_full;
         for (j, sl) in h.slices.iter_mut().enumerate() {
             let (crc32, md5) = slice_hashes[cursor[k] + j];
             *sl = SliceChecksum { md5, crc32 };
