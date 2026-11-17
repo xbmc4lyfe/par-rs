@@ -33,6 +33,8 @@ enum Fate {
     Good,
     Lost,
     Corrupt,
+    /// Lost first, then a good copy arrives later (a backup server).
+    Replaced,
 }
 
 struct Article {
@@ -46,6 +48,7 @@ struct Article {
 
 enum Event {
     Article(usize),
+    Replacement(usize),
     Recovery(usize),
 }
 
@@ -94,6 +97,7 @@ fn run_scenario(n: u64, seed: u64) {
             let fate = match rng.next() % 100 {
                 0..=9 => Fate::Lost,
                 10..=17 => Fate::Corrupt,
+                18..=25 => Fate::Replaced,
                 _ => Fate::Good,
             };
             let flip = (rng.next() % len as u64) as usize;
@@ -123,7 +127,10 @@ fn run_scenario(n: u64, seed: u64) {
         order.iter().map(|&i| slots[i].take().unwrap()).collect()
     };
 
-    let memory_only = rng.chance(50);
+    // 0: every article on disk; 1: every article RAM-only; 2: each article picks.
+    let mode = rng.range(0, 2);
+    // RAM-only bytes reach disk only after every event, as a slow writer would.
+    let mut deferred: Vec<(std::path::PathBuf, u64, Vec<u8>)> = Vec::new();
     let cap = if rng.chance(40) {
         rng.range(slice, 4 * slice)
     } else {
@@ -159,15 +166,28 @@ fn run_scenario(n: u64, seed: u64) {
         done_events += 1;
         match ev {
             Event::Recovery(v) => {
+                // A new recovery slot is back-filled from the target files, so pending
+                // RAM-only writes must land first (the documented flush barrier).
+                for (path, off, bytes) in deferred.drain(..) {
+                    write_at(&path, off, &bytes);
+                }
                 s.on_recovery_volume_arrived(&fx.vols[v], None).unwrap();
             }
-            Event::Article(i) => {
+            Event::Article(i) | Event::Replacement(i) => {
+                let replacement = matches!(ev, Event::Replacement(_));
                 let a = &articles[i];
                 let path = fx.dir.join(&fx.files[a.file].0);
                 let id = &ids[a.file];
                 let start = a.offset as usize;
                 let mut bytes = fx.files[a.file].1[start..start + a.len].to_vec();
                 match a.fate {
+                    Fate::Replaced if !replacement => {
+                        s.on_article_failed_permanently(id, a.offset, a.len as u64)
+                            .unwrap();
+                        let at = rng.range(0, events.len() as u64) as usize;
+                        events.insert(at, Event::Replacement(i));
+                        continue;
+                    }
                     Fate::Lost => {
                         s.on_article_failed_permanently(id, a.offset, a.len as u64)
                             .unwrap();
@@ -176,12 +196,20 @@ fn run_scenario(n: u64, seed: u64) {
                     Fate::Corrupt => {
                         bytes[a.flip] ^= 1 + (rng.next() % 255) as u8;
                     }
-                    Fate::Good => {}
+                    Fate::Good | Fate::Replaced => {}
                 }
                 let crc = crc32(&bytes);
-                if memory_only {
+                let ram = match mode {
+                    0 => false,
+                    1 => true,
+                    _ => rng.chance(50),
+                };
+                if ram {
                     match s.on_article_finished_memory_only(id, a.offset, &bytes, crc) {
-                        Ok(_) => delivered += bytes.len(),
+                        Ok(_) => {
+                            delivered += bytes.len();
+                            deferred.push((path.clone(), a.offset, bytes.clone()));
+                        }
                         Err(RepairError::StreamingMemoryLimit { context, .. }) => {
                             if std::env::var_os("PAR_RS_STRESS_DUMP").is_some() {
                                 eprintln!(
@@ -199,7 +227,6 @@ fn run_scenario(n: u64, seed: u64) {
                         }
                         Err(e) => panic!("{ctx}: memory-only article {i}: {e}"),
                     }
-                    write_at(&path, a.offset, &bytes);
                 } else {
                     write_at(&path, a.offset, &bytes);
                     s.on_article_finished(id, a.offset, a.len as u64, crc, Some(&bytes))
@@ -221,7 +248,7 @@ fn run_scenario(n: u64, seed: u64) {
     let mut damaged = std::collections::BTreeSet::new();
     for a in &articles {
         match a.fate {
-            Fate::Good => {}
+            Fate::Good | Fate::Replaced => {}
             Fate::Lost => {
                 let first = a.offset / slice;
                 let last = (a.offset + a.len as u64 - 1) / slice;
@@ -242,9 +269,7 @@ fn run_scenario(n: u64, seed: u64) {
     if std::env::var_os("PAR_RS_STRESS_DUMP").is_some()
         && (s.staging_bytes() != 0 || st.damaged != damaged.len())
     {
-        eprintln!(
-            "{ctx}: slice {slice} sizes {sizes:?} memory_only {memory_only} cap {cap} status {st:?}"
-        );
+        eprintln!("{ctx}: slice {slice} sizes {sizes:?} mode {mode} cap {cap} status {st:?}");
         for a in &articles {
             eprintln!(
                 "  f{} off {} len {} slices {}..={} {}",
@@ -255,13 +280,14 @@ fn run_scenario(n: u64, seed: u64) {
                 (a.offset + a.len as u64 - 1) / slice,
                 match a.fate {
                     Fate::Good => "good",
+                    Fate::Replaced => "REPLACED",
                     Fate::Lost => "LOST",
                     Fate::Corrupt => "CORRUPT",
                 }
             );
         }
     }
-    if memory_only {
+    if mode != 0 {
         // RAM-only bytes for a damaged slice stay staged in case a replacement arrives,
         // but nothing else may be left.
         let bound: u64 = damaged.iter().map(|_| slice).sum();
@@ -284,6 +310,9 @@ fn run_scenario(n: u64, seed: u64) {
     assert_eq!(st.damaged, damaged.len(), "{ctx}: damaged count");
     assert_eq!(st.verified, total - damaged.len(), "{ctx}: verified count");
 
+    for (path, off, bytes) in &deferred {
+        write_at(path, *off, bytes);
+    }
     let fits = damaged.len() <= recovery as usize;
     assert_eq!(st.early_cutover_possible, fits, "{ctx}: cutover");
     let r = s.repair_available_targets_now(&ids);

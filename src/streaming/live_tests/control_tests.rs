@@ -1682,6 +1682,32 @@ fn live_damaged_slice_does_not_stage_disk_bytes() {
 }
 
 #[test]
+fn live_ram_only_bytes_survive_a_loss_and_disk_replacement() {
+    // RAM-only bytes are staged and never reach disk. A loss then damages the slice, and a
+    // replacement for the lost range arrives on disk. The slice must complete from the
+    // staged RAM bytes plus the disk replacement, not from a reread of the whole slice.
+    let fx = fixture("ram-loss-replace", &[4096], 4096, 1, VolumeScheme::Single);
+    let id = fid(&fx, &fx.files[0].0);
+    let path = fx.dir.join(&fx.files[0].0);
+    let data = &fx.files[0].1;
+    let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    s.on_article_finished_memory_only(&id, 1024, &data[1024..], crc32(&data[1024..]))
+        .unwrap();
+    s.on_article_failed_permanently(&id, 0, 1024).unwrap();
+    assert_eq!(
+        s.staging_bytes(),
+        3072,
+        "RAM-only bytes are kept through the loss"
+    );
+    write_at(&path, 0, &data[..1024]);
+    s.on_article_finished(&id, 0, 1024, crc32(&data[..1024]), Some(&data[..1024]))
+        .unwrap();
+    assert_eq!(s.status().verified, 1);
+    assert_eq!(s.staging_bytes(), 0);
+    std::fs::remove_dir_all(&fx.dir).unwrap();
+}
+
+#[test]
 fn live_zero_preallocated_slots_still_repair() {
     // No syndrome slot exists before damage; slots are created when recovery is admitted and
     // back-filled from the verified slices.
