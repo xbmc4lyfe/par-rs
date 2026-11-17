@@ -9,10 +9,10 @@
 
 use super::*;
 
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         // xorshift64*
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
@@ -20,16 +20,16 @@ impl Rng {
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
     /// Uniform in `lo..=hi`.
-    fn range(&mut self, lo: u64, hi: u64) -> u64 {
+    pub(super) fn range(&mut self, lo: u64, hi: u64) -> u64 {
         lo + self.next() % (hi - lo + 1)
     }
-    fn chance(&mut self, percent: u64) -> bool {
+    pub(super) fn chance(&mut self, percent: u64) -> bool {
         self.next() % 100 < percent
     }
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Fate {
+pub(super) enum Fate {
     Good,
     Lost,
     Corrupt,
@@ -52,7 +52,7 @@ enum Event {
     Recovery(usize),
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
+pub(super) fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())

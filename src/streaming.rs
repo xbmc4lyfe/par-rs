@@ -3017,6 +3017,8 @@ impl StreamingParSession {
                 // the session. Disk payloads can be reread at completion, so they are not
                 // staged for a damaged slice. RAM-only payloads still are, because they
                 // cannot be reread.
+                // RAM-only bytes this call staged for this slice.
+                let mut grown_now = 0u64;
                 if let Some(d) = bytes
                     && (!payload.memory_only || offset > sstart || end < send)
                     && (payload.memory_only || t.states[g] != SliceState::Damaged)
@@ -3042,6 +3044,9 @@ impl StreamingParSession {
                         let current = st.ranges.len();
                         t.metadata_entries = t.metadata_entries - previous + current;
                         t.staging_bytes += grown as u64;
+                        if payload.memory_only {
+                            grown_now = grown as u64;
+                        }
                         if t.states[g] == SliceState::Damaged {
                             t.track_damaged_staging(g);
                             t.release_damaged_staging(self.inner.opts.max_damaged_staging_bytes);
@@ -3055,7 +3060,14 @@ impl StreamingParSession {
                     let (staged, partial) = match t.staging.remove(&g) {
                         Some(st) => {
                             t.metadata_entries -= st.ranges.len();
-                            completed_charges.bytes += st.pieces.held() as u64;
+                            // A RAM-only piece completing the slice was not admitted against
+                            // the cap (it leaves staging at once), so only bytes staged by
+                            // earlier calls stay charged while the slice is hashed.
+                            // Charging it too let concurrent completions pass the cap. Disk
+                            // pieces were admitted, and stay charged so that one large
+                            // article cannot stage every slice it completes.
+                            t.staging_bytes -= grown_now;
+                            completed_charges.bytes += st.pieces.held() as u64 - grown_now;
                             if range_covered(&normalize_ranges(&st.ranges), 0, slen as i64) {
                                 (Some(st.pieces.into_slice(slen)), None)
                             } else {
@@ -4618,6 +4630,7 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod live_tests {
+    mod concurrency_tests;
     pub(super) mod control_tests;
     mod stress_tests;
     use super::*;
