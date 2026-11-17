@@ -1744,3 +1744,126 @@ fn live_zero_preallocated_slots_still_repair() {
     );
     std::fs::remove_dir_all(&fx.dir).unwrap();
 }
+
+/// `metadata_entries` and `staging_bytes` must equal what the tracker actually holds.
+fn assert_accounting_exact(s: &StreamingParSession) {
+    let t = s.inner.tracker.lock().unwrap();
+    let held: usize = t.covered.iter().map(Vec::len).sum::<usize>()
+        + t.article_crcs.iter().map(Vec::len).sum::<usize>()
+        + t.staging.values().map(|st| st.ranges.len()).sum::<usize>();
+    assert_eq!(t.metadata_entries, held);
+    let bytes: u64 = t.staging.values().map(|st| st.pieces.held() as u64).sum();
+    assert_eq!(t.staging_bytes, bytes);
+}
+
+/// Stage the first half of each of three slices RAM-only, then lose every second half.
+fn damage_three_half_slices(s: &StreamingParSession, id: &FileId, data: &[u8]) {
+    for b in 0..3usize {
+        let o = b * 4096;
+        let part = &data[o..o + 2048];
+        s.on_article_finished_memory_only(id, o as u64, part, crc32(part))
+            .unwrap();
+    }
+    assert_eq!(s.staging_bytes(), 3 * 2048);
+    for b in 0..3u64 {
+        s.on_article_failed_permanently(id, b * 4096 + 2048, 2048)
+            .unwrap();
+        assert_accounting_exact(s);
+    }
+    assert_eq!(s.status().damaged, 3);
+}
+
+#[test]
+fn live_damaged_staging_cap_releases_oldest_and_repairs() {
+    let fx = fixture(
+        "damaged-cap",
+        &[3 * 4096],
+        4096,
+        3,
+        VolumeScheme::Uniform(1),
+    );
+    let id = fid(&fx, &fx.files[0].0);
+    let path = fx.dir.join(&fx.files[0].0);
+    let s = StreamingParSession::new(
+        &fx.set,
+        &fx.dir,
+        SessionOptions {
+            max_damaged_staging_bytes: 4096,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    let data = fx.files[0].1.clone();
+    damage_three_half_slices(&s, &id, &data);
+    // Slice 0 became damaged first, so its bytes went once the third slice pushed past 4096.
+    assert_eq!(s.staging_bytes(), 4096);
+    assert!(!s.inner.tracker.lock().unwrap().staging.contains_key(&0));
+
+    // A replacement for a kept slice still completes it from staging.
+    let tail = &data[6144..8192];
+    write_at(&path, 6144, tail);
+    s.on_article_finished(&id, 6144, 2048, crc32(tail), Some(tail))
+        .unwrap();
+    assert_eq!(s.status().verified, 1);
+    // A replacement for the released slice reads zeros where the RAM bytes were: it stays
+    // damaged, without an error.
+    let tail = &data[2048..4096];
+    write_at(&path, 2048, tail);
+    s.on_article_finished(&id, 2048, 2048, crc32(tail), Some(tail))
+        .unwrap();
+    assert_eq!(s.status().damaged, 2);
+    assert_eq!(s.staging_bytes(), 2048);
+    assert_accounting_exact(&s);
+
+    // The RAM-only bytes reach the file before recovery volumes back-fill from it.
+    for b in 0..3usize {
+        let o = b * 4096;
+        write_at(&path, o as u64, &data[o..o + 2048]);
+    }
+    for v in &fx.vols {
+        s.on_recovery_volume_arrived(v, None).unwrap();
+    }
+    let rep = s.repair_available_targets_now(&[id]).unwrap();
+    assert_eq!(rep.repaired_slices.len(), 2);
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+    assert_eq!(s.staging_bytes(), 0);
+    assert_accounting_exact(&s);
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}
+
+#[test]
+fn live_release_damaged_staging_frees_everything_and_repairs() {
+    let fx = fixture(
+        "damaged-release",
+        &[3 * 4096],
+        4096,
+        3,
+        VolumeScheme::Uniform(1),
+    );
+    let id = fid(&fx, &fx.files[0].0);
+    let path = fx.dir.join(&fx.files[0].0);
+    let s = StreamingParSession::new(&fx.set, &fx.dir, SessionOptions::default()).unwrap();
+    let data = fx.files[0].1.clone();
+    // The default cap keeps every damaged slice's bytes.
+    damage_three_half_slices(&s, &id, &data);
+    assert_eq!(s.staging_bytes(), 3 * 2048);
+    assert_eq!(s.release_damaged_staging(), 3 * 2048);
+    assert_eq!(s.staging_bytes(), 0);
+    assert_eq!(s.release_damaged_staging(), 0);
+    assert_eq!(s.status().damaged, 3);
+    assert_accounting_exact(&s);
+
+    // The RAM-only bytes reach the file later; repair rebuilds the lost halves.
+    for b in 0..3usize {
+        let o = b * 4096;
+        write_at(&path, o as u64, &data[o..o + 2048]);
+    }
+    for v in &fx.vols {
+        s.on_recovery_volume_arrived(v, None).unwrap();
+    }
+    let rep = s.repair_available_targets_now(&[id]).unwrap();
+    assert_eq!(rep.repaired_slices.len(), 3);
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+    assert_accounting_exact(&s);
+    std::fs::remove_dir_all(fx.dir).unwrap();
+}

@@ -61,7 +61,7 @@ use crate::repairer::{
     write_all_at,
 };
 use crate::scanner::{BlockRef, ChecksumEntry, entries_for_file};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -1786,6 +1786,16 @@ pub struct SessionOptions {
     /// recovery-volume arrival and [`StreamingParSession::set_max_syndrome_slots`].
     /// A repair still back-fills first.
     pub defer_backfill: bool,
+    /// Cap on RAM-only bytes kept for damaged slices.
+    ///
+    /// When an article is lost, the slice becomes damaged, but any RAM-only bytes it holds
+    /// are kept so that a replacement for the lost range can still complete it. If more
+    /// than this many such bytes are held, the slices that became damaged first give theirs
+    /// up. A released slice stays damaged and is rebuilt from recovery data, unless a
+    /// replacement arrives and the released bytes have reached the target file by then.
+    /// The default, `u64::MAX`, never releases. See also
+    /// [`StreamingParSession::release_damaged_staging`].
+    pub max_damaged_staging_bytes: u64,
 }
 
 impl Default for SessionOptions {
@@ -1802,6 +1812,7 @@ impl Default for SessionOptions {
             solve_mem_limit_bytes: 256 << 20,
             kernel: Kernel::detect(),
             defer_backfill: false,
+            max_damaged_staging_bytes: u64::MAX,
         }
     }
 }
@@ -1932,6 +1943,49 @@ fn shrink_staging(staging: &mut HashMap<usize, LiveStaged>) {
     }
 }
 
+impl Tracker {
+    /// Note that damaged slice `g` holds RAM-only staging.
+    fn track_damaged_staging(&mut self, g: usize) {
+        if !self.damaged_staged.contains(&g) {
+            self.damaged_staged.push_back(g);
+        }
+    }
+
+    /// Drop stale entries and return the bytes still staged for damaged slices.
+    fn damaged_staging_bytes(&mut self) -> u64 {
+        let (states, staging) = (&self.states, &self.staging);
+        self.damaged_staged
+            .retain(|g| states[*g] == SliceState::Damaged && staging.contains_key(g));
+        self.damaged_staged
+            .iter()
+            .map(|g| staging[g].pieces.held() as u64)
+            .sum()
+    }
+
+    /// Release the staging of the oldest damaged slices until at most `cap` bytes are held
+    /// for damaged slices. Returns the bytes freed.
+    fn release_damaged_staging(&mut self, cap: u64) -> u64 {
+        let mut held = self.damaged_staging_bytes();
+        let mut freed = 0;
+        while held > cap {
+            let Some(g) = self.damaged_staged.pop_front() else {
+                break;
+            };
+            if let Some(st) = self.staging.remove(&g) {
+                let bytes = st.pieces.held() as u64;
+                self.metadata_entries -= st.ranges.len();
+                self.staging_bytes -= bytes;
+                held -= bytes;
+                freed += bytes;
+            }
+        }
+        if freed > 0 {
+            shrink_staging(&mut self.staging);
+        }
+        freed
+    }
+}
+
 /// Mutable tracker state (one lock, held only for bookkeeping—never during hashing or I/O).
 struct Tracker {
     metadata_entries: usize,
@@ -1944,6 +1998,9 @@ struct Tracker {
     article_crcs: Vec<Vec<(u64, u64, u32)>>,
     staging: HashMap<usize, LiveStaged>,
     staging_bytes: u64,
+    /// Damaged slices that kept RAM-only staging, oldest first. Entries whose slice is no
+    /// longer damaged or no longer staged are pruned lazily.
+    damaged_staged: VecDeque<usize>,
     queued_volumes: Vec<QueuedVolume>,
     /// Volume ids unpaused by the scheduler that have not arrived yet, with their blocks.
     unpaused_in_flight: HashMap<u64, i32>,
@@ -2324,6 +2381,7 @@ impl StreamingParSession {
                 article_crcs: vec![Vec::new(); total],
                 staging: HashMap::new(),
                 staging_bytes: 0,
+                damaged_staged: VecDeque::new(),
                 queued_volumes: Vec::new(),
                 unpaused_in_flight: HashMap::new(),
                 ready_exponents: BTreeSet::new(),
@@ -2706,7 +2764,11 @@ impl StreamingParSession {
                     state: SliceState::Damaged,
                 });
             }
+            if t.staging.contains_key(&g) {
+                t.track_damaged_staging(g);
+            }
         }
+        t.release_damaged_staging(self.inner.opts.max_damaged_staging_bytes);
         let action = Self::schedule_unpause(&mut t);
         Ok((events, action))
     }
@@ -2980,6 +3042,10 @@ impl StreamingParSession {
                         let current = st.ranges.len();
                         t.metadata_entries = t.metadata_entries - previous + current;
                         t.staging_bytes += grown as u64;
+                        if t.states[g] == SliceState::Damaged {
+                            t.track_damaged_staging(g);
+                            t.release_damaged_staging(self.inner.opts.max_damaged_staging_bytes);
+                        }
                     }
                 }
                 if range_covered(&covered, 0, slen as i64) {
@@ -3555,6 +3621,20 @@ impl StreamingParSession {
     pub fn set_max_staging_bytes(&self, bytes: u64) -> u64 {
         self.inner.max_staging.store(bytes, Ordering::Release);
         bytes
+    }
+
+    /// Release the RAM-only bytes held for damaged slices and return how many were freed.
+    ///
+    /// Call this when no replacement will arrive for the lost articles, for example once
+    /// every server has been tried. The slices stay damaged and are rebuilt from recovery
+    /// data. If a replacement does arrive later, the slice is read from the target file, so
+    /// it verifies only if the released bytes have reached that file by then.
+    pub fn release_damaged_staging(&self) -> u64 {
+        self.inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .release_damaged_staging(0)
     }
 
     /// Current syndrome slot cap (starts at `SessionOptions::max_syndrome_slots`).
