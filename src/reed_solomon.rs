@@ -604,6 +604,16 @@ impl OutView {
 
 /// Word range of tile `t` (`None` past the end).
 #[inline]
+/// Tile width for `words` words split across `threads` workers: at most `max_tile`, shrunk so
+/// every worker gets the same number of tiles. Each batch ends in a barrier, so with 16 tiles
+/// on 12 workers the second round would keep only 4 busy.
+fn balanced_tile(words: usize, max_tile: usize, threads: usize) -> usize {
+    let threads = threads.max(1);
+    let rounds = words.div_ceil(max_tile).div_ceil(threads).max(1);
+    let tile = words.div_ceil(rounds * threads).next_multiple_of(64);
+    tile.clamp(64, max_tile.max(64))
+}
+
 fn tile_bounds(t: usize, tile: usize, words: usize) -> Option<(usize, usize)> {
     let t0 = t.checked_mul(tile)?;
     (t0 < words).then(|| (t0, (t0 + tile).min(words)))
@@ -763,7 +773,7 @@ impl Engine<'_> {
             for o in &mut outputs {
                 o[..len].fill(0);
             }
-            let tile = self.config.tile_words.max(64);
+            let tile = balanced_tile(words, self.config.tile_words.max(64), threads);
             let n_tiles = words.div_ceil(tile);
             let workers = threads.clamp(1, n_tiles);
 
@@ -1572,6 +1582,22 @@ mod tests {
         e0.run(&reader, &mut out, None, &mut |_, _, _, _| {})
             .unwrap();
         assert!(out.slices.iter().all(|s| s.iter().all(|&b| b == 0)));
+    }
+
+    #[test]
+    fn balanced_tiles_fill_every_worker() {
+        assert_eq!(balanced_tile(131_072, 8192, 12), 5504);
+        assert_eq!(131_072usize.div_ceil(5504), 24);
+        assert_eq!(balanced_tile(131_072, 8192, 8), 8192);
+        assert_eq!(balanced_tile(131_072, 8192, 10), 6592);
+        assert_eq!(balanced_tile(100, 8192, 12), 64);
+        assert_eq!(balanced_tile(1, 8192, 1), 64);
+        for words in [1usize, 63, 64, 4097, 131_072, 1 << 20] {
+            for threads in 1..=32 {
+                let t = balanced_tile(words, 8192, threads);
+                assert!((64..=8192).contains(&t) && t.is_multiple_of(64));
+            }
+        }
     }
 
     #[test]
