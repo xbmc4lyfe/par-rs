@@ -511,7 +511,7 @@ impl Chains<'_> {
 
     fn work_inner(&self, lanes: usize, yield_when: Option<&AtomicBool>) -> io::Result<()> {
         let mut held: Vec<Chain> = Vec::with_capacity(lanes);
-        // Room for a full chunk plus the final padding block(s).
+        // Room for a full chunk plus up to two final padding blocks.
         let mut bufs: Vec<Vec<u8>> = (0..lanes).map(|_| vec![0u8; HASH_CHUNK + 128]).collect();
         let mut sizes = vec![0usize; lanes];
         let mut states: Vec<[u32; 4]> = Vec::with_capacity(lanes);
