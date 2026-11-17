@@ -1913,6 +1913,10 @@ struct ArticlePayload<'a> {
     memory_only: bool,
 }
 
+/// A slice completed under the tracker lock: (slice, fully staged bytes, partly staged
+/// pieces, `ParQuick` CRC).
+type CompletedSlice = (usize, Option<Vec<u8>>, Option<Pieces>, Option<u32>);
+
 struct LiveStaged {
     pieces: Pieces,
     ranges: Vec<ByteRange>,
@@ -2811,8 +2815,7 @@ impl StreamingParSession {
             tracker: &self.inner.tracker,
             bytes: 0,
         };
-        // (slice, fully staged bytes, partly staged pieces, ParQuick CRC)
-        let mut completed: Vec<(usize, Option<Vec<u8>>, Option<Pieces>, Option<u32>)> = Vec::new();
+        let mut completed: Vec<CompletedSlice> = Vec::new();
         {
             let mut t = self
                 .inner
