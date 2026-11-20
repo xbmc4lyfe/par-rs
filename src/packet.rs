@@ -442,8 +442,18 @@ pub struct ScanStats {
     pub md5_failures: u64,
     /// Resynchronisations performed (corrupt regions skipped).
     pub resyncs: u64,
-    /// Bytes skipped by resynchronisation.
+    /// Bytes skipped by resynchronisation, including a trailing fragment too short to hold a
+    /// packet header.
     pub skipped_bytes: u64,
+}
+
+impl ScanStats {
+    /// Whether the framing of the source showed damage: a resynchronisation, an MD5 mismatch
+    /// or skipped bytes (holes, garbage, or a truncated last packet).
+    #[must_use]
+    pub fn damaged(&self) -> bool {
+        self.resyncs > 0 || self.md5_failures > 0 || self.skipped_bytes > 0
+    }
 }
 
 /// Iterator over the valid packets of a source.
@@ -541,6 +551,10 @@ impl<'a, S: PacketSource + ?Sized> PacketIter<'a, S> {
         let mut hdr = [0u8; HEADER_LEN];
         loop {
             if self.done || self.pos + HEADER_LEN as u64 > self.len {
+                if !self.done && self.pos < self.len {
+                    // A trailing fragment too short for a header: a truncated file.
+                    self.stats.skipped_bytes += self.len - self.pos;
+                }
                 self.done = true;
                 return Ok(None);
             }
@@ -1362,11 +1376,22 @@ pub struct LoadStats {
     pub invalid: u64,
     /// Unknown packet types.
     pub unknown: u64,
+    /// Recovery slices of a damaged source whose packet MD5 mismatched (dropped, not counted
+    /// as usable). See [`PacketSet::load_source`].
+    pub corrupt_recovery: u64,
     /// Scan statistics (framing).
     pub scan: ScanStats,
 }
 
 impl LoadStats {
+    /// Whether the source was damaged: bad framing (see [`ScanStats::damaged`]), structurally
+    /// invalid packets, or corrupt recovery slices. A damaged source is still loaded: its
+    /// valid packets are kept and only the bad ones are skipped.
+    #[must_use]
+    pub fn damaged(&self) -> bool {
+        self.scan.damaged() || self.invalid > 0 || self.corrupt_recovery > 0
+    }
+
     fn merge(&mut self, o: &LoadStats) {
         self.added += o.added;
         self.duplicates += o.duplicates;
@@ -1374,6 +1399,7 @@ impl LoadStats {
         self.wrong_slice_size += o.wrong_slice_size;
         self.invalid += o.invalid;
         self.unknown += o.unknown;
+        self.corrupt_recovery += o.corrupt_recovery;
         self.scan.packets += o.scan.packets;
         self.scan.md5_failures += o.scan.md5_failures;
         self.scan.resyncs += o.scan.resyncs;
@@ -1439,8 +1465,12 @@ impl PacketSet {
                 self.set_id = Some(set_id);
             }
             Some(s) if s != set_id => {
-                self.stats.foreign += 1;
-                return AddOutcome::ForeignSet;
+                if matches!(packet, Packet::Main(_)) && self.only_unverified_recovery() {
+                    self.rebind(set_id);
+                } else {
+                    self.stats.foreign += 1;
+                    return AddOutcome::ForeignSet;
+                }
             }
             _ => {}
         }
@@ -1505,8 +1535,41 @@ impl PacketSet {
         outcome
     }
 
+    /// Whether the set holds nothing but recovery slices whose MD5 was never checked: its set
+    /// id then comes from an unverified header, which damage may have altered.
+    fn only_unverified_recovery(&self) -> bool {
+        self.main.is_none()
+            && self.creator.is_none()
+            && self.file_descs.is_empty()
+            && self.ifscs.is_empty()
+            && self.recovery.values().all(|r| !r.md5_verified)
+    }
+
+    /// Re-bind a set that holds only unverified recovery slices to `set_id`, the id of an
+    /// MD5-checked Main packet. The slices stored so far carry another set id: they came from
+    /// a damaged header or a stray set, so they move to the foreign count.
+    fn rebind(&mut self, set_id: SetId) {
+        let dropped = self.recovery.len() as u64;
+        self.recovery.clear();
+        self.stats.added = self.stats.added.saturating_sub(dropped);
+        self.stats.foreign += dropped;
+        self.set_id = Some(set_id);
+    }
+
     /// Scan `src` and add every packet of this set. `source_id` is recorded in recovery
     /// slice references. Returns the statistics of this source only.
+    ///
+    /// A damaged source (see [`LoadStats::damaged`]) is not an error: bad packets are skipped
+    /// by resynchronizing on the next packet magic, including a last packet whose length runs
+    /// past the end, and every valid packet is kept. When `opts` leaves recovery payloads
+    /// unhashed, the recovery slices of a damaged source are hashed anyway, so that zero-filled
+    /// or overwritten slices are dropped (counted in [`LoadStats::corrupt_recovery`]) and
+    /// [`recovery_count`](Self::recovery_count) counts only intact ones. Recovery slices of a
+    /// source with clean framing stay unverified until used.
+    ///
+    /// An unbound set binds to the first Main packet of the source, else to the first
+    /// MD5-checked packet. A set holding only unverified recovery slices re-binds to the first
+    /// Main packet that arrives later, so one damaged recovery header cannot capture the set.
     ///
     /// # Errors
     /// I/O errors reading `src`; malformed packets are counted in the returned stats, not returned.
@@ -1529,10 +1592,25 @@ impl PacketSet {
             }
         }
         local.scan = iter.stats();
-        if self.set_id.is_none()
-            && let Some((sid, _)) = pending.iter().find(|(_, p)| matches!(p, Packet::Main(_)))
+        let pending = screen_damaged_recovery(src, pending, opts, &mut local)?;
+        let main_sid = pending
+            .iter()
+            .find(|(_, p)| matches!(p, Packet::Main(_)))
+            .map(|(sid, _)| *sid);
+        if self.set_id.is_none() {
+            let checked = |p: &Packet| match p {
+                Packet::RecoverySlice(r) => r.md5_verified,
+                Packet::Unknown { .. } => false,
+                _ => opts.verify_md5,
+            };
+            self.set_id =
+                main_sid.or_else(|| pending.iter().find(|(_, p)| checked(p)).map(|(s, _)| *s));
+        } else if let Some(sid) = main_sid
+            && self.set_id != Some(sid)
+            && self.only_unverified_recovery()
         {
-            self.set_id = Some(*sid);
+            // Before adding, so this source's own recovery slices are not turned away.
+            self.rebind(sid);
         }
         for (sid, p) in pending {
             match self.add(sid, p) {
@@ -1543,8 +1621,9 @@ impl PacketSet {
                 AddOutcome::Unknown => local.unknown += 1,
             }
         }
-        // `add` already counted into self.stats except scan/invalid.
+        // `add` already counted into self.stats except scan/invalid/corrupt recovery.
         self.stats.invalid += local.invalid;
+        self.stats.corrupt_recovery += local.corrupt_recovery;
         self.stats.scan.packets += local.scan.packets;
         self.stats.scan.md5_failures += local.scan.md5_failures;
         self.stats.scan.resyncs += local.scan.resyncs;
@@ -1645,6 +1724,7 @@ impl PacketSet {
     pub fn merge(&mut self, other: PacketSet) {
         if let (Some(a), Some(b)) = (self.set_id, other.set_id)
             && a != b
+            && !(other.main.is_some() && self.only_unverified_recovery())
         {
             self.stats.foreign += other.stats.added;
             return;
@@ -1670,11 +1750,40 @@ impl PacketSet {
             self.add(sid, Packet::RecoverySlice(r));
         }
         self.stats.invalid += other_stats.invalid;
+        self.stats.corrupt_recovery += other_stats.corrupt_recovery;
         self.stats.scan.packets += other_stats.scan.packets;
         self.stats.scan.md5_failures += other_stats.scan.md5_failures;
         self.stats.scan.resyncs += other_stats.scan.resyncs;
         self.stats.scan.skipped_bytes += other_stats.scan.skipped_bytes;
     }
+}
+
+/// When `src` is damaged (see [`LoadStats::damaged`]) and `opts` skips recovery hashing,
+/// check the MD5 of each unverified recovery slice in `pending` and drop the corrupt ones
+/// (counted in [`LoadStats::corrupt_recovery`]). Clean sources pass through unhashed.
+fn screen_damaged_recovery<S: PacketSource + ?Sized>(
+    src: &S,
+    pending: Vec<(SetId, Packet)>,
+    opts: ScanOptions,
+    local: &mut LoadStats,
+) -> io::Result<Vec<(SetId, Packet)>> {
+    if opts.verify_recovery_md5 || !local.damaged() {
+        return Ok(pending);
+    }
+    let mut kept = Vec::with_capacity(pending.len());
+    for (sid, mut p) in pending {
+        if let Packet::RecoverySlice(r) = &mut p
+            && !r.md5_verified
+        {
+            if !r.verify(src)? {
+                local.corrupt_recovery += 1;
+                continue;
+            }
+            r.md5_verified = true;
+        }
+        kept.push((sid, p));
+    }
+    Ok(kept)
 }
 
 /// Packets of every recovery set found in one or more sources, keyed by set id.
@@ -1693,7 +1802,9 @@ impl Par2Collection {
         Self::default()
     }
 
-    /// Scan `src` and distribute packets into their sets.
+    /// Scan `src` and distribute packets into their sets. A damaged source is handled as in
+    /// [`PacketSet::load_source`]: bad packets are skipped, valid ones kept, and the recovery
+    /// slices of a damaged source are hashed so that only intact ones are stored.
     ///
     /// # Errors
     /// I/O errors reading `src`; malformed packets are counted in the returned stats, not returned.
@@ -1705,27 +1816,28 @@ impl Par2Collection {
     ) -> io::Result<LoadStats> {
         let mut local = LoadStats::default();
         let mut iter = PacketIter::new(src, opts);
+        let mut pending: Vec<(SetId, Packet)> = Vec::new();
         for raw in iter.by_ref() {
             let raw = raw?;
             match parse_packet(src, &raw, source_id)? {
                 Ok(Packet::Unknown { .. }) => local.unknown += 1,
-                Ok(p) => {
-                    let sid = raw.header.set_id;
-                    let set = self
-                        .sets
-                        .entry(sid)
-                        .or_insert_with(|| PacketSet::for_set(sid));
-                    match set.add(sid, p) {
-                        AddOutcome::Added => local.added += 1,
-                        AddOutcome::Duplicate => local.duplicates += 1,
-                        AddOutcome::WrongSliceSize => local.wrong_slice_size += 1,
-                        AddOutcome::ForeignSet | AddOutcome::Unknown => unreachable!(),
-                    }
-                }
+                Ok(p) => pending.push((raw.header.set_id, p)),
                 Err(_) => local.invalid += 1,
             }
         }
         local.scan = iter.stats();
+        for (sid, p) in screen_damaged_recovery(src, pending, opts, &mut local)? {
+            let set = self
+                .sets
+                .entry(sid)
+                .or_insert_with(|| PacketSet::for_set(sid));
+            match set.add(sid, p) {
+                AddOutcome::Added => local.added += 1,
+                AddOutcome::Duplicate => local.duplicates += 1,
+                AddOutcome::WrongSliceSize => local.wrong_slice_size += 1,
+                AddOutcome::ForeignSet | AddOutcome::Unknown => unreachable!(),
+            }
+        }
         self.stats.merge(&local);
         Ok(local)
     }
