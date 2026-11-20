@@ -1,8 +1,11 @@
 //! Randomized live-repair stress: articles of random sizes arrive out of order, some twice,
 //! some lost for good and some corrupted, while recovery volumes arrive at random points. The
 //! session runs with random staging caps, slot counts and fold threads, and is sometimes
-//! cancelled part-way. Some scenarios also cap the RAM-only bytes kept for damaged slices. Every scenario checks the staging accounting, the final slice states,
-//! and that the repaired files match the originals byte for byte.
+//! cancelled part-way. Some scenarios also cap the RAM-only bytes kept for damaged slices.
+//! Some scenarios also patch random ranges with the original bytes mid-stream, the way a
+//! downloader rewrites refilled or stream-repaired data, over articles that already arrived,
+//! failed or were corrupted. Every scenario checks the staging accounting, the final slice
+//! states, and that the repaired files match the originals byte for byte.
 //!
 //! `PAR_RS_STRESS_SCENARIOS` sets the scenario count (default 48) and `PAR_RS_STRESS_SEED`
 //! the base seed, so a failure can be replayed.
@@ -151,9 +154,30 @@ fn run_scenario(n: u64, seed: u64) {
     };
     let s = StreamingParSession::new(&fx.set, &fx.dir, opts).unwrap();
 
+    // Patches draw from their own generator, so scenarios without them replay unchanged.
+    let mut prng = Rng(seed ^ 0x0BAD_C0DE_D00D_F00D);
+    let patching = prng.chance(35);
+    let mut processed = vec![false; articles.len()];
+    // Patched ranges per file, as `(start, end)`.
+    let mut patched: Vec<Vec<(u64, u64)>> = vec![Vec::new(); nfiles];
+
     let mut delivered = 0usize;
     let mut done_events = 0usize;
     while let Some(ev) = events.pop_front() {
+        if patching && prng.chance(20) {
+            patch_processed_range(
+                &s,
+                &fx,
+                &ids,
+                &articles,
+                &processed,
+                &mut prng,
+                &mut deferred,
+                &mut patched,
+                &mut delivered,
+                &ctx,
+            );
+        }
         if cancel_at == Some(done_events) {
             s.cancel();
             let a = &articles[0];
@@ -179,6 +203,7 @@ fn run_scenario(n: u64, seed: u64) {
             }
             Event::Article(i) | Event::Replacement(i) => {
                 let replacement = matches!(ev, Event::Replacement(_));
+                processed[i] = true;
                 let a = &articles[i];
                 let path = fx.dir.join(&fx.files[a.file].0);
                 let id = &ids[a.file];
@@ -261,20 +286,40 @@ fn run_scenario(n: u64, seed: u64) {
     }
     s.flush();
 
-    // A slice is damaged when a lost article touches it or holds a corrupted byte.
+    // A slice is damaged when it holds a byte of a lost article or a corrupted byte that no
+    // patch rewrote.
+    let is_patched = |file: usize, lo: u64, hi: u64| {
+        let mut runs = patched[file].clone();
+        runs.sort_unstable();
+        let mut pos = lo;
+        for (a, b) in runs {
+            if a <= pos && b > pos {
+                pos = b;
+            }
+        }
+        pos >= hi
+    };
     let mut damaged = std::collections::BTreeSet::new();
     for a in &articles {
         match a.fate {
             Fate::Good | Fate::Replaced => {}
             Fate::Lost => {
+                let end = a.offset + a.len as u64;
                 let first = a.offset / slice;
-                let last = (a.offset + a.len as u64 - 1) / slice;
+                let last = (end - 1) / slice;
                 for si in first..=last {
-                    damaged.insert((a.file, si));
+                    let lo = a.offset.max(si * slice);
+                    let hi = end.min((si + 1) * slice);
+                    if !is_patched(a.file, lo, hi) {
+                        damaged.insert((a.file, si));
+                    }
                 }
             }
             Fate::Corrupt => {
-                damaged.insert((a.file, (a.offset + a.flip as u64) / slice));
+                let at = a.offset + a.flip as u64;
+                if !is_patched(a.file, at, at + 1) {
+                    damaged.insert((a.file, at / slice));
+                }
             }
         }
     }
@@ -369,4 +414,66 @@ fn run_scenario(n: u64, seed: u64) {
     }
     drop(s);
     std::fs::remove_dir_all(&fx.dir).unwrap();
+}
+
+/// Patch a random range of articles that already had their first event with the original
+/// bytes: written to disk, then reported with or without the RAM bytes.
+#[allow(clippy::too_many_arguments)]
+fn patch_processed_range(
+    s: &StreamingParSession,
+    fx: &Fx,
+    ids: &[FileId],
+    articles: &[Article],
+    processed: &[bool],
+    rng: &mut Rng,
+    deferred: &mut Vec<(std::path::PathBuf, u64, Vec<u8>)>,
+    patched: &mut [Vec<(u64, u64)>],
+    delivered: &mut usize,
+    ctx: &str,
+) {
+    let done: Vec<usize> = (0..articles.len()).filter(|&i| processed[i]).collect();
+    if done.is_empty() {
+        return;
+    }
+    let first = done[(rng.next() % done.len() as u64) as usize];
+    let file = articles[first].file;
+    let (lo, hi) = if rng.chance(10)
+        && (0..articles.len()).all(|i| articles[i].file != file || processed[i])
+    {
+        // The whole volume.
+        (0, fx.files[file].1.len() as u64)
+    } else {
+        let mut last = first;
+        while last + 1 < articles.len()
+            && articles[last + 1].file == file
+            && processed[last + 1]
+            && rng.chance(60)
+        {
+            last += 1;
+        }
+        let (a, b) = (&articles[first], &articles[last]);
+        let lo = a.offset + rng.next() % a.len as u64;
+        let hi = (b.offset + rng.range(1, b.len as u64)).max(lo + 1);
+        (lo, hi.min(b.offset + b.len as u64))
+    };
+    // Pending RAM-only writes land first: a patched verified slice is checked against the
+    // rest of its bytes on disk.
+    for (path, off, bytes) in deferred.drain(..) {
+        write_at(&path, off, &bytes);
+    }
+    let data = &fx.files[file].1[lo as usize..hi as usize];
+    write_at(&fx.dir.join(&fx.files[file].0), lo, data);
+    let with_bytes = rng.chance(50);
+    let r = s
+        .on_range_replaced(&ids[file], lo, hi - lo, with_bytes.then_some(data))
+        .unwrap_or_else(|e| panic!("{ctx}: patch f{file} [{lo}, {hi}): {e}"));
+    assert!(
+        r.is_reconciled(),
+        "{ctx}: patch f{file} [{lo}, {hi}) with original bytes: {:?}",
+        r.slices
+    );
+    if with_bytes {
+        *delivered += data.len();
+    }
+    patched[file].push((lo, hi));
 }
