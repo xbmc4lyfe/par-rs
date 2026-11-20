@@ -255,3 +255,123 @@ fn live_session_absorbs_only_intact_slices_of_a_damaged_volume() {
         INTACT
     );
 }
+
+/// Only the recovery packets of a volume: clean framing, no metadata, nothing MD5-checked by
+/// a metadata scan.
+fn recovery_only(vol: &[u8]) -> Vec<u8> {
+    let last = packets(vol, PacketKind::RecvSlic).pop().unwrap();
+    vol[..last.offset + last.length as usize].to_vec()
+}
+
+/// Set B's recovery-only volume loads before set A's index in one directory. The set re-binds
+/// to A; B's volume must not stay a purge candidate, and the counts must not underflow.
+#[test]
+fn other_sets_recovery_volume_loaded_first_is_never_purged() {
+    let fx = fixture("multiset");
+    let b_src = data(30_000, 9);
+    let b = build_set(
+        "setb",
+        &[("b.bin", &b_src)],
+        &SetOptions {
+            slice_size: SLICE,
+            recovery_blocks: 4,
+            volumes: VolumeScheme::Single,
+            ..SetOptions::default()
+        },
+    )
+    .unwrap();
+    let b_vol = fx.dir.join("setb.vol00+04.par2");
+    std::fs::write(&b_vol, recovery_only(&b.volumes[0].1)).unwrap();
+    let (index, vol) = write_damaged_set(&fx);
+    write_source(&fx, 0);
+
+    let mut r = Par2Repairer::new(&fx.dir, RepairOptions::default());
+    assert_eq!(r.load_par2_file(&b_vol).unwrap(), 4);
+    assert_eq!(r.load_par2_file(&index).unwrap(), 0);
+    assert_eq!(r.load_par2_file(&vol).unwrap() as u64, INTACT);
+    r.finalize().unwrap();
+    assert_eq!(r.set_id(), Some(fx.set.set_id));
+    assert_eq!(r.recovery_blocks(), INTACT);
+    assert!(!r.purge_candidates().contains(&b_vol));
+    let reports = r.par_file_reports();
+    assert_eq!(
+        reports.iter().map(|p| p.path.clone()).collect::<Vec<_>>(),
+        vec![index.clone(), vol.clone()]
+    );
+    assert_eq!(reports[1].usable_recovery_slices, INTACT);
+
+    let v = r.verify(None, &mut NullObserver).unwrap();
+    assert!(v.all_complete);
+    assert_eq!(v.damaged_par_files, vec![vol.clone()]);
+    let purged = r.purge(&mut NullObserver);
+    assert!(purged.removed().any(|p| p == index));
+    assert!(
+        b_vol.exists(),
+        "set B's volume must survive a purge of set A"
+    );
+}
+
+/// A cleanly framed recovery-only volume of set A whose first header carries a damaged set id
+/// binds the set to that id; the re-bind to A's Main must add back its good slices.
+#[test]
+fn rebind_restores_slices_turned_away_by_a_damaged_first_header() {
+    let fx = fixture("parked");
+    let index = fx.dir.join("set.par2");
+    std::fs::write(&index, &fx.set.index).unwrap();
+    let mut d = recovery_only(&fx.set.volumes[1].1);
+    let first = packets(&d, PacketKind::RecvSlic)[0].offset;
+    d[first + 40..first + 48].fill(0);
+    let vol = fx.dir.join(&fx.set.volumes[1].0);
+    std::fs::write(&vol, d).unwrap();
+
+    let mut r = Par2Repairer::new(&fx.dir, RepairOptions::default());
+    assert_eq!(
+        r.load_par2_file(&vol).unwrap(),
+        1,
+        "bound to the damaged id"
+    );
+    assert_eq!(r.load_par2_file(&index).unwrap(), 0);
+    r.finalize().unwrap();
+    assert_eq!(r.recovery_blocks(), 7);
+    let reports = r.par_file_reports();
+    assert_eq!(reports[0].path, vol);
+    assert_eq!(reports[0].usable_recovery_slices, 7);
+    assert_eq!((reports[0].stats.added, reports[0].stats.foreign), (7, 1));
+    assert!(
+        !r.purge_candidates().contains(&vol),
+        "it held a foreign packet"
+    );
+}
+
+#[test]
+fn pinned_set_never_rebinds() {
+    let fx = fixture("pinned");
+    let other = par_rs::packet::SetId([0xAB; 16]);
+    let mut pinned = par_rs::packet::PacketSet::for_set(other);
+    pinned
+        .load_source(&fx.set.index[..], 0, ScanOptions::METADATA)
+        .unwrap();
+    assert_eq!(pinned.set_id, Some(other));
+    assert!(pinned.main.is_none());
+
+    // Pinned, then given unverified recovery slices of its own id: still never re-binds.
+    let b = load_par2_bytes(&recovery_only(&fx.set.volumes[0].1), ScanOptions::METADATA).unwrap();
+    let mut pinned = par_rs::packet::PacketSet::for_set(b.set_id.unwrap());
+    pinned.merge(b);
+    let stray = build_set(
+        "x",
+        &[("x.bin", &data(5000, 3))],
+        &SetOptions {
+            slice_size: SLICE,
+            recovery_blocks: 1,
+            ..SetOptions::default()
+        },
+    )
+    .unwrap()
+    .index;
+    let before = pinned.set_id;
+    pinned.merge(load_par2_bytes(&stray, ScanOptions::METADATA).unwrap());
+    assert_eq!(pinned.set_id, before);
+    assert_eq!(pinned.recovery_count(), 8);
+    assert!(pinned.main.is_none());
+}

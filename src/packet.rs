@@ -1424,6 +1424,13 @@ pub struct PacketSet {
     pub recovery: BTreeMap<u32, RecoverySliceRef>,
     /// Accumulated statistics.
     pub stats: LoadStats,
+    /// The set id was taken from an unverified recovery header, not pinned by
+    /// [`for_set`](Self::for_set) or bound by a Main or MD5-checked packet; only such a set
+    /// may re-bind (see [`load_source`](Self::load_source)).
+    auto_bound: bool,
+    /// Unverified recovery slices of another set id, turned away while the set is
+    /// auto-bound; re-added if a re-bind makes their set id the bound one.
+    parked: Vec<RecoverySliceRef>,
 }
 
 impl PacketSet {
@@ -1433,7 +1440,8 @@ impl PacketSet {
         Self::default()
     }
 
-    /// Empty set bound to `set_id`.
+    /// Empty set pinned to `set_id`: packets of any other set are always foreign, and the set
+    /// never re-binds.
     #[must_use]
     pub fn for_set(set_id: SetId) -> Self {
         Self {
@@ -1463,11 +1471,18 @@ impl PacketSet {
             None => {
                 // Bind to the first Main packet if possible, otherwise to the first packet.
                 self.set_id = Some(set_id);
+                self.auto_bound = matches!(&packet, Packet::RecoverySlice(r) if !r.md5_verified);
             }
             Some(s) if s != set_id => {
-                if matches!(packet, Packet::Main(_)) && self.only_unverified_recovery() {
+                if matches!(packet, Packet::Main(_)) && self.rebindable() {
                     self.rebind(set_id);
                 } else {
+                    if self.auto_bound
+                        && let Packet::RecoverySlice(r) = &packet
+                        && !r.md5_verified
+                    {
+                        self.parked.push(*r);
+                    }
                     self.stats.foreign += 1;
                     return AddOutcome::ForeignSet;
                 }
@@ -1545,15 +1560,29 @@ impl PacketSet {
             && self.recovery.values().all(|r| !r.md5_verified)
     }
 
-    /// Re-bind a set that holds only unverified recovery slices to `set_id`, the id of an
-    /// MD5-checked Main packet. The slices stored so far carry another set id: they came from
-    /// a damaged header or a stray set, so they move to the foreign count.
+    /// Whether a Main packet of another set id may re-bind this set: its id came from an
+    /// unverified recovery header and nothing else was stored since.
+    fn rebindable(&self) -> bool {
+        self.auto_bound && self.only_unverified_recovery()
+    }
+
+    /// Re-bind an auto-bound set that holds only unverified recovery slices to `set_id`, the
+    /// id of a Main packet. The slices stored so far carry another set id: they came from a
+    /// damaged header or a stray set, so they move to the foreign count. Parked slices of
+    /// `set_id` are added back.
     fn rebind(&mut self, set_id: SetId) {
         let dropped = self.recovery.len() as u64;
         self.recovery.clear();
         self.stats.added = self.stats.added.saturating_sub(dropped);
         self.stats.foreign += dropped;
         self.set_id = Some(set_id);
+        self.auto_bound = false;
+        for r in std::mem::take(&mut self.parked) {
+            if r.set_id == set_id && self.add(set_id, Packet::RecoverySlice(r)) == AddOutcome::Added
+            {
+                self.stats.foreign = self.stats.foreign.saturating_sub(1);
+            }
+        }
     }
 
     /// Scan `src` and add every packet of this set. `source_id` is recorded in recovery
@@ -1567,9 +1596,17 @@ impl PacketSet {
     /// [`recovery_count`](Self::recovery_count) counts only intact ones. Recovery slices of a
     /// source with clean framing stay unverified until used.
     ///
+    /// Damage confined to the payload of a recovery packet in an otherwise cleanly framed
+    /// source (a zero-filled range between intact headers) is not detected here: that slice
+    /// counts as usable until a repair hashes it before use and drops it.
+    ///
     /// An unbound set binds to the first Main packet of the source, else to the first
-    /// MD5-checked packet. A set holding only unverified recovery slices re-binds to the first
-    /// Main packet that arrives later, so one damaged recovery header cannot capture the set.
+    /// MD5-checked packet, else to the first packet. A set auto-bound that way to an
+    /// unverified recovery header, and holding nothing but unverified recovery slices,
+    /// re-binds to the first Main packet of another set id that arrives later, so one damaged
+    /// recovery header cannot capture the set. Its stored slices then count as foreign, and
+    /// slices it had turned away that match the Main packet are added back. A set pinned with
+    /// [`for_set`](Self::for_set), or bound by a Main or MD5-checked packet, never re-binds.
     ///
     /// # Errors
     /// I/O errors reading `src`; malformed packets are counted in the returned stats, not returned.
@@ -1605,9 +1642,10 @@ impl PacketSet {
             };
             self.set_id =
                 main_sid.or_else(|| pending.iter().find(|(_, p)| checked(p)).map(|(s, _)| *s));
+            // Otherwise `add` binds to the first packet and records whether it was unverified.
         } else if let Some(sid) = main_sid
             && self.set_id != Some(sid)
-            && self.only_unverified_recovery()
+            && self.rebindable()
         {
             // Before adding, so this source's own recovery slices are not turned away.
             self.rebind(sid);
@@ -1724,7 +1762,7 @@ impl PacketSet {
     pub fn merge(&mut self, other: PacketSet) {
         if let (Some(a), Some(b)) = (self.set_id, other.set_id)
             && a != b
-            && !(other.main.is_some() && self.only_unverified_recovery())
+            && !(other.main.is_some() && self.rebindable())
         {
             self.stats.foreign += other.stats.added;
             return;
