@@ -255,9 +255,9 @@ pub use repair::{
 };
 pub use repairer::{
     BackupPolicy, DonorReadBudget, DonorReadError, DonorReadScope, ExtraFileScanPolicy, FileStatus,
-    Level, NullObserver, Par2Repairer, PurgeEntry, PurgeKept, PurgeReport, QuickInfo,
-    QuickVerifier, RepairCheck, RepairError, RepairObserver, RepairOptions, RepairResult,
-    SourceFileState, Stage, VerifyResult,
+    Level, NullObserver, Par2Repairer, ParFileReport, PurgeEntry, PurgeKept, PurgeReport,
+    QuickInfo, QuickVerifier, RepairCheck, RepairError, RepairObserver, RepairOptions,
+    RepairResult, SourceFileState, Stage, VerifyResult,
 };
 pub use scanner::{ChecksumIndex, ScanConfig, ScanReport, scan_file};
 pub use stream::{FileLayout, StreamEvent, StreamStatus, StreamingSliceAssembler, SyndromeBank};

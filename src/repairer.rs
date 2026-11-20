@@ -23,7 +23,9 @@
 use crate::damage::{self, DownloadStatus, QuickVerdict, Segment};
 use crate::gf16::input_constant_logs;
 use crate::gf16::simd::Kernel;
-use crate::packet::{FileId, PacketSet, RecoverySliceRef, ScanOptions, SetId, read_exact_at};
+use crate::packet::{
+    FileId, LoadStats, PacketSet, RecoverySliceRef, ScanOptions, SetId, read_exact_at,
+};
 use crate::parhash::{
     HashRange, file_hashes_parallel, hash_ranges_parallel_with_budget, slice_ranges,
 };
@@ -495,14 +497,17 @@ pub(crate) fn check_recovery_matrix_memory(
     Ok(())
 }
 
-/// Outcome of [`Par2Repairer::verify`].
+/// Outcome of [`Par2Repairer::verify`]. Non-exhaustive: more fields may be added, so code
+/// outside this crate reads it but cannot build it with a struct literal.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VerifyResult {
     /// Every target file is complete.
     pub all_complete: bool,
     /// Blocks missing across all files.
     pub missing_blocks: u64,
-    /// Recovery blocks available.
+    /// Usable recovery blocks, as [`Par2Repairer::recovery_blocks`]: corrupt slices found in
+    /// damaged PAR2 files are not counted.
     pub recovery_blocks: u64,
     /// Some file needs rebuilding (missing blocks, misnamed, or relocated blocks).
     pub repair_needed: bool,
@@ -513,6 +518,10 @@ pub struct VerifyResult {
     /// Incomplete files that match `RepairOptions::ignore_extensions` (not counted in
     /// `repair_needed`).
     pub ignored_damaged: Vec<String>,
+    /// Loaded PAR2 files that were damaged (holes, bad packets, a truncated last packet). Their
+    /// valid packets were kept; this is information, not a failure. See
+    /// [`Par2Repairer::par_file_reports`] for details.
+    pub damaged_par_files: Vec<PathBuf>,
 }
 
 impl VerifyResult {
@@ -520,6 +529,27 @@ impl VerifyResult {
     #[must_use]
     pub fn blocks_needed(&self) -> u64 {
         self.missing_blocks.saturating_sub(self.recovery_blocks)
+    }
+}
+
+/// Load summary of one PAR2 file; see [`Par2Repairer::par_file_reports`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParFileReport {
+    /// The file as loaded (a temporary copy for [`Par2Repairer::load_par2_bytes`]).
+    pub path: PathBuf,
+    /// Recovery slices of this file the repairer currently counts as usable. A slice found
+    /// corrupt when the repair verifies it is no longer counted.
+    pub usable_recovery_slices: u64,
+    /// Load statistics of this file alone.
+    pub stats: LoadStats,
+}
+
+impl ParFileReport {
+    /// Whether the file was damaged (see [`LoadStats::damaged`]). A damaged file still
+    /// contributes its valid packets.
+    #[must_use]
+    pub fn damaged(&self) -> bool {
+        self.stats.damaged()
     }
 }
 
@@ -565,6 +595,8 @@ pub struct Par2Repairer {
     pub(crate) packets: PacketSet,
     /// Par2 files, indexed by `RecoverySliceRef::source_id`.
     pub(crate) par_files: Vec<PathBuf>,
+    /// Load statistics of each entry of `par_files`.
+    pub(crate) par_stats: Vec<LoadStats>,
     pub(crate) files: Vec<SourceFileState>,
     pub(crate) file_by_id: HashMap<FileId, usize>,
     /// Checksums per file in `files` order (`None` without IFSC).
@@ -608,6 +640,7 @@ impl Par2Repairer {
             base_dir: base_dir.into(),
             packets: PacketSet::new(),
             par_files: Vec::new(),
+            par_stats: Vec::new(),
             files: Vec::new(),
             file_by_id: HashMap::new(),
             checksums: Vec::new(),
@@ -737,7 +770,10 @@ impl Par2Repairer {
         &self.locations
     }
 
-    /// Recovery slices loaded.
+    /// Usable recovery slices loaded. Slices of a damaged PAR2 file are hashed when it loads
+    /// and only intact ones count. Slices of cleanly framed files are hashed lazily before a
+    /// repair uses them: a zero-filled payload between intact headers counts until then, and
+    /// stops counting once the repair finds it corrupt.
     #[must_use]
     pub fn recovery_blocks(&self) -> u64 {
         self.packets.recovery.len() as u64
@@ -780,6 +816,14 @@ impl Par2Repairer {
     /// Load one par2 file (index or volume). Metadata is verified; recovery payloads are only
     /// indexed. Returns the number of recovery slices added.
     ///
+    /// A damaged file (holes, zero-filled ranges, bad headers, MD5 mismatches, a truncated last
+    /// packet) is not an error: its bad packets are skipped, every valid Main, `FileDesc`, IFSC
+    /// and recovery packet is kept, and its recovery slices are hashed so that only intact ones
+    /// are added. [`par_file_reports`](Self::par_file_reports) and
+    /// [`VerifyResult::damaged_par_files`] report the damage. Verification fails only when no
+    /// loaded file supplies the Main packet or a recoverable file's description
+    /// ([`finalize`](Self::finalize)).
+    ///
     /// # Errors
     /// [`RepairError::Io`] when reading `path` fails, or [`RepairError::WrongSet`] when every
     /// packet in it belongs to a different recovery set.
@@ -790,13 +834,17 @@ impl Par2Repairer {
     /// [`load_par2_file`](Self::load_par2_file); `purgeable` records the file as a PAR2 file
     /// of this set that [`purge`](Self::purge) may remove (not for internal temporary copies).
     fn load_par2_path(&mut self, path: &Path, purgeable: bool) -> Result<usize, RepairError> {
-        let before = self.packets.recovery.len();
+        let set_before = self.packets.set_id;
         let source_id = self.par_files.len();
         let stats = self
             .packets
             .load_file(path, source_id, ScanOptions::METADATA)
             .map_err(io_ctx(format!("loading {}", path.display())))?;
         self.par_files.push(path.to_path_buf());
+        self.par_stats.push(stats);
+        if set_before.is_some() && self.packets.set_id != set_before {
+            self.after_rebind(source_id);
+        }
         if stats.foreign > 0 && stats.added == 0 {
             // Entire file belongs to another set.
             if let Some(expected) = self.packets.set_id {
@@ -820,7 +868,41 @@ impl Par2Repairer {
             let ss = self.block_size();
             self.packets.recovery.retain(|_, r| r.slice_size == ss);
         }
-        Ok(self.packets.recovery.len() - before)
+        Ok(self.recovery_from(source_id) as usize)
+    }
+
+    /// Recovery slices currently stored from `par_files[source_id]`.
+    fn recovery_from(&self, source_id: usize) -> u64 {
+        self.packets
+            .recovery
+            .values()
+            .filter(|r| r.source_id == source_id)
+            .count() as u64
+    }
+
+    /// The set re-bound while loading `par_files[current]` (its id had come from an unverified
+    /// recovery header). Files loaded earlier gave it only recovery slices, now mostly
+    /// foreign: recount what each still supplies, and drop the files that are no longer made
+    /// solely of this set's packets from the purge candidates.
+    fn after_rebind(&mut self, current: usize) {
+        for i in 0..current {
+            let supplied = self.recovery_from(i);
+            let Some(st) = self.par_stats.get_mut(i) else {
+                continue;
+            };
+            st.foreign = (st.foreign + st.added).saturating_sub(supplied);
+            st.added = supplied;
+            let own = st.foreign == 0 && st.added + st.duplicates > 0;
+            if !own && let Some(path) = self.par_files.get(i) {
+                self.purge_state.par_files.retain(|p| p != path);
+            }
+        }
+    }
+
+    /// Whether a file gave this set nothing but foreign packets (another set, or a set id the
+    /// set re-bound away from).
+    fn entirely_foreign(stats: &LoadStats) -> bool {
+        stats.foreign > 0 && stats.added + stats.duplicates == 0
     }
 
     /// Load `main_path` and every other file of the same collection in its directory
@@ -875,6 +957,31 @@ impl Par2Repairer {
         std::fs::write(&tmp, &data)
             .map_err(io_ctx(format!("writing temporary copy of {label}")))?;
         self.load_par2_path(&tmp, false)
+    }
+
+    /// Load summary of every loaded PAR2 file of this set, in load order: its path, the
+    /// recovery slices from it that currently count as usable, and its load statistics (with
+    /// [`ParFileReport::damaged`] for files whose bad packets were skipped). Files that gave
+    /// the set only foreign packets are left out.
+    #[must_use]
+    pub fn par_file_reports(&self) -> Vec<ParFileReport> {
+        let mut usable = vec![0u64; self.par_files.len()];
+        for r in self.packets.recovery.values() {
+            if let Some(n) = usable.get_mut(r.source_id) {
+                *n += 1;
+            }
+        }
+        self.par_files
+            .iter()
+            .zip(&self.par_stats)
+            .zip(usable)
+            .filter(|((_, stats), _)| !Self::entirely_foreign(stats))
+            .map(|((path, stats), usable_recovery_slices)| ParFileReport {
+                path: path.clone(),
+                usable_recovery_slices,
+                stats: *stats,
+            })
+            .collect()
     }
 
     /// Build the file and block tables. Must be called after loading and before verifying.
@@ -1731,6 +1838,13 @@ impl Par2Repairer {
             repair_possible: missing <= recovery,
             quick_verified_files: self.quick_verified_files,
             ignored_damaged,
+            damaged_par_files: self
+                .par_files
+                .iter()
+                .zip(&self.par_stats)
+                .filter(|(_, s)| s.damaged() && !Self::entirely_foreign(s))
+                .map(|(p, _)| p.clone())
+                .collect(),
         }
     }
 
