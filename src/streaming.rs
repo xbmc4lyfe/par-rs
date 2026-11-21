@@ -206,6 +206,44 @@ impl Pieces {
         self.held - before
     }
 
+    /// Drop the bytes held in `[lo, hi)`, splitting a run that straddles either edge. Returns
+    /// how many bytes the held total shrank by.
+    pub(crate) fn remove(&mut self, lo: usize, hi: usize) -> usize {
+        if lo >= hi {
+            return 0;
+        }
+        let hit: Vec<usize> = self
+            .runs
+            .range(..hi)
+            .rev()
+            .take_while(|(k, v)| **k + v.len() > lo)
+            .map(|(&k, _)| k)
+            .collect();
+        let before = self.held;
+        for k in hit {
+            let run = self.runs.remove(&k).unwrap_or_default();
+            self.held -= run.len();
+            let end = k + run.len();
+            if k < lo {
+                self.held += lo - k;
+                self.runs.insert(k, run[..lo - k].to_vec());
+            }
+            if end > hi {
+                self.held += end - hi;
+                self.runs.insert(hi, run[hi - k..].to_vec());
+            }
+        }
+        before - self.held
+    }
+
+    /// The held runs as slice-relative byte ranges, in order.
+    pub(crate) fn ranges(&self) -> Vec<ByteRange> {
+        self.runs
+            .iter()
+            .map(|(&k, run)| ByteRange::new(k as i64, run.len() as i64))
+            .collect()
+    }
+
     /// Byte ranges of `[0, len)` that no run covers, as `(start, end)`.
     pub(crate) fn gaps(&self, len: usize) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
@@ -948,6 +986,26 @@ mod pieces_tests {
     }
 
     #[test]
+    fn remove_splits_straddling_runs() {
+        let mut p = Pieces::default();
+        p.insert(0, &[1, 2, 3, 4, 5]);
+        p.insert(10, &[6, 7, 8]);
+        assert_eq!(p.remove(3, 11), 3); // keeps [0,3) and [11,13)
+        assert_eq!(p.held(), 5);
+        assert_eq!(p.remove(20, 30), 0);
+        assert_eq!(p.remove(5, 5), 0);
+        assert_eq!(p.gaps(13), vec![(3, 11)]);
+        let ranges: Vec<(i64, i64)> = p.ranges().iter().map(|r| (r.offset, r.size)).collect();
+        assert_eq!(ranges, vec![(0, 3), (11, 2)]);
+        assert_eq!(p.remove(0, 13), 5);
+        assert!(p.ranges().is_empty());
+        let mut p = Pieces::default();
+        p.insert(4, &[9; 4]);
+        assert_eq!(p.remove(5, 7), 2); // a hole in the middle of one run
+        assert_eq!(p.into_slice(8), vec![0, 0, 0, 0, 9, 0, 0, 9]);
+    }
+
+    #[test]
     fn into_slice_keeps_a_short_run() {
         let mut p = Pieces::default();
         p.insert(0, &[7; 3]);
@@ -1678,6 +1736,68 @@ pub struct ArticleOutcome {
     pub unpause: Option<UnpauseAction>,
 }
 
+/// What [`StreamingParSession::on_range_replaced`] did to one slice the range touches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatchedSlice {
+    /// The slice was verified and still matches its IFSC checksums, so its folded syndrome
+    /// contribution is still right. Nothing changed.
+    Unchanged,
+    /// The slice is not verified yet. Its coverage and staging took the new bytes, and it
+    /// waits for the rest of its data.
+    Pending,
+    /// The new bytes completed the slice, or repaired a damaged one: it verified and was
+    /// folded into the syndromes.
+    NewlyVerified,
+    /// The slice is damaged: it is complete but fails verification, or it still misses a
+    /// range lost earlier. Repair rebuilds it from recovery data.
+    Damaged,
+    /// The slice was verified and folded, but its new content no longer matches IFSC, or
+    /// the rest of the slice could not be read back to check it. Its folded contribution
+    /// is the old, IFSC-verified content and cannot be taken out without those old bytes,
+    /// so live repair cannot rebuild this slice, and the slice is now *diverged*:
+    ///
+    /// - It keeps its `VerifiedGood` state, but [`StreamingParSession::volume_status`]
+    ///   counts it as damaged, so its file never reports complete, and
+    ///   [`LiveStatus::early_cutover_possible`] stays false.
+    /// - Syndrome slots allocated before the patch still hold its verified content and
+    ///   stay correct. Slots allocated later (late recovery volumes) are back-filled
+    ///   without it, instead of failing, and are left out of every solve.
+    /// - A repair that needs those later slots fails with
+    ///   [`RepairError::NotEnoughRecovery`], counting only the consistent slots;
+    ///   [`StreamingParSession::diverged_slices`] names the diverged slices.
+    ///
+    /// A later patch that restores the IFSC content makes it `Unchanged` again and lets
+    /// the next back-fill complete the later slots. Otherwise the live session cannot
+    /// finish the set: the caller should switch to a set-wide disk repair.
+    Unreconcilable,
+}
+
+/// Outcome of [`StreamingParSession::on_range_replaced`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RangeOutcome {
+    /// Every slice the range touches, as `(slice index within the file, result)`, in order.
+    pub slices: Vec<(usize, PatchedSlice)>,
+    /// Volumes to unpause if a patched slice became damaged and pushed the need beyond the
+    /// available blocks.
+    pub unpause: Option<UnpauseAction>,
+}
+
+impl RangeOutcome {
+    /// Whether every slice was reconciled, that is, none is [`PatchedSlice::Unreconcilable`].
+    #[must_use]
+    pub fn is_reconciled(&self) -> bool {
+        self.unreconcilable().next().is_none()
+    }
+
+    /// Slice indices (within the file) that are [`PatchedSlice::Unreconcilable`].
+    pub fn unreconcilable(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slices
+            .iter()
+            .filter(|(_, r)| *r == PatchedSlice::Unreconcilable)
+            .map(|(b, _)| *b)
+    }
+}
+
 /// Result of [`StreamingParSession::repair_available_targets_now`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EarlyRepairReport {
@@ -1741,7 +1861,8 @@ pub struct LiveStatus {
     pub unpaused_in_flight: i64,
     /// `D - (ready + in flight)`, clamped at 0.
     pub needed_recovery_blocks: i64,
-    /// `D + U <= ready`: an early Reed-Solomon cutover would succeed right now.
+    /// `D + U <= ready`: an early Reed-Solomon cutover would succeed right now. Always
+    /// false while a slice is diverged (see [`PatchedSlice::Unreconcilable`]).
     pub early_cutover_possible: bool,
     /// Folding jobs not yet applied to the syndromes.
     pub pending_folds: usize,
@@ -1922,11 +2043,14 @@ struct LiveFile {
 struct ArticlePayload<'a> {
     bytes: Option<&'a [u8]>,
     memory_only: bool,
+    /// A replaced range ([`StreamingParSession::on_range_replaced`]), not an article: no
+    /// article CRC, and older staged bytes and CRCs for the range are dropped.
+    patch: bool,
 }
 
 /// A slice completed under the tracker lock: (slice, fully staged bytes, partly staged
-/// pieces, `ParQuick` CRC).
-type CompletedSlice = (usize, Option<Vec<u8>>, Option<Pieces>, Option<u32>);
+/// pieces, `ParQuick` CRC, patch generation).
+type CompletedSlice = (usize, Option<Vec<u8>>, Option<Pieces>, Option<u32>, u32);
 
 struct LiveStaged {
     pieces: Pieces,
@@ -2001,6 +2125,12 @@ struct Tracker {
     /// Damaged slices that kept RAM-only staging, oldest first. Entries whose slice is no
     /// longer damaged or no longer staged are pruned lazily.
     damaged_staged: VecDeque<usize>,
+    /// Per-slice patch generation, bumped by every
+    /// [`StreamingParSession::on_range_replaced`] that touches the slice. A completion that
+    /// started before a patch is stale and leaves the slice to the patch's own completion.
+    patch_gens: Vec<u32>,
+    /// Verified (folded) slices whose target bytes no longer match IFSC after a patch.
+    diverged: BTreeSet<usize>,
     queued_volumes: Vec<QueuedVolume>,
     /// Volume ids unpaused by the scheduler that have not arrived yet, with their blocks.
     unpaused_in_flight: HashMap<u64, i32>,
@@ -2244,6 +2374,7 @@ impl StreamingParSession {
         }
         let metadata = (|| {
             let per_slice = std::mem::size_of::<SliceState>()
+                + std::mem::size_of::<u32>()
                 + 2 * std::mem::size_of::<Vec<ByteRange>>()
                 + std::mem::size_of::<ChecksumEntry>();
             let mut bytes = (total as usize)
@@ -2382,6 +2513,8 @@ impl StreamingParSession {
                 staging: HashMap::new(),
                 staging_bytes: 0,
                 damaged_staged: VecDeque::new(),
+                patch_gens: vec![0; total],
+                diverged: BTreeSet::new(),
                 queued_volumes: Vec::new(),
                 unpaused_in_flight: HashMap::new(),
                 ready_exponents: BTreeSet::new(),
@@ -2593,6 +2726,31 @@ impl StreamingParSession {
         Ok(t.states[f.first_slice + slice_idx].clone())
     }
 
+    /// Verified slices whose target bytes no longer match IFSC after a patch, as
+    /// `(file id, slice index within the file)`. See [`PatchedSlice::Unreconcilable`]: while
+    /// this is not empty, the live session cannot finish the set, and the caller should
+    /// switch to a set-wide disk repair.
+    #[must_use]
+    pub fn diverged_slices(&self) -> Vec<(FileId, usize)> {
+        let t = self
+            .inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        t.diverged
+            .iter()
+            .map(|&g| {
+                let f = self
+                    .inner
+                    .files
+                    .iter()
+                    .find(|f| g >= f.first_slice && g < f.first_slice + f.slice_count)
+                    .expect("slice belongs to a file");
+                (f.file_id, g - f.first_slice)
+            })
+            .collect()
+    }
+
     /// Completion status of one volume (source file).
     ///
     /// # Errors
@@ -2609,8 +2767,14 @@ impl StreamingParSession {
 
     fn volume_status_locked(t: &Tracker, f: &LiveFile) -> VolumeStatus {
         let (mut v, mut d, mut u) = (0, 0, 0);
-        for state in &t.states[f.first_slice..f.first_slice + f.slice_count] {
+        for (g, state) in t.states[f.first_slice..f.first_slice + f.slice_count]
+            .iter()
+            .enumerate()
+            .map(|(b, state)| (f.first_slice + b, state))
+        {
             match state {
+                // Folded, but its target bytes no longer match IFSC after a patch.
+                SliceState::VerifiedGood if t.diverged.contains(&g) => d += 1,
                 SliceState::VerifiedGood => v += 1,
                 SliceState::Damaged => d += 1,
                 _ => u += 1,
@@ -2660,7 +2824,9 @@ impl StreamingParSession {
             ready_recovery: ready,
             unpaused_in_flight: in_flight,
             needed_recovery_blocks: (damaged - ready as i64 - in_flight).max(0),
-            early_cutover_possible: !self.is_cancelled() && damaged as usize + unarrived <= ready,
+            early_cutover_possible: !self.is_cancelled()
+                && t.diverged.is_empty()
+                && damaged as usize + unarrived <= ready,
             pending_folds: pending,
         }
     }
@@ -2799,6 +2965,7 @@ impl StreamingParSession {
             ArticlePayload {
                 bytes,
                 memory_only: false,
+                patch: false,
             },
         )
     }
@@ -2830,8 +2997,158 @@ impl StreamingParSession {
             ArticlePayload {
                 bytes: Some(bytes),
                 memory_only: true,
+                patch: false,
             },
         )
+    }
+
+    /// The caller replaced bytes `[offset, offset + size)` of `file_id` in the target file,
+    /// for example with an inline refill, a rebuilt volume end or a stream-repaired article.
+    /// `bytes` holds the new content of the range when it is still in RAM; with `None` the
+    /// new bytes are read back from the target file. Either way the target file must
+    /// already hold them when this is called, as for
+    /// [`on_article_finished`](Self::on_article_finished).
+    ///
+    /// Only the slices the range overlaps are touched; staged work and folded syndromes of
+    /// every other slice stay. Per slice:
+    ///
+    /// - **Verified** (folded): the whole slice is hashed again, from `bytes` plus the rest
+    ///   of the slice read from the target file. If it still matches IFSC its content is
+    ///   identical to what was folded, so nothing changes ([`PatchedSlice::Unchanged`]).
+    ///   Otherwise it is [`PatchedSlice::Unreconcilable`]; see there. The rest of a
+    ///   verified slice must therefore be on disk, not only in RAM.
+    /// - **Unarrived, partially arrived or damaged**: the range counts as newly arrived
+    ///   data. Coverage grows by the range; staged bytes and article CRCs inside the range
+    ///   are dropped, since they are older than the patch, and `bytes` is staged in their
+    ///   place when the staging cap allows. A slice that becomes fully covered, including
+    ///   a damaged slice whose lost range the patch fills, is verified and folded at once
+    ///   ([`PatchedSlice::NewlyVerified`]) or is damaged ([`PatchedSlice::Damaged`]).
+    ///   An article completion of the same slice that started before the patch is
+    ///   discarded; the patch's own completion decides.
+    ///
+    /// A range past the end of the file is clipped; an empty one does nothing.
+    ///
+    /// # Errors
+    /// [`RepairError::Cancelled`] after [`cancel`](Self::cancel), [`RepairError::UnknownFile`]
+    /// for an unknown `file_id`, [`RepairError::StreamingMemoryLimit`] when slice metadata
+    /// would exceed the working cap (the patch is then refused unchanged), and
+    /// [`RepairError::Io`] for an overflowing range, `bytes` shorter than the range, or a
+    /// failed target-file read. After an I/O error some slices may already be updated;
+    /// the caller should fall back as for an unreconcilable slice.
+    pub fn on_range_replaced(
+        &self,
+        file_id: &FileId,
+        offset: u64,
+        size: u64,
+        bytes: Option<&[u8]>,
+    ) -> Result<RangeOutcome, RepairError> {
+        let _payload = self
+            .inner
+            .payload_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _permit = self.inner.admit_payload()?;
+        let fi = self.file(file_id)?;
+        let f = &self.inner.files[fi];
+        let ss = self.inner.slice_size as u64;
+        let mut verified = Vec::new();
+        let applied = self.apply_payload(
+            file_id,
+            offset,
+            size,
+            0,
+            &ArticlePayload {
+                bytes,
+                memory_only: false,
+                patch: true,
+            },
+            &mut verified,
+        )?;
+        let mut out = RangeOutcome {
+            slices: Vec::new(),
+            unpause: applied.unpause,
+        };
+        if size == 0 || offset >= f.length || f.slice_count == 0 {
+            return Ok(out);
+        }
+        // `apply_payload` checked the range already.
+        let end = offset.saturating_add(size).min(f.length);
+        let mut checked: HashMap<usize, PatchedSlice> = HashMap::new();
+        for (g, generation) in verified {
+            let b = g - f.first_slice;
+            let sstart = b as u64 * ss;
+            let send = (sstart + ss).min(f.length);
+            let mut pieces = Pieces::default();
+            if let Some(d) = bytes {
+                let (s, e) = (offset.max(sstart), end.min(send));
+                pieces.insert(
+                    (s - sstart) as usize,
+                    &d[(s - offset) as usize..(e - offset) as usize],
+                );
+            }
+            let data = self.fill_gaps_from_target(fi, b, pieces)?;
+            let good = match data {
+                Some(data) => self.verify_slice_bytes(fi, b, Some(data), None)?.is_some(),
+                None => false,
+            };
+            let mut t = self
+                .inner
+                .tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A later patch of the same slice checks it again and decides.
+            if t.patch_gens[g] == generation {
+                if good {
+                    // Slots allocated while it diverged still miss it. Bump
+                    // the generation too, so a back-fill pass already past
+                    // this slice runs again instead of clearing the flag.
+                    if t.diverged.remove(&g) {
+                        self.inner.slot_generation.fetch_add(1, Ordering::AcqRel);
+                        self.inner.needs_backfill.store(true, Ordering::Release);
+                    }
+                } else {
+                    t.diverged.insert(g);
+                }
+            }
+            checked.insert(
+                b,
+                if good {
+                    PatchedSlice::Unchanged
+                } else {
+                    PatchedSlice::Unreconcilable
+                },
+            );
+        }
+        let events: HashMap<usize, &SliceState> = applied
+            .events
+            .iter()
+            .map(|ev| (ev.slice_idx, &ev.state))
+            .collect();
+        let t = self
+            .inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for b in (offset / ss) as usize..=((end - 1) / ss) as usize {
+            let result = if let Some(r) = checked.get(&b) {
+                *r
+            } else {
+                match events.get(&b) {
+                    Some(SliceState::VerifiedGood) => PatchedSlice::NewlyVerified,
+                    Some(SliceState::Damaged) => PatchedSlice::Damaged,
+                    _ => match t.states[f.first_slice + b] {
+                        SliceState::Damaged => PatchedSlice::Damaged,
+                        // Completed by a concurrent article after this patch's own pass.
+                        SliceState::VerifiedGood => PatchedSlice::NewlyVerified,
+                        _ => PatchedSlice::Pending,
+                    },
+                }
+            };
+            out.slices.push((b, result));
+        }
+        drop(t);
+        self.inner.control.ensure_running()?;
+        Ok(out)
     }
 
     fn on_article_payload(
@@ -2842,13 +3159,29 @@ impl StreamingParSession {
         crc32: u32,
         payload: ArticlePayload<'_>,
     ) -> Result<ArticleOutcome, RepairError> {
-        let bytes = payload.bytes;
         let _payload = self
             .inner
             .payload_gate
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _permit = self.inner.admit_payload()?;
+        self.apply_payload(file_id, offset, size, crc32, &payload, &mut Vec::new())
+    }
+
+    /// Body of [`Self::on_article_payload`]: the caller holds the shared payload gate and a
+    /// payload permit. For a patch, every verified slice the range touches is pushed to
+    /// `verified` with its new patch generation and left alone; the caller checks it.
+    #[allow(clippy::too_many_lines)]
+    fn apply_payload(
+        &self,
+        file_id: &FileId,
+        offset: u64,
+        size: u64,
+        crc32: u32,
+        payload: &ArticlePayload<'_>,
+        verified: &mut Vec<(usize, u32)>,
+    ) -> Result<ArticleOutcome, RepairError> {
+        let bytes = payload.bytes;
         let fi = self.file(file_id)?;
         let f = &self.inner.files[fi];
         let ss = self.inner.slice_size as u64;
@@ -2947,12 +3280,15 @@ impl StreamingParSession {
                 additional +=
                     usize::from(!range_covered(&t.covered[g], lo as i64, (hi - lo) as i64));
                 additional += usize::from(
-                    offset >= begin
+                    !payload.patch
+                        && offset >= begin
                         && end <= stop
                         && !t.article_crcs[g]
                             .iter()
                             .any(|&(o, l, _)| o == lo && l == hi - lo),
                 );
+                // Dropping a patched range from the middle of a staged run splits it in two.
+                additional += usize::from(payload.patch && t.staging.contains_key(&g));
                 if bytes.is_some() {
                     additional +=
                         usize::from(t.staging.get(&g).is_none_or(|st| {
@@ -2972,9 +3308,6 @@ impl StreamingParSession {
             }
             for b in b0..=b1.min(f.slice_count - 1) {
                 let g = f.first_slice + b;
-                if t.states[g] == SliceState::VerifiedGood {
-                    continue;
-                }
                 let sstart = b as u64 * ss;
                 let send = (sstart + ss).min(f.length);
                 let s = offset.max(sstart);
@@ -2982,7 +3315,36 @@ impl StreamingParSession {
                 if s >= e {
                     continue;
                 }
+                if payload.patch {
+                    t.patch_gens[g] = t.patch_gens[g].wrapping_add(1);
+                }
+                if t.states[g] == SliceState::VerifiedGood {
+                    if payload.patch {
+                        verified.push((g, t.patch_gens[g]));
+                    }
+                    continue;
+                }
                 let slen = (send - sstart) as usize;
+                if payload.patch {
+                    // The range holds newer bytes now: older article CRCs and staged bytes
+                    // for it are stale. Staged bytes elsewhere in the slice stay.
+                    let (lo, hi) = (s - sstart, e - sstart);
+                    let before = t.article_crcs[g].len();
+                    t.article_crcs[g].retain(|&(o, l, _)| o + l <= lo || o >= hi);
+                    t.metadata_entries -= before - t.article_crcs[g].len();
+                    if let Some(st) = t.staging.get_mut(&g) {
+                        let freed = st.pieces.remove(lo as usize, hi as usize);
+                        let previous = st.ranges.len();
+                        st.ranges = st.pieces.ranges();
+                        let current = st.ranges.len();
+                        t.metadata_entries = t.metadata_entries - previous + current;
+                        t.staging_bytes -= freed as u64;
+                        if current == 0 {
+                            t.staging.remove(&g);
+                            shrink_staging(&mut t.staging);
+                        }
+                    }
+                }
                 // Coverage.
                 let previous = t.covered[g].len();
                 t.covered[g].push(ByteRange::new((s - sstart) as i64, (e - s) as i64));
@@ -3001,7 +3363,7 @@ impl StreamingParSession {
                     );
                 }
                 // Article CRC for the quick path (only exact per-article pieces are usable).
-                if s == offset && e == end {
+                if s == offset && e == end && !payload.patch {
                     if let Some(entry) = t.article_crcs[g]
                         .iter_mut()
                         .find(|(o, l, _)| *o == s - sstart && *l == e - s)
@@ -3106,7 +3468,7 @@ impl StreamingParSession {
                             });
                         }
                     }
-                    completed.push((g, staged, partial, quick));
+                    completed.push((g, staged, partial, quick, t.patch_gens[g]));
                 }
             }
         }
@@ -3115,7 +3477,7 @@ impl StreamingParSession {
         }
         // Phase 2 (unlocked): obtain bytes, hash, fold.
         let mut damaged_any = false;
-        for (g, staged, partial, quick) in completed {
+        for (g, staged, partial, quick, generation) in completed {
             let b = g - f.first_slice;
             // A large article can supply whole slices without retaining copies of
             // all of them in staging or rereading bytes that the caller supplied.
@@ -3161,7 +3523,9 @@ impl StreamingParSession {
                 .tracker
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if t.states[g] == SliceState::VerifiedGood {
+            // A patch since this completion started owns the slice now; its own completion
+            // decides the state.
+            if t.states[g] == SliceState::VerifiedGood || t.patch_gens[g] != generation {
                 continue;
             }
             if let Some(data) = verdict {
@@ -3425,8 +3789,14 @@ impl StreamingParSession {
                 .tracker
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A diverged slice no longer has its folded content anywhere; slots that miss it
+            // stay without it and are left out of solves.
             range
-                .filter(|&g| g < t.states.len() && t.states[g] == SliceState::VerifiedGood)
+                .filter(|&g| {
+                    g < t.states.len()
+                        && t.states[g] == SliceState::VerifiedGood
+                        && !t.diverged.contains(&g)
+                })
                 .collect()
         };
         let slots: Vec<Arc<Mutex<SyndromeSlot>>> = self
@@ -4070,7 +4440,7 @@ impl StreamingParSession {
         for b in b0..=b1.min(f.slice_count - 1) {
             self.inner.control.ensure_running()?;
             let g = f.first_slice + b;
-            {
+            let generation = {
                 let t = self
                     .inner
                     .tracker
@@ -4079,7 +4449,8 @@ impl StreamingParSession {
                 if t.states[g] == SliceState::VerifiedGood {
                     continue;
                 }
-            }
+                t.patch_gens[g]
+            };
             let sstart = b as u64 * ss;
             let send = (sstart + ss).min(f.length);
             let slen = (send - sstart) as usize;
@@ -4108,7 +4479,8 @@ impl StreamingParSession {
                 .tracker
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if t.states[g] == SliceState::VerifiedGood {
+            // A patch since the read owns the slice; its own completion decides.
+            if t.states[g] == SliceState::VerifiedGood || t.patch_gens[g] != generation {
                 continue;
             }
             if let Some(st) = t.staging.remove(&g) {
@@ -4297,7 +4669,12 @@ impl StreamingParSession {
             self.backfill_slots(admitted.as_ref(), true)?;
         }
         let ss = self.inner.slice_size;
-        let (missing, present, ready_exps): (Vec<usize>, Vec<bool>, Vec<u32>) = {
+        let (missing, present, ready_exps, diverged): (
+            Vec<usize>,
+            Vec<bool>,
+            Vec<u32>,
+            Vec<usize>,
+        ) = {
             let t = self
                 .inner
                 .tracker
@@ -4313,10 +4690,41 @@ impl StreamingParSession {
                 missing,
                 present,
                 t.ready_exponents.iter().copied().collect(),
+                t.diverged.iter().copied().collect(),
             )
         };
         let k = missing.len();
         if k > ready_exps.len() {
+            return Err(RepairError::NotEnoughRecovery {
+                needed: k as u64,
+                available: ready_exps.len() as u64,
+            });
+        }
+        // Only syndromes that folded every diverged slice before it diverged are consistent
+        // with the verified set; slots allocated later lack it for good.
+        let ready_exps: Vec<u32> = if diverged.is_empty() {
+            ready_exps
+        } else {
+            let slots = self
+                .inner
+                .slots
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ready_exps
+                .into_iter()
+                .filter(|&e| {
+                    slots.iter().any(|slot| {
+                        let slot = slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        slot.exponent == e && diverged.iter().all(|&g| slot.folded_mask.get(g))
+                    })
+                })
+                .collect()
+        };
+        if k > ready_exps.len() {
+            // Typed as a recovery shortfall: the live syndromes cannot solve, and
+            // `diverged_slices` names the cause.
             return Err(RepairError::NotEnoughRecovery {
                 needed: k as u64,
                 available: ready_exps.len() as u64,
@@ -4632,6 +5040,7 @@ const _: fn() = || {
 mod live_tests {
     mod concurrency_tests;
     pub(super) mod control_tests;
+    mod patch_tests;
     mod stress_tests;
     use super::*;
     use crate::crc::crc32;
