@@ -1754,11 +1754,21 @@ pub enum PatchedSlice {
     /// The slice was verified and folded, but its new content no longer matches IFSC, or
     /// the rest of the slice could not be read back to check it. Its folded contribution
     /// is the old, IFSC-verified content and cannot be taken out without those old bytes,
-    /// so repair cannot rebuild this slice. The syndromes stay correct for the solve.
-    /// The slice keeps its `VerifiedGood` state, but [`StreamingParSession::volume_status`]
-    /// counts it as damaged, so its file never reports complete. A later patch that
-    /// restores the IFSC content makes it `Unchanged` again; otherwise the caller must fall
-    /// back, for example by cancelling the session.
+    /// so live repair cannot rebuild this slice, and the slice is now *diverged*:
+    ///
+    /// - It keeps its `VerifiedGood` state, but [`StreamingParSession::volume_status`]
+    ///   counts it as damaged, so its file never reports complete, and
+    ///   [`LiveStatus::early_cutover_possible`] stays false.
+    /// - Syndrome slots allocated before the patch still hold its verified content and
+    ///   stay correct. Slots allocated later (late recovery volumes) are back-filled
+    ///   without it, instead of failing, and are left out of every solve.
+    /// - A repair that needs those later slots fails with
+    ///   [`RepairError::NotEnoughRecovery`], counting only the consistent slots;
+    ///   [`StreamingParSession::diverged_slices`] names the diverged slices.
+    ///
+    /// A later patch that restores the IFSC content makes it `Unchanged` again and lets
+    /// the next back-fill complete the later slots. Otherwise the live session cannot
+    /// finish the set: the caller should switch to a set-wide disk repair.
     Unreconcilable,
 }
 
@@ -1851,7 +1861,8 @@ pub struct LiveStatus {
     pub unpaused_in_flight: i64,
     /// `D - (ready + in flight)`, clamped at 0.
     pub needed_recovery_blocks: i64,
-    /// `D + U <= ready`: an early Reed-Solomon cutover would succeed right now.
+    /// `D + U <= ready`: an early Reed-Solomon cutover would succeed right now. Always
+    /// false while a slice is diverged (see [`PatchedSlice::Unreconcilable`]).
     pub early_cutover_possible: bool,
     /// Folding jobs not yet applied to the syndromes.
     pub pending_folds: usize,
@@ -2715,6 +2726,31 @@ impl StreamingParSession {
         Ok(t.states[f.first_slice + slice_idx].clone())
     }
 
+    /// Verified slices whose target bytes no longer match IFSC after a patch, as
+    /// `(file id, slice index within the file)`. See [`PatchedSlice::Unreconcilable`]: while
+    /// this is not empty, the live session cannot finish the set, and the caller should
+    /// switch to a set-wide disk repair.
+    #[must_use]
+    pub fn diverged_slices(&self) -> Vec<(FileId, usize)> {
+        let t = self
+            .inner
+            .tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        t.diverged
+            .iter()
+            .map(|&g| {
+                let f = self
+                    .inner
+                    .files
+                    .iter()
+                    .find(|f| g >= f.first_slice && g < f.first_slice + f.slice_count)
+                    .expect("slice belongs to a file");
+                (f.file_id, g - f.first_slice)
+            })
+            .collect()
+    }
+
     /// Completion status of one volume (source file).
     ///
     /// # Errors
@@ -2788,7 +2824,9 @@ impl StreamingParSession {
             ready_recovery: ready,
             unpaused_in_flight: in_flight,
             needed_recovery_blocks: (damaged - ready as i64 - in_flight).max(0),
-            early_cutover_possible: !self.is_cancelled() && damaged as usize + unarrived <= ready,
+            early_cutover_possible: !self.is_cancelled()
+                && t.diverged.is_empty()
+                && damaged as usize + unarrived <= ready,
             pending_folds: pending,
         }
     }
@@ -3061,7 +3099,10 @@ impl StreamingParSession {
             // A later patch of the same slice checks it again and decides.
             if t.patch_gens[g] == generation {
                 if good {
-                    t.diverged.remove(&g);
+                    // Slots allocated while it diverged still miss it.
+                    if t.diverged.remove(&g) {
+                        self.inner.needs_backfill.store(true, Ordering::Release);
+                    }
                 } else {
                     t.diverged.insert(g);
                 }
@@ -3243,6 +3284,8 @@ impl StreamingParSession {
                             .iter()
                             .any(|&(o, l, _)| o == lo && l == hi - lo),
                 );
+                // Dropping a patched range from the middle of a staged run splits it in two.
+                additional += usize::from(payload.patch && t.staging.contains_key(&g));
                 if bytes.is_some() {
                     additional +=
                         usize::from(t.staging.get(&g).is_none_or(|st| {
@@ -3743,8 +3786,14 @@ impl StreamingParSession {
                 .tracker
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A diverged slice no longer has its folded content anywhere; slots that miss it
+            // stay without it and are left out of solves.
             range
-                .filter(|&g| g < t.states.len() && t.states[g] == SliceState::VerifiedGood)
+                .filter(|&g| {
+                    g < t.states.len()
+                        && t.states[g] == SliceState::VerifiedGood
+                        && !t.diverged.contains(&g)
+                })
                 .collect()
         };
         let slots: Vec<Arc<Mutex<SyndromeSlot>>> = self
@@ -4388,7 +4437,7 @@ impl StreamingParSession {
         for b in b0..=b1.min(f.slice_count - 1) {
             self.inner.control.ensure_running()?;
             let g = f.first_slice + b;
-            {
+            let generation = {
                 let t = self
                     .inner
                     .tracker
@@ -4397,7 +4446,8 @@ impl StreamingParSession {
                 if t.states[g] == SliceState::VerifiedGood {
                     continue;
                 }
-            }
+                t.patch_gens[g]
+            };
             let sstart = b as u64 * ss;
             let send = (sstart + ss).min(f.length);
             let slen = (send - sstart) as usize;
@@ -4426,7 +4476,8 @@ impl StreamingParSession {
                 .tracker
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if t.states[g] == SliceState::VerifiedGood {
+            // A patch since the read owns the slice; its own completion decides.
+            if t.states[g] == SliceState::VerifiedGood || t.patch_gens[g] != generation {
                 continue;
             }
             if let Some(st) = t.staging.remove(&g) {
@@ -4615,7 +4666,12 @@ impl StreamingParSession {
             self.backfill_slots(admitted.as_ref(), true)?;
         }
         let ss = self.inner.slice_size;
-        let (missing, present, ready_exps): (Vec<usize>, Vec<bool>, Vec<u32>) = {
+        let (missing, present, ready_exps, diverged): (
+            Vec<usize>,
+            Vec<bool>,
+            Vec<u32>,
+            Vec<usize>,
+        ) = {
             let t = self
                 .inner
                 .tracker
@@ -4631,10 +4687,41 @@ impl StreamingParSession {
                 missing,
                 present,
                 t.ready_exponents.iter().copied().collect(),
+                t.diverged.iter().copied().collect(),
             )
         };
         let k = missing.len();
         if k > ready_exps.len() {
+            return Err(RepairError::NotEnoughRecovery {
+                needed: k as u64,
+                available: ready_exps.len() as u64,
+            });
+        }
+        // Only syndromes that folded every diverged slice before it diverged are consistent
+        // with the verified set; slots allocated later lack it for good.
+        let ready_exps: Vec<u32> = if diverged.is_empty() {
+            ready_exps
+        } else {
+            let slots = self
+                .inner
+                .slots
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ready_exps
+                .into_iter()
+                .filter(|&e| {
+                    slots.iter().any(|slot| {
+                        let slot = slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        slot.exponent == e && diverged.iter().all(|&g| slot.folded_mask.get(g))
+                    })
+                })
+                .collect()
+        };
+        if k > ready_exps.len() {
+            // Typed as a recovery shortfall: the live syndromes cannot solve, and
+            // `diverged_slices` names the cause.
             return Err(RepairError::NotEnoughRecovery {
                 needed: k as u64,
                 available: ready_exps.len() as u64,

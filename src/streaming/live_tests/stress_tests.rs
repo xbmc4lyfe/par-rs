@@ -4,7 +4,9 @@
 //! cancelled part-way. Some scenarios also cap the RAM-only bytes kept for damaged slices.
 //! Some scenarios also patch random ranges with the original bytes mid-stream, the way a
 //! downloader rewrites refilled or stream-repaired data, over articles that already arrived,
-//! failed or were corrupted. Every scenario checks the staging accounting, the final slice
+//! failed or were corrupted. A few of those also overwrite a verified slice with different
+//! bytes, which leaves it diverged: repair must then solve only with the syndromes that
+//! existed before, and leave the overwritten bytes alone. Every scenario checks the staging accounting, the final slice
 //! states, and that the repaired files match the originals byte for byte.
 //!
 //! `PAR_RS_STRESS_SCENARIOS` sets the scenario count (default 48) and `PAR_RS_STRESS_SEED`
@@ -157,6 +159,8 @@ fn run_scenario(n: u64, seed: u64) {
     // Patches draw from their own generator, so scenarios without them replay unchanged.
     let mut prng = Rng(seed ^ 0x0BAD_C0DE_D00D_F00D);
     let patching = prng.chance(35);
+    let diverging = patching && prng.chance(30);
+    let mut diverged: Option<Divergence> = None;
     let mut processed = vec![false; articles.len()];
     // Patched ranges per file, as `(start, end)`.
     let mut patched: Vec<Vec<(u64, u64)>> = vec![Vec::new(); nfiles];
@@ -164,7 +168,22 @@ fn run_scenario(n: u64, seed: u64) {
     let mut delivered = 0usize;
     let mut done_events = 0usize;
     while let Some(ev) = events.pop_front() {
-        if patching && prng.chance(20) {
+        if diverging && diverged.is_none() && prng.chance(30) {
+            diverged = diverge_verified_slice(
+                &s,
+                &fx,
+                &ids,
+                &articles,
+                &ev,
+                &events,
+                &mut prng,
+                &mut deferred,
+                slice,
+                &ctx,
+            );
+        }
+        // Once a slice diverged, a patch with the original bytes would reconcile it again.
+        if patching && diverged.is_none() && prng.chance(20) {
             patch_processed_range(
                 &s,
                 &fx,
@@ -394,21 +413,43 @@ fn run_scenario(n: u64, seed: u64) {
         write_at(path, *off, bytes);
     }
     let fits = damaged_count <= recovery as usize;
-    assert_eq!(st.early_cutover_possible, fits, "{ctx}: cutover");
+    assert_eq!(
+        st.early_cutover_possible,
+        fits && diverged.is_none(),
+        "{ctx}: cutover"
+    );
+    // Only slots that existed when the slice diverged hold its verified content.
+    let usable = diverged.as_ref().map_or(recovery as usize, |d| {
+        let t = s.inner.tracker.lock().unwrap();
+        t.ready_exponents
+            .iter()
+            .filter(|e| d.slots.contains(e))
+            .count()
+    });
     let r = s.repair_available_targets_now(&ids);
-    if fits {
+    if damaged_count <= usable {
         let rep = r.unwrap_or_else(|e| panic!("{ctx}: repair: {e}"));
         assert_eq!(rep.repaired_slices.len(), damaged_count, "{ctx}");
-        for (name, data) in &fx.files {
+        for (fi, (name, data)) in fx.files.iter().enumerate() {
+            let mut want = data.clone();
+            if let Some(d) = diverged.as_ref().filter(|d| d.file == fi) {
+                want[d.at as usize] = d.byte;
+            }
             assert!(
-                std::fs::read(fx.dir.join(name)).unwrap() == *data,
+                std::fs::read(fx.dir.join(name)).unwrap() == want,
                 "{ctx}: {name} differs after repair"
+            );
+            let ok = rep.files[fi].2;
+            assert_eq!(
+                ok,
+                diverged.as_ref().is_none_or(|d| d.file != fi),
+                "{ctx}: {name} verification"
             );
         }
     } else {
         assert!(
             matches!(r, Err(RepairError::NotEnoughRecovery { .. })),
-            "{ctx}: {} damaged with {recovery} recovery should not repair",
+            "{ctx}: {} damaged with {usable} usable recovery should not repair",
             damaged_count
         );
     }
@@ -476,4 +517,89 @@ fn patch_processed_range(
         *delivered += data.len();
     }
     patched[file].push((lo, hi));
+}
+
+/// A verified slice overwritten with a different byte.
+struct Divergence {
+    file: usize,
+    at: u64,
+    byte: u8,
+    /// Exponents of the syndrome slots that existed when it diverged.
+    slots: std::collections::BTreeSet<u32>,
+}
+
+/// Overwrite one byte of a random verified slice that no queued event touches, so the
+/// change stays on disk to the end, and check that it is reported unreconcilable.
+#[allow(clippy::too_many_arguments)]
+fn diverge_verified_slice(
+    s: &StreamingParSession,
+    fx: &Fx,
+    ids: &[FileId],
+    articles: &[Article],
+    current: &Event,
+    events: &std::collections::VecDeque<Event>,
+    rng: &mut Rng,
+    deferred: &mut Vec<(std::path::PathBuf, u64, Vec<u8>)>,
+    slice: u64,
+    ctx: &str,
+) -> Option<Divergence> {
+    let queued = |file: usize, lo: u64, hi: u64| {
+        std::iter::once(current).chain(events).any(|ev| match ev {
+            Event::Article(i) | Event::Replacement(i) => {
+                let a = &articles[*i];
+                a.file == file && a.offset < hi && a.offset + a.len as u64 > lo
+            }
+            Event::Recovery(_) => false,
+        })
+    };
+    let mut candidates = Vec::new();
+    for (fi, (_, data)) in fx.files.iter().enumerate() {
+        let n = data.len() as u64;
+        for b in 0..n.div_ceil(slice) {
+            let (lo, hi) = (b * slice, ((b + 1) * slice).min(n));
+            if s.slice_state(&ids[fi], b as usize).unwrap() == SliceState::VerifiedGood
+                && !queued(fi, lo, hi)
+            {
+                candidates.push((fi, lo, hi));
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    let (file, lo, hi) = candidates[(rng.next() % candidates.len() as u64) as usize];
+    // Pending RAM-only writes land first, so only the overwritten byte differs on disk.
+    for (path, off, bytes) in deferred.drain(..) {
+        write_at(&path, off, &bytes);
+    }
+    let at = rng.range(lo, hi - 1);
+    let byte = fx.files[file].1[at as usize] ^ (1 + (rng.next() % 255) as u8);
+    write_at(&fx.dir.join(&fx.files[file].0), at, &[byte]);
+    let slots = s
+        .inner
+        .slots
+        .read()
+        .unwrap()
+        .iter()
+        .map(|slot| slot.lock().unwrap().exponent)
+        .collect();
+    let with_bytes = rng.chance(50);
+    let r = s
+        .on_range_replaced(&ids[file], at, 1, with_bytes.then_some(&[byte][..]))
+        .unwrap_or_else(|e| panic!("{ctx}: diverging f{file} at {at}: {e}"));
+    assert_eq!(
+        r.slices,
+        vec![((at / slice) as usize, PatchedSlice::Unreconcilable)],
+        "{ctx}: diverging f{file} at {at}"
+    );
+    assert_eq!(
+        s.diverged_slices(),
+        vec![(ids[file], (at / slice) as usize)]
+    );
+    Some(Divergence {
+        file,
+        at,
+        byte,
+        slots,
+    })
 }

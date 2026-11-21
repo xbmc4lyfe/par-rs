@@ -449,3 +449,87 @@ fn live_patches_race_article_completions() {
         std::fs::remove_dir_all(&fx.dir).unwrap();
     }
 }
+
+/// Diverge slice 0 of file 0, then let every recovery volume arrive late.
+fn diverge_then_late_volumes(tag: &str, preallocated: usize) -> (Fx, StreamingParSession) {
+    let fx = fixture(tag, &[4096, 2048], 1024, 2, VolumeScheme::Uniform(1));
+    let ids: Vec<FileId> = fx.files.iter().map(|(n, _)| fid(&fx, n)).collect();
+    let s = StreamingParSession::new(
+        &fx.set,
+        &fx.dir,
+        SessionOptions {
+            preallocated_syndrome_slots: preallocated,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    deliver(&s, &fx, 0, 0, 4096);
+    deliver(&s, &fx, 1, 0, 1024);
+    s.on_article_failed_permanently(&ids[1], 1024, 1024)
+        .unwrap();
+    let mut wrong = fx.files[0].1[100..200].to_vec();
+    wrong[3] ^= 0x80;
+    write_at(&fx.dir.join(&fx.files[0].0), 100, &wrong);
+    let r = s.on_range_replaced(&ids[0], 100, 100, None).unwrap();
+    assert_eq!(r.unreconcilable().collect::<Vec<_>>(), vec![0]);
+    assert_eq!(s.diverged_slices(), vec![(ids[0], 0)]);
+    // Late volumes are back-filled without the diverged slice instead of failing.
+    for v in &fx.vols {
+        s.on_recovery_volume_arrived(v, None).unwrap();
+    }
+    assert!(!s.needs_backfill());
+    assert!(!s.status().early_cutover_possible);
+    (fx, s)
+}
+
+#[test]
+fn live_patch_divergence_with_only_late_slots_asks_for_disk_repair() {
+    let (fx, s) = diverge_then_late_volumes("patch-diverge-late", 0);
+    let ids: Vec<FileId> = fx.files.iter().map(|(n, _)| fid(&fx, n)).collect();
+    // No slot holds the diverged slice's verified content: a typed shortfall, not an
+    // opaque read error, and no writes.
+    let r = s.repair_available_targets_now(&ids[1..]);
+    assert!(
+        matches!(
+            r,
+            Err(RepairError::NotEnoughRecovery {
+                needed: 1,
+                available: 0
+            })
+        ),
+        "{r:?}"
+    );
+    assert_eq!(s.repair_phase_stats().target_bytes_written, 0);
+    assert!(!s.needs_backfill());
+    // Restoring the verified content lets the next back-fill complete the late slots.
+    let r = patch(&s, &fx, 0, 100, 200, false);
+    assert_eq!(r.slices, vec![(0, PatchedSlice::Unchanged)]);
+    assert!(s.diverged_slices().is_empty());
+    assert!(s.needs_backfill());
+    assert!(s.backfill_pending().unwrap());
+    assert!(s.status().early_cutover_possible);
+    let rep = s.repair_available_targets_now(&ids).unwrap();
+    assert_eq!(rep.repaired_slices, vec![(ids[1], 1)]);
+    for (name, data) in &fx.files {
+        assert_eq!(std::fs::read(fx.dir.join(name)).unwrap(), *data, "{name}");
+    }
+    assert!(rep.files.iter().all(|(_, _, ok)| *ok));
+    std::fs::remove_dir_all(&fx.dir).unwrap();
+}
+
+#[test]
+fn live_patch_divergence_still_solves_with_slots_from_before_it() {
+    // One slot existed before the divergence; the second, allocated late, lacks the slice.
+    let (fx, s) = diverge_then_late_volumes("patch-diverge-mixed", 1);
+    let ids: Vec<FileId> = fx.files.iter().map(|(n, _)| fid(&fx, n)).collect();
+    let rep = s.repair_available_targets_now(&ids).unwrap();
+    assert_eq!(rep.recovery_used, 1);
+    assert_eq!(rep.repaired_slices, vec![(ids[1], 1)]);
+    assert_eq!(
+        std::fs::read(fx.dir.join(&fx.files[1].0)).unwrap(),
+        fx.files[1].1
+    );
+    assert!(!rep.files[0].2, "the diverged file must not verify");
+    assert!(rep.files[1].2);
+    std::fs::remove_dir_all(&fx.dir).unwrap();
+}
