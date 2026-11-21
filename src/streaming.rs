@@ -3099,8 +3099,11 @@ impl StreamingParSession {
             // A later patch of the same slice checks it again and decides.
             if t.patch_gens[g] == generation {
                 if good {
-                    // Slots allocated while it diverged still miss it.
+                    // Slots allocated while it diverged still miss it. Bump
+                    // the generation too, so a back-fill pass already past
+                    // this slice runs again instead of clearing the flag.
                     if t.diverged.remove(&g) {
+                        self.inner.slot_generation.fetch_add(1, Ordering::AcqRel);
                         self.inner.needs_backfill.store(true, Ordering::Release);
                     }
                 } else {
